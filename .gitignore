@@ -1,0 +1,4 @@
+llama.cpp/
+__pycache__/
+*.log
+.claude/settings.local.json
