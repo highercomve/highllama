@@ -59,3 +59,10 @@ orchestrating Claude validates results before they land. Install the CLIs:
 ```bash
 localagent/install.sh        # symlinks localagent + claude-local into ~/.local/bin
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE). This project builds on
+[llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT, The ggml authors) and
+optionally [mlx-lm](https://github.com/ml-explore/mlx-lm) (MIT, Apple Inc.);
+see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
