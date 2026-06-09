@@ -265,7 +265,12 @@ build_llama() {
 }
 
 # ---- pull: download GGUFs from Hugging Face (LM Studio-style picker) -------
-PULL_DIR="${PULL_DIR:-$HOME/.cache/llama.cpp}"
+# Default into LM Studio's models dir (publisher/repo/file layout) so LM Studio
+# sees pulled models too; fall back to the llama.cpp cache if LM Studio absent.
+if [ -z "${PULL_DIR:-}" ]; then
+  if [ -d "$HOME/.lmstudio/models" ]; then PULL_DIR="$HOME/.lmstudio/models"
+  else PULL_DIR="$HOME/.cache/llama.cpp"; fi
+fi
 
 human_mib() { awk -v m="$1" 'BEGIN{ if (m >= 1024) printf "%.1fG", m/1024; else printf "%dM", m }'; }
 
@@ -281,7 +286,7 @@ for m in json.load(urllib.request.urlopen(req, timeout=30)):
 PY
 }
 
-# list a repo's GGUF files -> lines "name<TAB>total_MiB<TAB>file1,file2,..."
+# list a repo's GGUF files -> lines "name<TAB>total_MiB<TAB>file1:MiB1,file2:MiB2,..."
 # (multi-part shards grouped into one entry; mmproj excluded; smallest first)
 hf_files() {
   python3 - "$1" <<'PY'
@@ -297,27 +302,49 @@ for s in d.get("siblings", []):
         continue
     base = re.sub(r"-\d{5}-of-\d{5}(?=\.gguf$)", "", f)
     g = groups.setdefault(base, {"files": [], "size": 0})
-    g["files"].append(f)
+    g["files"].append((f, (s.get("size") or 0) // (1024 * 1024)))
     g["size"] += s.get("size") or 0
 for base, g in sorted(groups.items(), key=lambda kv: kv[1]["size"]):
-    print(f"{base}\t{g['size'] // (1024 * 1024)}\t{','.join(sorted(g['files']))}")
+    files = ",".join(f"{name}:{mib}" for name, mib in sorted(g["files"]))
+    print(f"{base}\t{g['size'] // (1024 * 1024)}\t{files}")
 PY
 }
 
-pull_files() {  # $1 = repo, $2 = comma-separated rfilenames
-  local repo="$1" f url dest
-  mkdir -p "$PULL_DIR"
+pull_files() {  # $1 = repo, $2 = comma-separated "rfilename:MiB" entries
+  local repo="$1" entry f mib url dest pid rc cur last speed pct
+  mkdir -p "$PULL_DIR/$repo"   # publisher/repo subdirs, LM Studio layout
   local IFS=','
-  for f in $2; do
+  for entry in $2; do
+    f="${entry%:*}"; mib="${entry##*:}"
     url="https://huggingface.co/$repo/resolve/main/$f"
-    dest="$PULL_DIR/$(printf '%s' "$repo" | tr '/' '_')_$(basename "$f")"
+    dest="$PULL_DIR/$repo/$(basename "$f")"
     if [ -f "$dest" ]; then
       echo ">> already downloaded: $dest"
       continue
     fi
-    echo ">> downloading $f"
-    curl -L --fail --progress-bar -C - ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} \
-      -o "$dest.part" "$url"
+    echo ">> downloading $f ($(human_mib "$mib"))"
+    curl -sL --fail -C - ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} \
+      -o "$dest.part" "$url" &
+    pid=$!
+    last="$(( $(file_size "$dest.part" 2>/dev/null || echo 0) / 1048576 ))"
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 1
+      cur="$(( $(file_size "$dest.part" 2>/dev/null || echo 0) / 1048576 ))"
+      speed=$((cur - last)); last=$cur
+      if [ "$mib" -gt 0 ] 2>/dev/null; then
+        pct=$((cur * 100 / mib))
+        printf '\r   %s / %s  (%d%%)  %d MiB/s     ' \
+          "$(human_mib "$cur")" "$(human_mib "$mib")" "$pct" "$speed"
+      else
+        printf '\r   %s downloaded  %d MiB/s     ' "$(human_mib "$cur")" "$speed"
+      fi
+    done
+    rc=0; wait "$pid" || rc=$?
+    printf '\n'
+    if [ "$rc" -ne 0 ]; then
+      echo "!! download failed (curl exit $rc): $f — re-run to resume" >&2
+      exit 1
+    fi
     mv "$dest.part" "$dest"
     echo ">> saved: $dest"
   done

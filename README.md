@@ -42,8 +42,9 @@ Then point any OpenAI-compatible client at `http://localhost:8089/v1`.
 - **Downloads:** `pull` with no args asks for a search term and lists matching
   HF repos (most downloaded first), then the repo's quants with sizes — pick
   one and it downloads (resumable, multi-part shards handled) into
-  `~/.cache/llama.cpp`, where `list`/`-m` find it. Set `HF_TOKEN` for gated
-  models, `PULL_DIR` to download elsewhere.
+  `~/.lmstudio/models/<publisher>/<repo>/` — so LM Studio sees it too — or
+  `~/.cache/llama.cpp` if LM Studio isn't installed; `list`/`-m` find both.
+  Set `HF_TOKEN` for gated models, `PULL_DIR` to download elsewhere.
 
 - **Backends:** `cuda` / `rocm` / `vulkan` / `metal` / `mlx` / `cpu`, autodetected;
   override with `--backend` or `BACKEND=`.
