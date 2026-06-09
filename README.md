@@ -29,12 +29,21 @@ Then point any OpenAI-compatible client at `http://localhost:8089/v1`.
 ## run-llm.sh
 
 ```bash
+./run-llm.sh pull                               # browse/search HF, pick + download
+./run-llm.sh pull qwen3 coder                   # search HF by term
+./run-llm.sh pull unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_XL   # direct
 ./run-llm.sh -m unsloth/gpt-oss-20b-GGUF:Q8_0   # any HF repo:quant (cached)
 ./run-llm.sh -m qwen3-coder -c 128k             # fuzzy-match a local GGUF
 ./run-llm.sh -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec decoding
 ./run-llm.sh --backend mlx -m mlx-community/Qwen3-8B-4bit      # MLX on macOS
 ./run-llm.sh list | stop | status
 ```
+
+- **Downloads:** `pull` with no args asks for a search term and lists matching
+  HF repos (most downloaded first), then the repo's quants with sizes — pick
+  one and it downloads (resumable, multi-part shards handled) into
+  `~/.cache/llama.cpp`, where `list`/`-m` find it. Set `HF_TOKEN` for gated
+  models, `PULL_DIR` to download elsewhere.
 
 - **Backends:** `cuda` / `rocm` / `vulkan` / `metal` / `mlx` / `cpu`, autodetected;
   override with `--backend` or `BACKEND=`.

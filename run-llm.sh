@@ -22,6 +22,9 @@
 #   MLX:    pip install mlx-lm                                      # no build
 #
 # Usage:
+#   ./run-llm.sh pull                              # browse/search HF, pick + download
+#   ./run-llm.sh pull qwen3 coder                  # search HF by term
+#   ./run-llm.sh pull unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_XL  # direct
 #   ./run-llm.sh                                   # interactive picker, 64k ctx
 #   ./run-llm.sh -m unsloth/gpt-oss-20b-GGUF:Q8_0  # any HF repo:quant
 #   ./run-llm.sh -m /path/to/model.gguf -c 32k     # any local GGUF
@@ -261,7 +264,144 @@ build_llama() {
   echo ">> built: $LLAMA_DIR/build/bin/llama-server"
 }
 
-# ---- subcommands: list / stop / status / deps / build ----------------------
+# ---- pull: download GGUFs from Hugging Face (LM Studio-style picker) -------
+PULL_DIR="${PULL_DIR:-$HOME/.cache/llama.cpp}"
+
+human_mib() { awk -v m="$1" 'BEGIN{ if (m >= 1024) printf "%.1fG", m/1024; else printf "%dM", m }'; }
+
+# search HF for GGUF repos -> lines "repo_id<TAB>downloads" (most downloaded first)
+hf_search() {
+  python3 - "$1" <<'PY'
+import json, sys, urllib.parse, urllib.request
+q = urllib.parse.quote(sys.argv[1])
+url = f"https://huggingface.co/api/models?search={q}&filter=gguf&sort=downloads&direction=-1&limit=25"
+req = urllib.request.Request(url, headers={"User-Agent": "run-llm.sh"})
+for m in json.load(urllib.request.urlopen(req, timeout=30)):
+    print(f"{m['id']}\t{m.get('downloads', 0)}")
+PY
+}
+
+# list a repo's GGUF files -> lines "name<TAB>total_MiB<TAB>file1,file2,..."
+# (multi-part shards grouped into one entry; mmproj excluded; smallest first)
+hf_files() {
+  python3 - "$1" <<'PY'
+import json, re, sys, urllib.request
+repo = sys.argv[1]
+url = f"https://huggingface.co/api/models/{repo}?blobs=true"
+req = urllib.request.Request(url, headers={"User-Agent": "run-llm.sh"})
+d = json.load(urllib.request.urlopen(req, timeout=30))
+groups = {}
+for s in d.get("siblings", []):
+    f = s.get("rfilename", "")
+    if not f.lower().endswith(".gguf") or "mmproj" in f.lower():
+        continue
+    base = re.sub(r"-\d{5}-of-\d{5}(?=\.gguf$)", "", f)
+    g = groups.setdefault(base, {"files": [], "size": 0})
+    g["files"].append(f)
+    g["size"] += s.get("size") or 0
+for base, g in sorted(groups.items(), key=lambda kv: kv[1]["size"]):
+    print(f"{base}\t{g['size'] // (1024 * 1024)}\t{','.join(sorted(g['files']))}")
+PY
+}
+
+pull_files() {  # $1 = repo, $2 = comma-separated rfilenames
+  local repo="$1" f url dest
+  mkdir -p "$PULL_DIR"
+  local IFS=','
+  for f in $2; do
+    url="https://huggingface.co/$repo/resolve/main/$f"
+    dest="$PULL_DIR/$(printf '%s' "$repo" | tr '/' '_')_$(basename "$f")"
+    if [ -f "$dest" ]; then
+      echo ">> already downloaded: $dest"
+      continue
+    fi
+    echo ">> downloading $f"
+    curl -L --fail --progress-bar -C - ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} \
+      -o "$dest.part" "$url"
+    mv "$dest.part" "$dest"
+    echo ">> saved: $dest"
+  done
+  echo ">> done. serve it with: $0 -m <name substring>"
+}
+
+cmd_pull() {
+  local arg="${1:-}" repo="" quant="" idx choice pick base
+  command -v python3 >/dev/null 2>&1 || { echo "!! pull needs python3" >&2; exit 1; }
+  command -v curl >/dev/null 2>&1 || { echo "!! pull needs curl" >&2; exit 1; }
+
+  if [ -z "$arg" ]; then
+    printf "Search Hugging Face for GGUF models (q to quit): "
+    read -r arg
+    { [ -n "$arg" ] && [ "$arg" != "q" ]; } || exit 0
+  fi
+
+  # owner/repo[:quant] goes straight to the repo; anything else is a search term
+  case "$arg" in
+    */*) repo="${arg%%:*}"
+         case "$arg" in *:*) quant="${arg#*:}";; esac ;;
+  esac
+
+  if [ -z "$repo" ]; then
+    local REPOS=() DLS=() id dls
+    while IFS=$'\t' read -r id dls; do
+      [ -n "$id" ] || continue
+      REPOS+=("$id"); DLS+=("$dls")
+    done < <(hf_search "$arg" || true)
+    if [ "${#REPOS[@]}" -eq 0 ]; then
+      echo "!! no GGUF models on Hugging Face matching '$arg'" >&2
+      exit 1
+    fi
+    echo "GGUF models on Hugging Face matching '$arg':"
+    idx=1
+    for id in "${REPOS[@]}"; do
+      printf "  %2d) %-65s %10s downloads\n" "$idx" "$id" "${DLS[$((idx - 1))]}"
+      idx=$((idx + 1))
+    done
+    printf "Select model [1-%d] (q to quit): " "${#REPOS[@]}"
+    read -r choice
+    [ "$choice" = "q" ] && exit 0
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#REPOS[@]}" ]; then
+      echo "Invalid selection."; exit 1
+    fi
+    repo="${REPOS[$((choice - 1))]}"
+  fi
+
+  echo ">> fetching file list for $repo ..."
+  local BASES=() SIZES=() FILESL=() mib files
+  while IFS=$'\t' read -r base mib files; do
+    [ -n "$base" ] || continue
+    if [ -n "$quant" ]; then
+      printf '%s' "$base" | command grep -qi -- "$quant" || continue
+    fi
+    BASES+=("$base"); SIZES+=("$mib"); FILESL+=("$files")
+  done < <(hf_files "$repo" || true)
+  if [ "${#BASES[@]}" -eq 0 ]; then
+    echo "!! no .gguf files in $repo${quant:+ matching '$quant'}" >&2
+    exit 1
+  fi
+
+  if [ "${#BASES[@]}" -eq 1 ]; then
+    pick=0
+    echo ">> $(human_mib "${SIZES[0]}")  ${BASES[0]}"
+  else
+    echo "Available files in $repo:"
+    idx=1
+    for base in "${BASES[@]}"; do
+      printf "  %2d) %-8s %s\n" "$idx" "$(human_mib "${SIZES[$((idx - 1))]}")" "$base"
+      idx=$((idx + 1))
+    done
+    printf "Select file [1-%d] (q to quit): " "${#BASES[@]}"
+    read -r choice
+    [ "$choice" = "q" ] && exit 0
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#BASES[@]}" ]; then
+      echo "Invalid selection."; exit 1
+    fi
+    pick=$((choice - 1))
+  fi
+  pull_files "$repo" "${FILESL[$pick]}"
+}
+
+# ---- subcommands: list / pull / stop / status / deps / build ----------------
 case "${1:-}" in
   list|--list)
     echo "Local GGUF models (usable with -m <substring>, no re-download):"
@@ -289,6 +429,11 @@ case "${1:-}" in
     fi
     exit 0
     ;;
+  pull|download)
+    shift
+    cmd_pull "$*"
+    exit 0
+    ;;
   deps|install-deps)
     install_deps "${2:-$(detect_backend)}"
     exit 0
@@ -312,7 +457,7 @@ while [ $# -gt 0 ]; do
     --port)        PORT="$2"; shift 2;;
     --backend)     BACKEND="$2"; shift 2;;
     --)            shift; EXTRA+=("$@"); break;;
-    -h|--help)     sed -n '2,33p' "$0"; exit 0;;
+    -h|--help)     sed -n '2,36p' "$0"; exit 0;;
     *)             EXTRA+=("$1"); shift;;
   esac
 done
