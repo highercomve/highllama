@@ -13,6 +13,7 @@
 # One-shot setup on any platform:
 #   highllama deps [backend]    # install build requirements (pacman/apt/dnf/zypper/brew)
 #   highllama build [backend]   # clone (if needed) + cmake-build llama.cpp for the backend
+#   highllama update [backend]  # git pull llama.cpp + rebuild for the backend
 #
 # Manual cmake equivalents (inside llama.cpp/):
 #   NVIDIA: cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
@@ -33,6 +34,7 @@
 #   highllama --backend mlx -m mlx-community/Qwen3-8B-4bit
 #   highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
 #   highllama -m <model> --daemon                # background; logs -> journal
+#   highllama logs                              # stream daemon journal logs
 #
 # Everything is overridable by flag OR env var (flag wins):
 #   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT HOST PORT BACKEND
@@ -312,6 +314,18 @@ build_llama() {
     echo ">> built: $LLAMA_DIR/build/bin/llama-server"
 }
 
+update_llama() {
+    local backend="$1"
+    if [ -d "$LLAMA_DIR" ]; then
+        echo ">> updating llama.cpp in $LLAMA_DIR (git pull) ..."
+        git -C "$LLAMA_DIR" pull
+    else
+        echo ">> llama.cpp directory does not exist, cloning first ..."
+        git clone https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
+    fi
+    build_llama "$backend"
+}
+
 # ---- pull: download GGUFs from Hugging Face (LM Studio-style picker) -------
 # Default into LM Studio's models dir (publisher/repo/file layout) so LM Studio
 # sees pulled models too; fall back to the llama.cpp cache if LM Studio absent.
@@ -560,6 +574,18 @@ status)
     fi
     exit 0
     ;;
+logs)
+    if ! command -v journalctl >/dev/null 2>&1; then
+        echo "!! journalctl not found (logs are only written to the system journal on systemd systems)" >&2
+        exit 1
+    fi
+    shift
+    if [ $# -eq 0 ]; then
+        exec journalctl -t highllama -f
+    else
+        exec journalctl -t highllama "$@"
+    fi
+    ;;
 pull | download)
     shift
     cmd_pull "$*"
@@ -571,6 +597,10 @@ deps | install-deps)
     ;;
 build)
     build_llama "${2:-$(detect_backend)}"
+    exit 0
+    ;;
+update)
+    update_llama "${2:-$(detect_backend)}"
     exit 0
     ;;
 esac
@@ -624,7 +654,7 @@ while [ $# -gt 0 ]; do
         break
         ;;
     -h | --help)
-        sed -n '2,38p' "$0"
+        sed -n '2,40p' "$0"
         exit 0
         ;;
     *)
