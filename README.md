@@ -15,7 +15,7 @@ the backend is autodetected.
 | `install.sh` | symlink `highllama` into `~/.local/bin` (`--systemd` adds a user service) |
 | `gguf-estimate.py` | reads a GGUF header and estimates `--n-cpu-moe` for the free VRAM + context (SWA-aware) |
 | `localagent/` | run headless `claude` sub-agents on the local llama-server, validated by Opus — see [its README](localagent/README.md) |
-| `llama.cpp/` | upstream clone + build (not tracked; `highllama build` creates it) |
+| `llama.cpp/` | upstream clone + build (not tracked; `highllama build` / `update` creates/updates it) |
 
 ## Quick start
 
@@ -23,6 +23,7 @@ the backend is autodetected.
 ./install.sh          # symlink highllama into ~/.local/bin
 highllama deps        # install build requirements (pacman/apt/dnf/zypper/brew)
 highllama build       # clone + cmake-build llama.cpp for your backend
+highllama update      # git pull llama.cpp + rebuild for your backend
 highllama             # pick a local model interactively, serve on :8089
 ```
 
@@ -54,6 +55,7 @@ highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec decoding
 highllama --backend mlx -m mlx-community/Qwen3-8B-4bit      # MLX on macOS
 highllama ls                                 # list local models (picker view)
 highllama list | stop | status | logs        # full paths | kill | status | view logs
+highllama update                             # git pull llama.cpp + rebuild for the backend
 ```
 
 - **Downloads:** `pull` with no args asks for a search term and lists matching
@@ -62,6 +64,9 @@ highllama list | stop | status | logs        # full paths | kill | status | view
   `~/.lmstudio/models/<publisher>/<repo>/` — so LM Studio sees it too — or
   `~/.cache/llama.cpp` if LM Studio isn't installed; `list`/`-m` find both.
   Set `HF_TOKEN` for gated models, `PULL_DIR` to download elsewhere.
+- **Build / Update:** `deps` installs package requirements; `build` clones
+  and compiles `llama.cpp` for the active backend; `update` pulls the latest
+  upstream `llama.cpp` changes and rebuilds.
 
 - **Backends:** `cuda` / `rocm` / `vulkan` / `metal` / `mlx` / `cpu`, autodetected;
   override with `--backend` or `BACKEND=`.
