@@ -53,7 +53,7 @@ highllama -m qwen3-coder -c 128k             # fuzzy-match a local GGUF
 highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec decoding
 highllama --backend mlx -m mlx-community/Qwen3-8B-4bit      # MLX on macOS
 highllama ls                                 # list local models (picker view)
-highllama list | stop | status               # full paths | kill server | report
+highllama list | stop | status | logs        # full paths | kill | status | view logs
 ```
 
 - **Downloads:** `pull` with no args asks for a search term and lists matching
