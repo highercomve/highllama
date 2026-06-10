@@ -32,6 +32,7 @@
 #   highllama -m <model> -c 128k --ncmoe 44     # 128k + manual offload
 #   highllama --backend mlx -m mlx-community/Qwen3-8B-4bit
 #   highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
+#   highllama -m <model> --daemon                # background; logs -> journal
 #
 # Everything is overridable by flag OR env var (flag wins):
 #   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT HOST PORT BACKEND
@@ -58,6 +59,7 @@ DRAFT="${DRAFT:-}"          # optional draft model (HF tag or path) for speculat
 HOST="${HOST:-0.0.0.0}"   # 0.0.0.0 = reachable from other machines on the LAN
 PORT="${PORT:-8089}"        # 8080 is a very common conflict; auto-advances if busy
 BACKEND="${BACKEND:-}"      # empty = autodetect (see detect_backend)
+DAEMON=""                   # --daemon: detach to background, logs -> journal
 EXTRA=()                    # any extra args after `--` are passed straight to llama-server
 
 # Where local GGUFs live: LM Studio models + llama.cpp/HF download caches
@@ -470,11 +472,42 @@ case "${1:-}" in
     exit 0
     ;;
   stop)
+    # a systemd-managed server must be stopped through systemd, or
+    # Restart=on-failure just brings it back after the pkill. "activating"
+    # covers the RestartSec window where the unit isn't active yet but a
+    # respawn is pending; reset-failed cancels that pending restart.
+    stopped_unit=""
+    if command -v systemctl >/dev/null 2>&1; then
+      state="$(systemctl --user is-active highllama.service 2>/dev/null || true)"
+      if [ "$state" = "active" ] || [ "$state" = "activating" ]; then
+        echo ">> stopping systemd user service..."
+        systemctl --user stop highllama.service
+        systemctl --user reset-failed highllama.service 2>/dev/null || true
+        stopped_unit=1
+      fi
+    fi
     if [ -n "$(server_running)" ]; then
       echo ">> stopping server..."
       pkill -x llama-server 2>/dev/null || true
       pkill -f 'mlx_lm.server|mlx_lm server' 2>/dev/null || true
-      sleep 1
+      # SIGTERM shutdown can take a few seconds (VRAM teardown); wait for
+      # the process to actually die instead of declaring victory blind
+      for _ in $(seq 1 20); do
+        [ -n "$(server_running)" ] || break
+        sleep 0.5
+      done
+      if [ -n "$(server_running)" ]; then
+        echo ">> still alive after 10s, sending SIGKILL..."
+        pkill -9 -x llama-server 2>/dev/null || true
+        pkill -9 -f 'mlx_lm.server|mlx_lm server' 2>/dev/null || true
+        sleep 1
+      fi
+      if [ -n "$(server_running)" ]; then
+        echo "!! failed to stop: $(server_running)" >&2
+        exit 1
+      fi
+      echo ">> stopped."
+    elif [ -n "$stopped_unit" ]; then
       echo ">> stopped."
     else
       echo ">> no server running."
@@ -517,8 +550,9 @@ while [ $# -gt 0 ]; do
     --host)        HOST="$2"; shift 2;;
     --port)        PORT="$2"; shift 2;;
     --backend)     BACKEND="$2"; shift 2;;
+    -d|--daemon)   DAEMON=1; shift;;
     --)            shift; EXTRA+=("$@"); break;;
-    -h|--help)     sed -n '2,37p' "$0"; exit 0;;
+    -h|--help)     sed -n '2,38p' "$0"; exit 0;;
     *)             EXTRA+=("$1"); shift;;
   esac
 done
@@ -551,6 +585,9 @@ done
 
 # ---- MLX backend: hand off to mlx_lm.server (no GGUF machinery) ------------
 if [ "$BACKEND" = "mlx" ]; then
+  if [ -n "$DAEMON" ]; then
+    echo "!! --daemon is not supported with the mlx backend (no journal on macOS)" >&2; exit 1
+  fi
   if [ "$OS" != "Darwin" ]; then
     echo "!! mlx backend only works on macOS (Apple silicon)" >&2; exit 1
   fi
@@ -572,6 +609,11 @@ fi
 
 # ---- no model specified -> interactive picker (dynamic mode) ---------------
 if [ -z "$MODEL" ]; then
+  if [ ! -t 0 ]; then   # systemd / pipes: no tty for the picker
+    echo "!! no MODEL set and no tty for the interactive picker" >&2
+    echo "!! set MODEL= (e.g. in ~/.config/highllama/highllama.env) or pass -m" >&2
+    exit 1
+  fi
   echo "Available local models:"
   if ! print_model_menu; then
     echo "No local GGUF models found. Specify one to download: $0 -m <hf-repo:quant>"
@@ -586,6 +628,40 @@ if [ -z "$MODEL" ]; then
   fi
   MODEL="${MODELS[$((choice - 1))]}"
   echo ">> selected: $(basename "$MODEL")"
+fi
+
+# ---- daemon mode: re-exec detached, output to the system journal -----------
+# Runs after the picker so `highllama --daemon` can still ask interactively;
+# the child gets every resolved setting via env vars (all env-overridable).
+if [ -n "$DAEMON" ]; then
+  if ! command -v systemd-cat >/dev/null 2>&1; then
+    echo "!! --daemon needs systemd-cat to write logs to the journal" >&2
+    exit 1
+  fi
+  echo ">> starting in background (logs -> journal, tag 'highllama')"
+  setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
+    KVTYPE="$KVTYPE" DRAFT="$DRAFT" HOST="$HOST" PORT="$PORT" \
+    BACKEND="$BACKEND" PARALLEL="$PARALLEL" \
+    systemd-cat -t highllama "$SCRIPT_PATH" ${EXTRA[@]+-- "${EXTRA[@]}"} \
+    </dev/null >/dev/null 2>&1 &
+  DPID=$!
+  # wait for the server to come up (model load can take a while)
+  for _ in $(seq 1 240); do
+    if ! kill -0 "$DPID" 2>/dev/null && [ -z "$(server_running)" ]; then
+      echo "!! exited before the server became ready — see: journalctl -t highllama -e" >&2
+      exit 1
+    fi
+    if port_busy "$PORT"; then
+      echo ">> ready: http://${HOST}:${PORT}/v1"
+      echo ">> logs:  journalctl -t highllama -f"
+      echo ">> stop:  highllama stop"
+      exit 0
+    fi
+    sleep 0.5
+  done
+  echo ">> not ready after 120s (large model / first download?)"
+  echo ">> follow progress: journalctl -t highllama -f"
+  exit 0
 fi
 
 # ---- normalize context (accepts 32k / 64k / 128k or a raw token count) -----

@@ -12,7 +12,7 @@ the backend is autodetected.
 | path | what |
 |---|---|
 | `highllama` | launch `llama-server` for any GGUF — backend autodetect, smart MoE offload, OOM auto-retry |
-| `install.sh` | symlink `highllama` into `~/.local/bin` |
+| `install.sh` | symlink `highllama` into `~/.local/bin` (`--systemd` adds a user service) |
 | `gguf-estimate.py` | reads a GGUF header and estimates `--n-cpu-moe` for the free VRAM + context (SWA-aware) |
 | `localagent/` | run headless `claude` sub-agents on the local llama-server, validated by Opus — see [its README](localagent/README.md) |
 | `llama.cpp/` | upstream clone + build (not tracked; `highllama build` creates it) |
@@ -27,6 +27,20 @@ highllama             # pick a local model interactively, serve on :8089
 ```
 
 Then point any OpenAI-compatible client at `http://localhost:8089/v1`.
+
+## Run as a service (Linux)
+
+`./install.sh --systemd` installs an optional **systemd user unit**.
+Configure it in `~/.config/highllama/highllama.env` — `MODEL=` is required, and
+any highllama env var (`CONTEXT`, `PORT`, `KVTYPE`, ...) works there too:
+
+```bash
+systemctl --user start highllama       # launch the server
+systemctl --user enable highllama      # start on login
+loginctl enable-linger $USER           # ...or even without logging in
+journalctl --user -u highllama -f      # follow the server logs
+highllama status | stop                # stop detects the unit and uses systemd
+```
 
 ## highllama
 
