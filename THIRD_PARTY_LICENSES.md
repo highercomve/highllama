@@ -6,8 +6,8 @@ and depends on the following software at runtime:
 ## llama.cpp / ggml
 
 - https://github.com/ggml-org/llama.cpp
-- Cloned and built locally by `./run-llm.sh build` into `llama.cpp/` (not tracked
-  in this repository); `run-llm.sh` runs its `llama-server`.
+- Cloned and built locally by `highllama build` into `llama.cpp/` (not tracked
+  in this repository); `highllama` runs its `llama-server`.
 
 ```
 MIT License
@@ -36,5 +36,5 @@ SOFTWARE.
 ## mlx-lm (optional, `--backend mlx` on macOS)
 
 - https://github.com/ml-explore/mlx-lm — MIT License, Copyright © 2023-2024
-  Apple Inc. Installed separately via `pip install mlx-lm`; `run-llm.sh` only
+  Apple Inc. Installed separately via `pip install mlx-lm`; `highllama` only
   invokes its `mlx_lm.server` entry point.

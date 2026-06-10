@@ -48,7 +48,7 @@ proxy_start() {
   if proxy_healthy; then echo "proxy already up at $PROXY_URL"; return 0; fi
   command -v python3 >/dev/null || die "python3 not found"
   curl -s --max-time 3 "$LLAMA_BASE/v1/models" >/dev/null 2>&1 \
-    || echo "$(c_red warn:) llama-server not reachable at $LLAMA_BASE (start it with run-llm.sh)" >&2
+    || echo "$(c_red warn:) llama-server not reachable at $LLAMA_BASE (start it with highllama)" >&2
   echo "starting proxy: $PROXY_URL -> $LLAMA_BASE"
   LLAMA_PROXY_HOST="$PROXY_HOST" LLAMA_PROXY_PORT="$PROXY_PORT" \
   LLAMA_BASE="$LLAMA_BASE" LLAMA_PROXY_LOG="$PROXY_LOG" \

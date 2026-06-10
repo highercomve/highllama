@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run-llm.sh — launch ANY GGUF model on llama.cpp server (NVIDIA / AMD / Apple)
+# highllama — launch ANY GGUF model on llama.cpp server (NVIDIA / AMD / Apple)
 #
 # Backends (autodetected, override with --backend or BACKEND=):
 #   cuda    NVIDIA (nvidia-smi present)
@@ -11,8 +11,8 @@
 #   cpu     no GPU found
 #
 # One-shot setup on any platform:
-#   ./run-llm.sh deps [backend]    # install build requirements (pacman/apt/dnf/zypper/brew)
-#   ./run-llm.sh build [backend]   # clone (if needed) + cmake-build llama.cpp for the backend
+#   highllama deps [backend]    # install build requirements (pacman/apt/dnf/zypper/brew)
+#   highllama build [backend]   # clone (if needed) + cmake-build llama.cpp for the backend
 #
 # Manual cmake equivalents (inside llama.cpp/):
 #   NVIDIA: cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
@@ -22,23 +22,32 @@
 #   MLX:    pip install mlx-lm                                      # no build
 #
 # Usage:
-#   ./run-llm.sh pull                              # browse/search HF, pick + download
-#   ./run-llm.sh pull qwen3 coder                  # search HF by term
-#   ./run-llm.sh pull unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_XL  # direct
-#   ./run-llm.sh                                   # interactive picker, 64k ctx
-#   ./run-llm.sh -m unsloth/gpt-oss-20b-GGUF:Q8_0  # any HF repo:quant
-#   ./run-llm.sh -m /path/to/model.gguf -c 32k     # any local GGUF
-#   ./run-llm.sh -m <model> -c 128k --ncmoe 44     # 128k + manual offload
-#   ./run-llm.sh --backend mlx -m mlx-community/Qwen3-8B-4bit
-#   ./run-llm.sh -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
+#   highllama pull                              # browse/search HF, pick + download
+#   highllama pull qwen3 coder                  # search HF by term
+#   highllama pull unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_XL  # direct
+#   highllama                                   # interactive picker, 64k ctx
+#   highllama ls                                # list local models (picker view)
+#   highllama -m unsloth/gpt-oss-20b-GGUF:Q8_0  # any HF repo:quant
+#   highllama -m /path/to/model.gguf -c 32k     # any local GGUF
+#   highllama -m <model> -c 128k --ncmoe 44     # 128k + manual offload
+#   highllama --backend mlx -m mlx-community/Qwen3-8B-4bit
+#   highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
 #
 # Everything is overridable by flag OR env var (flag wins):
 #   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT HOST PORT BACKEND
 #
 set -euo pipefail
 
+# resolve the real script location (works when invoked via a ~/.local/bin symlink)
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  link="$(readlink "$SCRIPT_PATH")"
+  case "$link" in /*) SCRIPT_PATH="$link" ;; *) SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$link" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
 # ---- defaults -------------------------------------------------------------
-LLAMA_DIR="${LLAMA_DIR:-$HOME/Code/llms/llama.cpp}"
+LLAMA_DIR="${LLAMA_DIR:-$SCRIPT_DIR/llama.cpp}"
 MODEL="${MODEL:-}"          # empty => interactive picker (no-arg dynamic mode)
 CONTEXT="${CONTEXT:-64k}"   # accepts 32k / 64k / 128k or a raw token count
 NCMOE="${NCMOE:-}"          # MoE layers pinned to CPU; empty = auto by free VRAM
@@ -52,8 +61,12 @@ BACKEND="${BACKEND:-}"      # empty = autodetect (see detect_backend)
 EXTRA=()                    # any extra args after `--` are passed straight to llama-server
 
 # Where local GGUFs live: LM Studio models + llama.cpp/HF download caches
+# + Unsloth Studio (legacy HF cache, fine-tune exports/outputs; its main
+# downloads go to the standard HF hub cache above)
 MODEL_ROOTS=("$HOME/.lmstudio/models" "$HOME/.cache/huggingface/hub" \
-             "$HOME/.cache/llama.cpp" "$HOME/Library/Caches/llama.cpp")
+             "$HOME/.cache/llama.cpp" "$HOME/Library/Caches/llama.cpp" \
+             "$HOME/.unsloth/studio/cache/huggingface/hub" \
+             "$HOME/.unsloth/studio/exports" "$HOME/.unsloth/studio/outputs")
 
 # ---- portability helpers (GNU/Linux + BSD/macOS) ---------------------------
 OS="$(uname -s)"
@@ -143,6 +156,19 @@ collect_local_models() {
     [ -d "$d" ] || continue
     command find -L "$d" -type f -iname '*.gguf' 2>/dev/null
   done | command grep -iv 'mmproj' | command grep -v '/blobs/' | sort -u || true
+}
+
+# numbered size+name listing of local models (picker look); fills MODELS array.
+# returns 1 if none found.
+print_model_menu() {
+  MODELS=()
+  local m idx=1
+  while IFS= read -r m; do [ -n "$m" ] && MODELS+=("$m"); done < <(collect_local_models)
+  [ "${#MODELS[@]}" -gt 0 ] || return 1
+  for m in "${MODELS[@]}"; do
+    printf "  %2d) %-7s %s\n" "$idx" "$(command du -hL "$m" 2>/dev/null | cut -f1)" "$(basename "$m")"
+    idx=$((idx + 1))
+  done
 }
 
 # normalize a context size: accepts 32k / 64K / 128k / 131072 -> token count
@@ -280,7 +306,7 @@ hf_search() {
 import json, sys, urllib.parse, urllib.request
 q = urllib.parse.quote(sys.argv[1])
 url = f"https://huggingface.co/api/models?search={q}&filter=gguf&sort=downloads&direction=-1&limit=25"
-req = urllib.request.Request(url, headers={"User-Agent": "run-llm.sh"})
+req = urllib.request.Request(url, headers={"User-Agent": "highllama"})
 for m in json.load(urllib.request.urlopen(req, timeout=30)):
     print(f"{m['id']}\t{m.get('downloads', 0)}")
 PY
@@ -293,7 +319,7 @@ hf_files() {
 import json, re, sys, urllib.request
 repo = sys.argv[1]
 url = f"https://huggingface.co/api/models/{repo}?blobs=true"
-req = urllib.request.Request(url, headers={"User-Agent": "run-llm.sh"})
+req = urllib.request.Request(url, headers={"User-Agent": "highllama"})
 d = json.load(urllib.request.urlopen(req, timeout=30))
 groups = {}
 for s in d.get("siblings", []):
@@ -428,8 +454,16 @@ cmd_pull() {
   pull_files "$repo" "${FILESL[$pick]}"
 }
 
-# ---- subcommands: list / pull / stop / status / deps / build ----------------
+# ---- subcommands: ls / list / pull / stop / status / deps / build -----------
 case "${1:-}" in
+  ls)
+    echo "Available local models:"
+    if ! print_model_menu; then
+      echo "No local GGUF models found. Download one with: $0 pull"
+      exit 1
+    fi
+    exit 0
+    ;;
   list|--list)
     echo "Local GGUF models (usable with -m <substring>, no re-download):"
     list_local_models
@@ -484,7 +518,7 @@ while [ $# -gt 0 ]; do
     --port)        PORT="$2"; shift 2;;
     --backend)     BACKEND="$2"; shift 2;;
     --)            shift; EXTRA+=("$@"); break;;
-    -h|--help)     sed -n '2,36p' "$0"; exit 0;;
+    -h|--help)     sed -n '2,37p' "$0"; exit 0;;
     *)             EXTRA+=("$1"); shift;;
   esac
 done
@@ -500,7 +534,7 @@ if [ -n "$running" ]; then
   echo ">> A server is already running:"
   echo "   $running"
   [ -n "$rport" ] && echo ">> Endpoint: http://${HOST}:${rport}/v1"
-  echo ">> To switch models: ./run-llm.sh stop   (then run this again)"
+  echo ">> To switch models: highllama stop   (then run this again)"
   exit 0
 fi
 
@@ -538,18 +572,11 @@ fi
 
 # ---- no model specified -> interactive picker (dynamic mode) ---------------
 if [ -z "$MODEL" ]; then
-  MODELS=()
-  while IFS= read -r m; do [ -n "$m" ] && MODELS+=("$m"); done < <(collect_local_models)
-  if [ "${#MODELS[@]}" -eq 0 ]; then
+  echo "Available local models:"
+  if ! print_model_menu; then
     echo "No local GGUF models found. Specify one to download: $0 -m <hf-repo:quant>"
     exit 1
   fi
-  echo "Available local models:"
-  idx=1
-  for m in "${MODELS[@]}"; do
-    printf "  %2d) %-7s %s\n" "$idx" "$(command du -hL "$m" 2>/dev/null | cut -f1)" "$(basename "$m")"
-    idx=$((idx + 1))
-  done
   printf "Select model [1-%d] (q to quit): " "${#MODELS[@]}"
   read -r choice
   [ "$choice" = "q" ] && exit 0
@@ -640,7 +667,7 @@ if [ -z "$NCMOE" ]; then
       FREE_MIB="$(free_vram_mib "$BACKEND")"
       est=""
       if [ "${MODEL_ARGS[0]}" = "-m" ] && [ -n "${FREE_MIB:-}" ] && command -v python3 >/dev/null 2>&1; then
-        est="$(python3 "$(dirname "$0")/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
+        est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
       fi
       if [ -n "$est" ]; then
         NCMOE="${est%% *}"                 # "<ncmoe> <layers>"
@@ -675,7 +702,7 @@ if [ ! -x "$LLAMA_BIN" ]; then
 fi
 
 # ---- launch with OOM auto-retry: bump expert-offload until it fits ----------
-LOG="$(mktemp "${TMPDIR:-/tmp}/run-llm.XXXXXX")"
+LOG="$(mktemp "${TMPDIR:-/tmp}/highllama.XXXXXX")"
 SRV=""; TAILER=""
 cleanup() { [ -n "$TAILER" ] && kill "$TAILER" 2>/dev/null; [ -n "$SRV" ] && kill "$SRV" 2>/dev/null; rm -f "$LOG"; }
 trap cleanup EXIT

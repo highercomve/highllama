@@ -51,7 +51,7 @@ Headless `claude` sub-agents, isolated in a git worktree, so Opus can validate t
   anthropic_proxy.py ← stdlib translation proxy (Anthropic ⇄ OpenAI)
      │  OpenAI /v1/chat/completions
      ▼
-  llama-server :8089 ← gemma / qwen / whatever run-llm.sh loaded
+  llama-server :8089 ← gemma / qwen / whatever highllama loaded
 
   Opus reviews .git/localagent/meta/<branch>/changes.diff  →  localagent apply | discard
 ```
@@ -92,7 +92,7 @@ Agents (Claude Code, loaded at startup — restart to pick up changes):
 - `~/.claude/agents/local-llama.md` — native worker (`model: local-llama`, needs a
   `claude-local` session).
 
-Requires `llama-server` running (use `~/Code/llms/run-llm.sh`) and the `claude` CLI.
+Requires `llama-server` running (use `highllama`) and the `claude` CLI.
 
 ## Usage
 
@@ -162,7 +162,7 @@ Tested gemma-4-26B-A4B vs Qwen3-Coder-30B-A3B as the agent brain, same harness/t
 | open-ended discovery (grep→read→synthesize) | ✅ completes, accurate, exact citations | ❌ flails, gives up, hallucinates |
 | best at | the agentic loop here | raw coding when *handed* exact files |
 
-**Use gemma-4-26B as the local brain** (`run-llm.sh -m gemma`). Despite being the "coder"
+**Use gemma-4-26B as the local brain** (`highllama -m gemma`). Despite being the "coder"
 model, Qwen3-Coder underperforms in this agentic harness. **Context size was a red herring**
 — 64k vs 128k made no difference; the model was the deciding factor. 64k is faster on gemma
 (~47 t/s) and plenty.
