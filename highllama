@@ -42,145 +42,159 @@ set -euo pipefail
 # resolve the real script location (works when invoked via a ~/.local/bin symlink)
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 while [ -L "$SCRIPT_PATH" ]; do
-  link="$(readlink "$SCRIPT_PATH")"
-  case "$link" in /*) SCRIPT_PATH="$link" ;; *) SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$link" ;; esac
+    link="$(readlink "$SCRIPT_PATH")"
+    case "$link" in /*) SCRIPT_PATH="$link" ;; *) SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$link" ;; esac
 done
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # ---- defaults -------------------------------------------------------------
 LLAMA_DIR="${LLAMA_DIR:-$SCRIPT_DIR/llama.cpp}"
-MODEL="${MODEL:-}"          # empty => interactive picker (no-arg dynamic mode)
-CONTEXT="${CONTEXT:-64k}"   # accepts 32k / 64k / 128k or a raw token count
-NCMOE="${NCMOE:-}"          # MoE layers pinned to CPU; empty = auto by free VRAM
-THREADS="${THREADS:-}"      # empty = physical cores. NEVER SMT count (gen collapses)
-KVTYPE="${KVTYPE:-q4_0}"    # KV cache quant: q4_0 (lean) | q8_0 (higher quality) | f16
-PARALLEL="${PARALLEL:-1}"   # server slots. 1 = single-user (least VRAM). >1 multiplies buffers
-DRAFT="${DRAFT:-}"          # optional draft model (HF tag or path) for speculative decoding
+MODEL="${MODEL:-}"        # empty => interactive picker (no-arg dynamic mode)
+CONTEXT="${CONTEXT:-64k}" # accepts 32k / 64k / 128k or a raw token count
+NCMOE="${NCMOE:-}"        # MoE layers pinned to CPU; empty = auto by free VRAM
+THREADS="${THREADS:-}"    # empty = physical cores. NEVER SMT count (gen collapses)
+KVTYPE="${KVTYPE:-q4_0}"  # KV cache quant: q4_0 (lean) | q8_0 (higher quality) | f16
+PARALLEL="${PARALLEL:-1}" # server slots. 1 = single-user (least VRAM). >1 multiplies buffers
+DRAFT="${DRAFT:-}"        # optional draft model (HF tag or path) for speculative decoding
 HOST="${HOST:-0.0.0.0}"   # 0.0.0.0 = reachable from other machines on the LAN
-PORT="${PORT:-8089}"        # 8080 is a very common conflict; auto-advances if busy
-BACKEND="${BACKEND:-}"      # empty = autodetect (see detect_backend)
-DAEMON=""                   # --daemon: detach to background, logs -> journal
-EXTRA=()                    # any extra args after `--` are passed straight to llama-server
+PORT="${PORT:-8089}"      # 8080 is a very common conflict; auto-advances if busy
+BACKEND="${BACKEND:-}"    # empty = autodetect (see detect_backend)
+DAEMON=""                 # --daemon: detach to background, logs -> journal
+EXTRA=()                  # any extra args after `--` are passed straight to llama-server
 
 # Where local GGUFs live: LM Studio models + llama.cpp/HF download caches
 # + Unsloth Studio (legacy HF cache, fine-tune exports/outputs; its main
 # downloads go to the standard HF hub cache above)
-MODEL_ROOTS=("$HOME/.lmstudio/models" "$HOME/.cache/huggingface/hub" \
-             "$HOME/.cache/llama.cpp" "$HOME/Library/Caches/llama.cpp" \
-             "$HOME/.unsloth/studio/cache/huggingface/hub" \
-             "$HOME/.unsloth/studio/exports" "$HOME/.unsloth/studio/outputs")
+MODEL_ROOTS=("$HOME/.lmstudio/models" "$HOME/.cache/huggingface/hub"
+    "$HOME/.cache/llama.cpp" "$HOME/Library/Caches/llama.cpp"
+    "$HOME/.unsloth/studio/cache/huggingface/hub"
+    "$HOME/.unsloth/studio/exports" "$HOME/.unsloth/studio/outputs")
 
 # ---- portability helpers (GNU/Linux + BSD/macOS) ---------------------------
 OS="$(uname -s)"
 
-file_size() {  # bytes, following symlinks
-  stat -Lc%s "$1" 2>/dev/null || stat -Lf%z "$1" 2>/dev/null
+file_size() { # bytes, following symlinks
+    stat -Lc%s "$1" 2>/dev/null || stat -Lf%z "$1" 2>/dev/null
 }
 
 port_busy() {
-  if command -v ss >/dev/null 2>&1; then
-    ss -ltn 2>/dev/null | command grep -q ":$1 "
-  elif command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
-  else
-    netstat -an 2>/dev/null | command grep -q "[.:]$1 .*LISTEN"
-  fi
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | command grep -q ":$1 "
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+    else
+        netstat -an 2>/dev/null | command grep -q "[.:]$1 .*LISTEN"
+    fi
 }
 
 physical_cores() {
-  if [ "$OS" = "Darwin" ]; then
-    sysctl -n hw.physicalcpu 2>/dev/null || echo 8
-  else
-    local n
-    n="$(lscpu -b -p=Core,Socket 2>/dev/null | command grep -v '^#' | sort -u | wc -l)"
-    [ "${n:-0}" -gt 0 ] && echo "$n" || echo "$(( $(nproc 2>/dev/null || echo 16) / 2 ))"
-  fi
+    if [ "$OS" = "Darwin" ]; then
+        sysctl -n hw.physicalcpu 2>/dev/null || echo 8
+    else
+        local n
+        n="$(lscpu -b -p=Core,Socket 2>/dev/null | command grep -v '^#' | sort -u | wc -l)"
+        [ "${n:-0}" -gt 0 ] && echo "$n" || echo "$(($(nproc 2>/dev/null || echo 16) / 2))"
+    fi
 }
 
 detect_backend() {
-  if [ "$OS" = "Darwin" ]; then echo metal; return; fi
-  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then echo cuda; return; fi
-  if command -v rocm-smi >/dev/null 2>&1 || command -v amd-smi >/dev/null 2>&1; then echo rocm; return; fi
-  if command -v vulkaninfo >/dev/null 2>&1; then echo vulkan; return; fi
-  echo cpu
+    if [ "$OS" = "Darwin" ]; then
+        echo metal
+        return
+    fi
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+        echo cuda
+        return
+    fi
+    if command -v rocm-smi >/dev/null 2>&1 || command -v amd-smi >/dev/null 2>&1; then
+        echo rocm
+        return
+    fi
+    if command -v vulkaninfo >/dev/null 2>&1; then
+        echo vulkan
+        return
+    fi
+    echo cpu
 }
 
 # free VRAM in MiB; prints nothing if unknown (caller falls back to buckets)
 free_vram_mib() {
-  case "$1" in
+    case "$1" in
     cuda)
-      nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null \
-        | head -1 | tr -dc '0-9' ;;
+        nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null |
+            head -1 | tr -dc '0-9'
+        ;;
     rocm)
-      # rocm-smi CSV: device,VRAM Total Memory (B),VRAM Total Used Memory (B)
-      rocm-smi --showmeminfo vram --csv 2>/dev/null | awk -F, '
-        NR==2 { printf "%d\n", ($2-$3)/1048576 }' ;;
-    *) : ;;   # vulkan/metal/cpu: unknown / unified memory
-  esac
+        # rocm-smi CSV: device,VRAM Total Memory (B),VRAM Total Used Memory (B)
+        rocm-smi --showmeminfo vram --csv 2>/dev/null | awk -F, '
+        NR==2 { printf "%d\n", ($2-$3)/1048576 }'
+        ;;
+    *) : ;; # vulkan/metal/cpu: unknown / unified memory
+    esac
 }
 
 gpu_status() {
-  case "$1" in
+    case "$1" in
     cuda) nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv,noheader 2>/dev/null || true ;;
     rocm) rocm-smi --showmeminfo vram 2>/dev/null | command grep -i vram || true ;;
-    metal) echo "unified memory: $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 )) MiB total" ;;
+    metal) echo "unified memory: $(($(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576)) MiB total" ;;
     *) echo "(no VRAM telemetry for backend '$1')" ;;
-  esac
+    esac
 }
 
 # list every local .gguf (excluding multimodal projectors) with size + path
 list_local_models() {
-  local d
-  printf '%-10s  %s\n' "SIZE" "PATH"
-  for d in "${MODEL_ROOTS[@]}"; do
-    [ -d "$d" ] || continue
-    command find -L "$d" -type f -iname '*.gguf' 2>/dev/null   # -L: follow HF-cache symlinks
-  done | command grep -iv 'mmproj' | command grep -v '/blobs/' | sort -u | while read -r f; do
-    printf '%-10s  %s\n' "$(command du -hL "$f" 2>/dev/null | cut -f1)" "$f"
-  done
+    local d
+    printf '%-10s  %s\n' "SIZE" "PATH"
+    for d in "${MODEL_ROOTS[@]}"; do
+        [ -d "$d" ] || continue
+        command find -L "$d" -type f -iname '*.gguf' 2>/dev/null # -L: follow HF-cache symlinks
+    done | command grep -iv 'mmproj' | command grep -v '/blobs/' | sort -u | while read -r f; do
+        printf '%-10s  %s\n' "$(command du -hL "$f" 2>/dev/null | cut -f1)" "$f"
+    done
 }
 
 # resolve a search term to the best local .gguf (largest non-mmproj match); empty if none
 resolve_local_gguf() {
-  local term="$1" d
-  for d in "${MODEL_ROOTS[@]}"; do
-    [ -d "$d" ] || continue
-    command find -L "$d" -type f -iname '*.gguf' 2>/dev/null   # -L: follow HF-cache symlinks
-  done | command grep -iv 'mmproj' | command grep -v '/blobs/' | command grep -i -- "$term" \
-    | while read -r f; do printf '%s\t%s\n' "$(file_size "$f")" "$f"; done \
-    | sort -rn | head -1 | cut -f2- || true
+    local term="$1" d
+    for d in "${MODEL_ROOTS[@]}"; do
+        [ -d "$d" ] || continue
+        command find -L "$d" -type f -iname '*.gguf' 2>/dev/null # -L: follow HF-cache symlinks
+    done | command grep -iv 'mmproj' | command grep -v '/blobs/' | command grep -i -- "$term" |
+        while read -r f; do printf '%s\t%s\n' "$(file_size "$f")" "$f"; done |
+        sort -rn | head -1 | cut -f2- || true
 }
 
 # all local model paths, one per line (for the interactive picker)
 collect_local_models() {
-  local d
-  for d in "${MODEL_ROOTS[@]}"; do
-    [ -d "$d" ] || continue
-    command find -L "$d" -type f -iname '*.gguf' 2>/dev/null
-  done | command grep -iv 'mmproj' | command grep -v '/blobs/' | sort -u || true
+    local d
+    for d in "${MODEL_ROOTS[@]}"; do
+        [ -d "$d" ] || continue
+        command find -L "$d" -type f -iname '*.gguf' 2>/dev/null
+    done | command grep -iv 'mmproj' | command grep -v '/blobs/' | sort -u || true
 }
 
 # numbered size+name listing of local models (picker look); fills MODELS array.
 # returns 1 if none found.
 print_model_menu() {
-  MODELS=()
-  local m idx=1
-  while IFS= read -r m; do [ -n "$m" ] && MODELS+=("$m"); done < <(collect_local_models)
-  [ "${#MODELS[@]}" -gt 0 ] || return 1
-  for m in "${MODELS[@]}"; do
-    printf "  %2d) %-7s %s\n" "$idx" "$(command du -hL "$m" 2>/dev/null | cut -f1)" "$(basename "$m")"
-    idx=$((idx + 1))
-  done
+    MODELS=()
+    local m idx=1
+    while IFS= read -r m; do [ -n "$m" ] && MODELS+=("$m"); done < <(collect_local_models)
+    [ "${#MODELS[@]}" -gt 0 ] || return 1
+    for m in "${MODELS[@]}"; do
+        printf "  %2d) %-7s %s\n" "$idx" "$(command du -hL "$m" 2>/dev/null | cut -f1)" "$(basename "$m")"
+        idx=$((idx + 1))
+    done
 }
 
 # normalize a context size: accepts 32k / 64K / 128k / 131072 -> token count
 to_tokens() {
-  local v="$1"
-  case "$v" in
-    *[kK]) echo $(( ${v%[kK]} * 1024 )) ;;
-    *[mM]) echo $(( ${v%[mM]} * 1024 * 1024 )) ;;
-    *)     echo "$v" ;;
-  esac
+    local v="$1"
+    case "$v" in
+    *[kK]) echo $((${v%[kK]} * 1024)) ;;
+    *[mM]) echo $((${v%[mM]} * 1024 * 1024)) ;;
+    *) echo "$v" ;;
+    esac
 }
 
 # is a server already running? prints its cmdline if so.
@@ -188,123 +202,130 @@ to_tokens() {
 # regardless of how/where the server was launched (avoids stacking a 2nd server
 # on top of one already holding VRAM). Also catches an MLX server.
 server_running() {
-  local pid
-  pid="$(pgrep -x llama-server 2>/dev/null | head -1 || true)"
-  [ -n "$pid" ] || pid="$(pgrep -f 'mlx_lm.server|mlx_lm server' 2>/dev/null | head -1 || true)"
-  [ -n "$pid" ] || return 0
-  ps -o args= -p "$pid" 2>/dev/null || true
+    local pid
+    pid="$(pgrep -x llama-server 2>/dev/null | head -1 || true)"
+    [ -n "$pid" ] || pid="$(pgrep -f 'mlx_lm.server|mlx_lm server' 2>/dev/null | head -1 || true)"
+    [ -n "$pid" ] || return 0
+    ps -o args= -p "$pid" 2>/dev/null || true
 }
 
 # ---- build requirements per platform (deps subcommand) ---------------------
 install_deps() {
-  local backend="$1"
-  echo ">> installing build requirements for backend=$backend ..."
-  if [ "$OS" = "Darwin" ]; then
-    xcode-select -p >/dev/null 2>&1 || xcode-select --install || true
-    if command -v brew >/dev/null 2>&1; then
-      brew install cmake git curl
-    else
-      echo "!! Homebrew not found (https://brew.sh) — need cmake + git on top of Xcode CLT" >&2
+    local backend="$1"
+    echo ">> installing build requirements for backend=$backend ..."
+    if [ "$OS" = "Darwin" ]; then
+        xcode-select -p >/dev/null 2>&1 || xcode-select --install || true
+        if command -v brew >/dev/null 2>&1; then
+            brew install cmake git curl
+        else
+            echo "!! Homebrew not found (https://brew.sh) — need cmake + git on top of Xcode CLT" >&2
+        fi
+        [ "$backend" = "mlx" ] && python3 -m pip install --upgrade mlx-lm
+        echo ">> deps done."
+        return 0
     fi
-    [ "$backend" = "mlx" ] && python3 -m pip install --upgrade mlx-lm
+
+    local SUDO=""
+    [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+
+    if command -v pacman >/dev/null 2>&1; then
+        $SUDO pacman -S --needed --noconfirm base-devel cmake git curl python
+        case "$backend" in
+        cuda) $SUDO pacman -S --needed --noconfirm cuda ;;
+        rocm) $SUDO pacman -S --needed --noconfirm rocm-hip-sdk rocminfo ;;
+        vulkan) $SUDO pacman -S --needed --noconfirm vulkan-headers vulkan-icd-loader vulkan-tools shaderc ;;
+        esac
+    elif command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update
+        $SUDO apt-get install -y build-essential cmake git libcurl4-openssl-dev python3
+        case "$backend" in
+        cuda) $SUDO apt-get install -y nvidia-cuda-toolkit ||
+            echo "!! install the CUDA toolkit from NVIDIA's repo: https://developer.nvidia.com/cuda-downloads" >&2 ;;
+        rocm) $SUDO apt-get install -y rocm-hip-sdk rocminfo ||
+            echo "!! ROCm needs AMD's repo first: https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
+        vulkan) $SUDO apt-get install -y libvulkan-dev glslc vulkan-tools ||
+            $SUDO apt-get install -y libvulkan-dev glslang-tools vulkan-tools ;;
+        esac
+    elif command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y gcc-c++ cmake git libcurl-devel python3
+        case "$backend" in
+        cuda) echo "!! CUDA on Fedora: enable NVIDIA's repo, then: dnf install cuda-toolkit" >&2 ;;
+        rocm) $SUDO dnf install -y rocm-hip-devel hipblas-devel rocminfo ||
+            echo "!! see https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
+        vulkan) $SUDO dnf install -y vulkan-headers vulkan-loader-devel glslc vulkan-tools ;;
+        esac
+    elif command -v zypper >/dev/null 2>&1; then
+        $SUDO zypper install -y gcc-c++ cmake git libcurl-devel python3
+        case "$backend" in
+        cuda) echo "!! CUDA on openSUSE: add NVIDIA's repo, then: zypper install cuda-toolkit" >&2 ;;
+        rocm) echo "!! ROCm on openSUSE: see https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
+        vulkan) $SUDO zypper install -y vulkan-headers vulkan-loader-devel shaderc vulkan-tools ;;
+        esac
+    else
+        echo "!! unknown package manager — install manually: C++ toolchain, cmake, git, libcurl dev" >&2
+        return 1
+    fi
     echo ">> deps done."
-    return 0
-  fi
-
-  local SUDO=""
-  [ "$(id -u)" -ne 0 ] && SUDO="sudo"
-
-  if command -v pacman >/dev/null 2>&1; then
-    $SUDO pacman -S --needed --noconfirm base-devel cmake git curl python
-    case "$backend" in
-      cuda)   $SUDO pacman -S --needed --noconfirm cuda ;;
-      rocm)   $SUDO pacman -S --needed --noconfirm rocm-hip-sdk rocminfo ;;
-      vulkan) $SUDO pacman -S --needed --noconfirm vulkan-headers vulkan-icd-loader vulkan-tools shaderc ;;
-    esac
-  elif command -v apt-get >/dev/null 2>&1; then
-    $SUDO apt-get update
-    $SUDO apt-get install -y build-essential cmake git libcurl4-openssl-dev python3
-    case "$backend" in
-      cuda)   $SUDO apt-get install -y nvidia-cuda-toolkit \
-                || echo "!! install the CUDA toolkit from NVIDIA's repo: https://developer.nvidia.com/cuda-downloads" >&2 ;;
-      rocm)   $SUDO apt-get install -y rocm-hip-sdk rocminfo \
-                || echo "!! ROCm needs AMD's repo first: https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
-      vulkan) $SUDO apt-get install -y libvulkan-dev glslc vulkan-tools \
-                || $SUDO apt-get install -y libvulkan-dev glslang-tools vulkan-tools ;;
-    esac
-  elif command -v dnf >/dev/null 2>&1; then
-    $SUDO dnf install -y gcc-c++ cmake git libcurl-devel python3
-    case "$backend" in
-      cuda)   echo "!! CUDA on Fedora: enable NVIDIA's repo, then: dnf install cuda-toolkit" >&2 ;;
-      rocm)   $SUDO dnf install -y rocm-hip-devel hipblas-devel rocminfo \
-                || echo "!! see https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
-      vulkan) $SUDO dnf install -y vulkan-headers vulkan-loader-devel glslc vulkan-tools ;;
-    esac
-  elif command -v zypper >/dev/null 2>&1; then
-    $SUDO zypper install -y gcc-c++ cmake git libcurl-devel python3
-    case "$backend" in
-      cuda)   echo "!! CUDA on openSUSE: add NVIDIA's repo, then: zypper install cuda-toolkit" >&2 ;;
-      rocm)   echo "!! ROCm on openSUSE: see https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
-      vulkan) $SUDO zypper install -y vulkan-headers vulkan-loader-devel shaderc vulkan-tools ;;
-    esac
-  else
-    echo "!! unknown package manager — install manually: C++ toolchain, cmake, git, libcurl dev" >&2
-    return 1
-  fi
-  echo ">> deps done."
 }
 
 # ---- clone (if needed) + configure + build llama.cpp (build subcommand) ----
 build_llama() {
-  local backend="$1" flags=() jobs g cap gfx
-  if [ "$backend" = "mlx" ]; then
-    echo ">> mlx uses mlx-lm, not llama.cpp — nothing to build (pip install mlx-lm)"
-    return 0
-  fi
-  if [ ! -d "$LLAMA_DIR" ]; then
-    echo ">> cloning llama.cpp into $LLAMA_DIR ..."
-    git clone https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
-  fi
-  case "$backend" in
+    local backend="$1" flags=() jobs g cap gfx
+    if [ "$backend" = "mlx" ]; then
+        echo ">> mlx uses mlx-lm, not llama.cpp — nothing to build (pip install mlx-lm)"
+        return 0
+    fi
+    if [ ! -d "$LLAMA_DIR" ]; then
+        echo ">> cloning llama.cpp into $LLAMA_DIR ..."
+        git clone https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
+    fi
+    case "$backend" in
     cuda)
-      [ -d /opt/cuda ] && export CUDAToolkit_ROOT=/opt/cuda
-      flags=(-DGGML_CUDA=ON)
-      cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
-      [ -n "$cap" ] && flags+=(-DCMAKE_CUDA_ARCHITECTURES="$cap")
-      # nvcc often rejects the newest system gcc; prefer an older versioned one
-      for g in gcc-15 gcc-14 gcc-13; do
-        if command -v "$g" >/dev/null 2>&1; then
-          flags+=(-DCMAKE_CUDA_HOST_COMPILER="$(command -v "$g")"); break
-        fi
-      done ;;
+        [ -d /opt/cuda ] && export CUDAToolkit_ROOT=/opt/cuda
+        flags=(-DGGML_CUDA=ON)
+        cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
+        [ -n "$cap" ] && flags+=(-DCMAKE_CUDA_ARCHITECTURES="$cap")
+        # nvcc often rejects the newest system gcc; prefer an older versioned one
+        for g in gcc-15 gcc-14 gcc-13; do
+            if command -v "$g" >/dev/null 2>&1; then
+                flags+=(-DCMAKE_CUDA_HOST_COMPILER="$(command -v "$g")")
+                break
+            fi
+        done
+        ;;
     rocm)
-      gfx="$(rocminfo 2>/dev/null | command grep -o 'gfx[0-9a-f]*' | command grep -v '^gfx\(000\)\?$' | head -1 || true)"
-      flags=(-DGGML_HIP=ON)
-      [ -n "$gfx" ] && flags+=(-DAMDGPU_TARGETS="$gfx" -DGPU_TARGETS="$gfx") ;;
+        gfx="$(rocminfo 2>/dev/null | command grep -o 'gfx[0-9a-f]*' | command grep -v '^gfx\(000\)\?$' | head -1 || true)"
+        flags=(-DGGML_HIP=ON)
+        [ -n "$gfx" ] && flags+=(-DAMDGPU_TARGETS="$gfx" -DGPU_TARGETS="$gfx")
+        ;;
     vulkan) flags=(-DGGML_VULKAN=ON) ;;
-    metal|cpu) ;;   # cmake defaults are right (Metal is on by default on Apple silicon)
-    *) echo "!! unknown backend '$backend' (cuda|rocm|vulkan|metal|cpu|mlx)" >&2; return 1 ;;
-  esac
-  if [ "$OS" = "Darwin" ]; then jobs="$(sysctl -n hw.ncpu)"; else jobs="$(nproc)"; fi
-  echo ">> cmake configure: ${flags[*]:-'(defaults)'}"
-  cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DCMAKE_BUILD_TYPE=Release ${flags[@]+"${flags[@]}"}
-  cmake --build "$LLAMA_DIR/build" --config Release -j "$jobs"
-  echo ">> built: $LLAMA_DIR/build/bin/llama-server"
+    metal | cpu) ;; # cmake defaults are right (Metal is on by default on Apple silicon)
+    *)
+        echo "!! unknown backend '$backend' (cuda|rocm|vulkan|metal|cpu|mlx)" >&2
+        return 1
+        ;;
+    esac
+    if [ "$OS" = "Darwin" ]; then jobs="$(sysctl -n hw.ncpu)"; else jobs="$(nproc)"; fi
+    echo ">> cmake configure: ${flags[*]:-'(defaults)'}"
+    cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DCMAKE_BUILD_TYPE=Release ${flags[@]+"${flags[@]}"}
+    cmake --build "$LLAMA_DIR/build" --config Release -j "$jobs"
+    echo ">> built: $LLAMA_DIR/build/bin/llama-server"
 }
 
 # ---- pull: download GGUFs from Hugging Face (LM Studio-style picker) -------
 # Default into LM Studio's models dir (publisher/repo/file layout) so LM Studio
 # sees pulled models too; fall back to the llama.cpp cache if LM Studio absent.
 if [ -z "${PULL_DIR:-}" ]; then
-  if [ -d "$HOME/.lmstudio/models" ]; then PULL_DIR="$HOME/.lmstudio/models"
-  else PULL_DIR="$HOME/.cache/llama.cpp"; fi
+    if [ -d "$HOME/.lmstudio/models" ]; then
+        PULL_DIR="$HOME/.lmstudio/models"
+    else PULL_DIR="$HOME/.cache/llama.cpp"; fi
 fi
 
 human_mib() { awk -v m="$1" 'BEGIN{ if (m >= 1024) printf "%.1fG", m/1024; else printf "%dM", m }'; }
 
 # search HF for GGUF repos -> lines "repo_id<TAB>downloads" (most downloaded first)
 hf_search() {
-  python3 - "$1" <<'PY'
+    python3 - "$1" <<'PY'
 import json, sys, urllib.parse, urllib.request
 q = urllib.parse.quote(sys.argv[1])
 url = f"https://huggingface.co/api/models?search={q}&filter=gguf&sort=downloads&direction=-1&limit=25"
@@ -317,7 +338,7 @@ PY
 # list a repo's GGUF files -> lines "name<TAB>total_MiB<TAB>file1:MiB1,file2:MiB2,..."
 # (multi-part shards grouped into one entry; mmproj excluded; smallest first)
 hf_files() {
-  python3 - "$1" <<'PY'
+    python3 - "$1" <<'PY'
 import json, re, sys, urllib.request
 repo = sys.argv[1]
 url = f"https://huggingface.co/api/models/{repo}?blobs=true"
@@ -338,201 +359,217 @@ for base, g in sorted(groups.items(), key=lambda kv: kv[1]["size"]):
 PY
 }
 
-pull_files() {  # $1 = repo, $2 = comma-separated "rfilename:MiB" entries
-  local repo="$1" entry f mib url dest pid rc cur last speed pct
-  mkdir -p "$PULL_DIR/$repo"   # publisher/repo subdirs, LM Studio layout
-  local IFS=','
-  for entry in $2; do
-    f="${entry%:*}"; mib="${entry##*:}"
-    url="https://huggingface.co/$repo/resolve/main/$f"
-    dest="$PULL_DIR/$repo/$(basename "$f")"
-    if [ -f "$dest" ]; then
-      echo ">> already downloaded: $dest"
-      continue
-    fi
-    echo ">> downloading $f ($(human_mib "$mib"))"
-    curl -sL --fail -C - ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} \
-      -o "$dest.part" "$url" &
-    pid=$!
-    last="$(( $(file_size "$dest.part" 2>/dev/null || echo 0) / 1048576 ))"
-    while kill -0 "$pid" 2>/dev/null; do
-      sleep 1
-      cur="$(( $(file_size "$dest.part" 2>/dev/null || echo 0) / 1048576 ))"
-      speed=$((cur - last)); last=$cur
-      if [ "$mib" -gt 0 ] 2>/dev/null; then
-        pct=$((cur * 100 / mib))
-        printf '\r   %s / %s  (%d%%)  %d MiB/s     ' \
-          "$(human_mib "$cur")" "$(human_mib "$mib")" "$pct" "$speed"
-      else
-        printf '\r   %s downloaded  %d MiB/s     ' "$(human_mib "$cur")" "$speed"
-      fi
+pull_files() { # $1 = repo, $2 = comma-separated "rfilename:MiB" entries
+    local repo="$1" entry f mib url dest pid rc cur last speed pct
+    mkdir -p "$PULL_DIR/$repo" # publisher/repo subdirs, LM Studio layout
+    local IFS=','
+    for entry in $2; do
+        f="${entry%:*}"
+        mib="${entry##*:}"
+        url="https://huggingface.co/$repo/resolve/main/$f"
+        dest="$PULL_DIR/$repo/$(basename "$f")"
+        if [ -f "$dest" ]; then
+            echo ">> already downloaded: $dest"
+            continue
+        fi
+        echo ">> downloading $f ($(human_mib "$mib"))"
+        curl -sL --fail -C - ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} \
+            -o "$dest.part" "$url" &
+        pid=$!
+        last="$(($(file_size "$dest.part" 2>/dev/null || echo 0) / 1048576))"
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+            cur="$(($(file_size "$dest.part" 2>/dev/null || echo 0) / 1048576))"
+            speed=$((cur - last))
+            last=$cur
+            if [ "$mib" -gt 0 ] 2>/dev/null; then
+                pct=$((cur * 100 / mib))
+                printf '\r   %s / %s  (%d%%)  %d MiB/s     ' \
+                    "$(human_mib "$cur")" "$(human_mib "$mib")" "$pct" "$speed"
+            else
+                printf '\r   %s downloaded  %d MiB/s     ' "$(human_mib "$cur")" "$speed"
+            fi
+        done
+        rc=0
+        wait "$pid" || rc=$?
+        printf '\n'
+        if [ "$rc" -ne 0 ]; then
+            echo "!! download failed (curl exit $rc): $f — re-run to resume" >&2
+            exit 1
+        fi
+        mv "$dest.part" "$dest"
+        echo ">> saved: $dest"
     done
-    rc=0; wait "$pid" || rc=$?
-    printf '\n'
-    if [ "$rc" -ne 0 ]; then
-      echo "!! download failed (curl exit $rc): $f — re-run to resume" >&2
-      exit 1
-    fi
-    mv "$dest.part" "$dest"
-    echo ">> saved: $dest"
-  done
-  echo ">> done. serve it with: $0 -m <name substring>"
+    echo ">> done. serve it with: $0 -m <name substring>"
 }
 
 cmd_pull() {
-  local arg="${1:-}" repo="" quant="" idx choice pick base
-  command -v python3 >/dev/null 2>&1 || { echo "!! pull needs python3" >&2; exit 1; }
-  command -v curl >/dev/null 2>&1 || { echo "!! pull needs curl" >&2; exit 1; }
+    local arg="${1:-}" repo="" quant="" idx choice pick base
+    command -v python3 >/dev/null 2>&1 || {
+        echo "!! pull needs python3" >&2
+        exit 1
+    }
+    command -v curl >/dev/null 2>&1 || {
+        echo "!! pull needs curl" >&2
+        exit 1
+    }
 
-  if [ -z "$arg" ]; then
-    printf "Search Hugging Face for GGUF models (q to quit): "
-    read -r arg
-    { [ -n "$arg" ] && [ "$arg" != "q" ]; } || exit 0
-  fi
-
-  # owner/repo[:quant] goes straight to the repo; anything else is a search term
-  case "$arg" in
-    */*) repo="${arg%%:*}"
-         case "$arg" in *:*) quant="${arg#*:}";; esac ;;
-  esac
-
-  if [ -z "$repo" ]; then
-    local REPOS=() DLS=() id dls
-    while IFS=$'\t' read -r id dls; do
-      [ -n "$id" ] || continue
-      REPOS+=("$id"); DLS+=("$dls")
-    done < <(hf_search "$arg" || true)
-    if [ "${#REPOS[@]}" -eq 0 ]; then
-      echo "!! no GGUF models on Hugging Face matching '$arg'" >&2
-      exit 1
+    if [ -z "$arg" ]; then
+        printf "Search Hugging Face for GGUF models (q to quit): "
+        read -r arg
+        { [ -n "$arg" ] && [ "$arg" != "q" ]; } || exit 0
     fi
-    echo "GGUF models on Hugging Face matching '$arg':"
-    idx=1
-    for id in "${REPOS[@]}"; do
-      printf "  %2d) %-65s %10s downloads\n" "$idx" "$id" "${DLS[$((idx - 1))]}"
-      idx=$((idx + 1))
-    done
-    printf "Select model [1-%d] (q to quit): " "${#REPOS[@]}"
-    read -r choice
-    [ "$choice" = "q" ] && exit 0
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#REPOS[@]}" ]; then
-      echo "Invalid selection."; exit 1
-    fi
-    repo="${REPOS[$((choice - 1))]}"
-  fi
 
-  echo ">> fetching file list for $repo ..."
-  local BASES=() SIZES=() FILESL=() mib files
-  while IFS=$'\t' read -r base mib files; do
-    [ -n "$base" ] || continue
-    if [ -n "$quant" ]; then
-      printf '%s' "$base" | command grep -qi -- "$quant" || continue
-    fi
-    BASES+=("$base"); SIZES+=("$mib"); FILESL+=("$files")
-  done < <(hf_files "$repo" || true)
-  if [ "${#BASES[@]}" -eq 0 ]; then
-    echo "!! no .gguf files in $repo${quant:+ matching '$quant'}" >&2
-    exit 1
-  fi
+    # owner/repo[:quant] goes straight to the repo; anything else is a search term
+    case "$arg" in
+    */*)
+        repo="${arg%%:*}"
+        case "$arg" in *:*) quant="${arg#*:}" ;; esac
+        ;;
+    esac
 
-  if [ "${#BASES[@]}" -eq 1 ]; then
-    pick=0
-    echo ">> $(human_mib "${SIZES[0]}")  ${BASES[0]}"
-  else
-    echo "Available files in $repo:"
-    idx=1
-    for base in "${BASES[@]}"; do
-      printf "  %2d) %-8s %s\n" "$idx" "$(human_mib "${SIZES[$((idx - 1))]}")" "$base"
-      idx=$((idx + 1))
-    done
-    printf "Select file [1-%d] (q to quit): " "${#BASES[@]}"
-    read -r choice
-    [ "$choice" = "q" ] && exit 0
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#BASES[@]}" ]; then
-      echo "Invalid selection."; exit 1
+    if [ -z "$repo" ]; then
+        local REPOS=() DLS=() id dls
+        while IFS=$'\t' read -r id dls; do
+            [ -n "$id" ] || continue
+            REPOS+=("$id")
+            DLS+=("$dls")
+        done < <(hf_search "$arg" || true)
+        if [ "${#REPOS[@]}" -eq 0 ]; then
+            echo "!! no GGUF models on Hugging Face matching '$arg'" >&2
+            exit 1
+        fi
+        echo "GGUF models on Hugging Face matching '$arg':"
+        idx=1
+        for id in "${REPOS[@]}"; do
+            printf "  %2d) %-65s %10s downloads\n" "$idx" "$id" "${DLS[$((idx - 1))]}"
+            idx=$((idx + 1))
+        done
+        printf "Select model [1-%d] (q to quit): " "${#REPOS[@]}"
+        read -r choice
+        [ "$choice" = "q" ] && exit 0
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#REPOS[@]}" ]; then
+            echo "Invalid selection."
+            exit 1
+        fi
+        repo="${REPOS[$((choice - 1))]}"
     fi
-    pick=$((choice - 1))
-  fi
-  pull_files "$repo" "${FILESL[$pick]}"
+
+    echo ">> fetching file list for $repo ..."
+    local BASES=() SIZES=() FILESL=() mib files
+    while IFS=$'\t' read -r base mib files; do
+        [ -n "$base" ] || continue
+        if [ -n "$quant" ]; then
+            printf '%s' "$base" | command grep -qi -- "$quant" || continue
+        fi
+        BASES+=("$base")
+        SIZES+=("$mib")
+        FILESL+=("$files")
+    done < <(hf_files "$repo" || true)
+    if [ "${#BASES[@]}" -eq 0 ]; then
+        echo "!! no .gguf files in $repo${quant:+ matching '$quant'}" >&2
+        exit 1
+    fi
+
+    if [ "${#BASES[@]}" -eq 1 ]; then
+        pick=0
+        echo ">> $(human_mib "${SIZES[0]}")  ${BASES[0]}"
+    else
+        echo "Available files in $repo:"
+        idx=1
+        for base in "${BASES[@]}"; do
+            printf "  %2d) %-8s %s\n" "$idx" "$(human_mib "${SIZES[$((idx - 1))]}")" "$base"
+            idx=$((idx + 1))
+        done
+        printf "Select file [1-%d] (q to quit): " "${#BASES[@]}"
+        read -r choice
+        [ "$choice" = "q" ] && exit 0
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#BASES[@]}" ]; then
+            echo "Invalid selection."
+            exit 1
+        fi
+        pick=$((choice - 1))
+    fi
+    pull_files "$repo" "${FILESL[$pick]}"
 }
 
 # ---- subcommands: ls / list / pull / stop / status / deps / build -----------
 case "${1:-}" in
-  ls)
+ls)
     echo "Available local models:"
     if ! print_model_menu; then
-      echo "No local GGUF models found. Download one with: $0 pull"
-      exit 1
+        echo "No local GGUF models found. Download one with: $0 pull"
+        exit 1
     fi
     exit 0
     ;;
-  list|--list)
+list | --list)
     echo "Local GGUF models (usable with -m <substring>, no re-download):"
     list_local_models
     exit 0
     ;;
-  stop)
+stop)
     # a systemd-managed server must be stopped through systemd, or
     # Restart=on-failure just brings it back after the pkill. "activating"
     # covers the RestartSec window where the unit isn't active yet but a
     # respawn is pending; reset-failed cancels that pending restart.
     stopped_unit=""
     if command -v systemctl >/dev/null 2>&1; then
-      state="$(systemctl --user is-active highllama.service 2>/dev/null || true)"
-      if [ "$state" = "active" ] || [ "$state" = "activating" ]; then
-        echo ">> stopping systemd user service..."
-        systemctl --user stop highllama.service
-        systemctl --user reset-failed highllama.service 2>/dev/null || true
-        stopped_unit=1
-      fi
+        state="$(systemctl --user is-active highllama.service 2>/dev/null || true)"
+        if [ "$state" = "active" ] || [ "$state" = "activating" ]; then
+            echo ">> stopping systemd user service..."
+            systemctl --user stop highllama.service
+            systemctl --user reset-failed highllama.service 2>/dev/null || true
+            stopped_unit=1
+        fi
     fi
     if [ -n "$(server_running)" ]; then
-      echo ">> stopping server..."
-      pkill -x llama-server 2>/dev/null || true
-      pkill -f 'mlx_lm.server|mlx_lm server' 2>/dev/null || true
-      # SIGTERM shutdown can take a few seconds (VRAM teardown); wait for
-      # the process to actually die instead of declaring victory blind
-      for _ in $(seq 1 20); do
-        [ -n "$(server_running)" ] || break
-        sleep 0.5
-      done
-      if [ -n "$(server_running)" ]; then
-        echo ">> still alive after 10s, sending SIGKILL..."
-        pkill -9 -x llama-server 2>/dev/null || true
-        pkill -9 -f 'mlx_lm.server|mlx_lm server' 2>/dev/null || true
-        sleep 1
-      fi
-      if [ -n "$(server_running)" ]; then
-        echo "!! failed to stop: $(server_running)" >&2
-        exit 1
-      fi
-      echo ">> stopped."
+        echo ">> stopping server..."
+        pkill -x llama-server 2>/dev/null || true
+        pkill -f 'mlx_lm.server|mlx_lm server' 2>/dev/null || true
+        # SIGTERM shutdown can take a few seconds (VRAM teardown); wait for
+        # the process to actually die instead of declaring victory blind
+        for _ in $(seq 1 20); do
+            [ -n "$(server_running)" ] || break
+            sleep 0.5
+        done
+        if [ -n "$(server_running)" ]; then
+            echo ">> still alive after 10s, sending SIGKILL..."
+            pkill -9 -x llama-server 2>/dev/null || true
+            pkill -9 -f 'mlx_lm.server|mlx_lm server' 2>/dev/null || true
+            sleep 1
+        fi
+        if [ -n "$(server_running)" ]; then
+            echo "!! failed to stop: $(server_running)" >&2
+            exit 1
+        fi
+        echo ">> stopped."
     elif [ -n "$stopped_unit" ]; then
-      echo ">> stopped."
+        echo ">> stopped."
     else
-      echo ">> no server running."
+        echo ">> no server running."
     fi
     exit 0
     ;;
-  status)
+status)
     running="$(server_running)"
     if [ -n "$running" ]; then
-      echo ">> RUNNING: $running"
+        echo ">> RUNNING: $running"
     else
-      echo ">> no server running."
+        echo ">> no server running."
     fi
     exit 0
     ;;
-  pull|download)
+pull | download)
     shift
     cmd_pull "$*"
     exit 0
     ;;
-  deps|install-deps)
+deps | install-deps)
     install_deps "${2:-$(detect_backend)}"
     exit 0
     ;;
-  build)
+build)
     build_llama "${2:-$(detect_backend)}"
     exit 0
     ;;
@@ -540,21 +577,61 @@ esac
 
 # ---- arg parsing ----------------------------------------------------------
 while [ $# -gt 0 ]; do
-  case "$1" in
-    -m|--model)    MODEL="$2"; shift 2;;
-    -c|--ctx)      CONTEXT="$2"; shift 2;;
-    --ncmoe)       NCMOE="$2"; shift 2;;
-    -t|--threads)  THREADS="$2"; shift 2;;
-    --kv)          KVTYPE="$2"; shift 2;;
-    --draft|-md)   DRAFT="$2"; shift 2;;
-    --host)        HOST="$2"; shift 2;;
-    --port)        PORT="$2"; shift 2;;
-    --backend)     BACKEND="$2"; shift 2;;
-    -d|--daemon)   DAEMON=1; shift;;
-    --)            shift; EXTRA+=("$@"); break;;
-    -h|--help)     sed -n '2,38p' "$0"; exit 0;;
-    *)             EXTRA+=("$1"); shift;;
-  esac
+    case "$1" in
+    -m | --model)
+        MODEL="$2"
+        shift 2
+        ;;
+    -c | --ctx)
+        CONTEXT="$2"
+        shift 2
+        ;;
+    --ncmoe)
+        NCMOE="$2"
+        shift 2
+        ;;
+    -t | --threads)
+        THREADS="$2"
+        shift 2
+        ;;
+    --kv)
+        KVTYPE="$2"
+        shift 2
+        ;;
+    --draft | -md)
+        DRAFT="$2"
+        shift 2
+        ;;
+    --host)
+        HOST="$2"
+        shift 2
+        ;;
+    --port)
+        PORT="$2"
+        shift 2
+        ;;
+    --backend)
+        BACKEND="$2"
+        shift 2
+        ;;
+    -d | --daemon)
+        DAEMON=1
+        shift
+        ;;
+    --)
+        shift
+        EXTRA+=("$@")
+        break
+        ;;
+    -h | --help)
+        sed -n '2,38p' "$0"
+        exit 0
+        ;;
+    *)
+        EXTRA+=("$1")
+        shift
+        ;;
+    esac
 done
 
 [ -n "$BACKEND" ] || BACKEND="$(detect_backend)"
@@ -564,111 +641,114 @@ echo ">> backend=$BACKEND"
 # ---- if a server is already up, just report it and exit -------------------
 running="$(server_running)"
 if [ -n "$running" ]; then
-  rport="$(printf '%s\n' "$running" | command grep -oE -- '--port [0-9]+' | command grep -oE '[0-9]+' | head -1)"
-  echo ">> A server is already running:"
-  echo "   $running"
-  [ -n "$rport" ] && echo ">> Endpoint: http://${HOST}:${rport}/v1"
-  echo ">> To switch models: highllama stop   (then run this again)"
-  exit 0
+    rport="$(printf '%s\n' "$running" | command grep -oE -- '--port [0-9]+' | command grep -oE '[0-9]+' | head -1)"
+    echo ">> A server is already running:"
+    echo "   $running"
+    [ -n "$rport" ] && echo ">> Endpoint: http://${HOST}:${rport}/v1"
+    echo ">> To switch models: highllama stop   (then run this again)"
+    exit 0
 fi
 
 # ---- pick a free port (auto-advance if the requested one is busy) ----------
 orig_port="$PORT"
 while port_busy "$PORT"; do
-  PORT=$((PORT + 1))
-  if [ "$PORT" -gt $((orig_port + 20)) ]; then
-    echo "!! no free port found near $orig_port" >&2
-    exit 1
-  fi
+    PORT=$((PORT + 1))
+    if [ "$PORT" -gt $((orig_port + 20)) ]; then
+        echo "!! no free port found near $orig_port" >&2
+        exit 1
+    fi
 done
 [ "$PORT" != "$orig_port" ] && echo ">> port $orig_port busy -> using $PORT"
 
 # ---- MLX backend: hand off to mlx_lm.server (no GGUF machinery) ------------
 if [ "$BACKEND" = "mlx" ]; then
-  if [ -n "$DAEMON" ]; then
-    echo "!! --daemon is not supported with the mlx backend (no journal on macOS)" >&2; exit 1
-  fi
-  if [ "$OS" != "Darwin" ]; then
-    echo "!! mlx backend only works on macOS (Apple silicon)" >&2; exit 1
-  fi
-  if [ -z "$MODEL" ]; then
-    echo "!! mlx backend needs -m <hf-repo> (e.g. mlx-community/Qwen3-8B-4bit)" >&2; exit 1
-  fi
-  if command -v lms >/dev/null 2>&1; then
-    echo ">> Unloading LM Studio models to free memory..."
-    lms unload --all || true
-  fi
-  echo ">> model=$MODEL"
-  echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
-  if command -v mlx_lm.server >/dev/null 2>&1; then
-    exec mlx_lm.server --model "$MODEL" --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"}
-  else
-    exec python3 -m mlx_lm server --model "$MODEL" --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"}
-  fi
+    if [ -n "$DAEMON" ]; then
+        echo "!! --daemon is not supported with the mlx backend (no journal on macOS)" >&2
+        exit 1
+    fi
+    if [ "$OS" != "Darwin" ]; then
+        echo "!! mlx backend only works on macOS (Apple silicon)" >&2
+        exit 1
+    fi
+    if [ -z "$MODEL" ]; then
+        echo "!! mlx backend needs -m <hf-repo> (e.g. mlx-community/Qwen3-8B-4bit)" >&2
+        exit 1
+    fi
+    if command -v lms >/dev/null 2>&1; then
+        echo ">> Unloading LM Studio models to free memory..."
+        lms unload --all || true
+    fi
+    echo ">> model=$MODEL"
+    echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
+    if command -v mlx_lm.server >/dev/null 2>&1; then
+        exec mlx_lm.server --model "$MODEL" --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"}
+    else
+        exec python3 -m mlx_lm server --model "$MODEL" --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"}
+    fi
 fi
 
 # ---- no model specified -> interactive picker (dynamic mode) ---------------
 if [ -z "$MODEL" ]; then
-  if [ ! -t 0 ]; then   # systemd / pipes: no tty for the picker
-    echo "!! no MODEL set and no tty for the interactive picker" >&2
-    echo "!! set MODEL= (e.g. in ~/.config/highllama/highllama.env) or pass -m" >&2
-    exit 1
-  fi
-  echo "Available local models:"
-  if ! print_model_menu; then
-    echo "No local GGUF models found. Specify one to download: $0 -m <hf-repo:quant>"
-    exit 1
-  fi
-  printf "Select model [1-%d] (q to quit): " "${#MODELS[@]}"
-  read -r choice
-  [ "$choice" = "q" ] && exit 0
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#MODELS[@]}" ]; then
-    echo "Invalid selection."
-    exit 1
-  fi
-  MODEL="${MODELS[$((choice - 1))]}"
-  echo ">> selected: $(basename "$MODEL")"
+    if [ ! -t 0 ]; then # systemd / pipes: no tty for the picker
+        echo "!! no MODEL set and no tty for the interactive picker" >&2
+        echo "!! set MODEL= (e.g. in ~/.config/highllama/highllama.env) or pass -m" >&2
+        exit 1
+    fi
+    echo "Available local models:"
+    if ! print_model_menu; then
+        echo "No local GGUF models found. Specify one to download: $0 -m <hf-repo:quant>"
+        exit 1
+    fi
+    printf "Select model [1-%d] (q to quit): " "${#MODELS[@]}"
+    read -r choice
+    [ "$choice" = "q" ] && exit 0
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#MODELS[@]}" ]; then
+        echo "Invalid selection."
+        exit 1
+    fi
+    MODEL="${MODELS[$((choice - 1))]}"
+    echo ">> selected: $(basename "$MODEL")"
 fi
 
 # ---- daemon mode: re-exec detached, output to the system journal -----------
 # Runs after the picker so `highllama --daemon` can still ask interactively;
 # the child gets every resolved setting via env vars (all env-overridable).
 if [ -n "$DAEMON" ]; then
-  if ! command -v systemd-cat >/dev/null 2>&1; then
-    echo "!! --daemon needs systemd-cat to write logs to the journal" >&2
-    exit 1
-  fi
-  echo ">> starting in background (logs -> journal, tag 'highllama')"
-  setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
-    KVTYPE="$KVTYPE" DRAFT="$DRAFT" HOST="$HOST" PORT="$PORT" \
-    BACKEND="$BACKEND" PARALLEL="$PARALLEL" \
-    systemd-cat -t highllama "$SCRIPT_PATH" ${EXTRA[@]+-- "${EXTRA[@]}"} \
-    </dev/null >/dev/null 2>&1 &
-  DPID=$!
-  # wait for the server to come up (model load can take a while)
-  for _ in $(seq 1 240); do
-    if ! kill -0 "$DPID" 2>/dev/null && [ -z "$(server_running)" ]; then
-      echo "!! exited before the server became ready — see: journalctl -t highllama -e" >&2
-      exit 1
+    if ! command -v systemd-cat >/dev/null 2>&1; then
+        echo "!! --daemon needs systemd-cat to write logs to the journal" >&2
+        exit 1
     fi
-    if port_busy "$PORT"; then
-      echo ">> ready: http://${HOST}:${PORT}/v1"
-      echo ">> logs:  journalctl -t highllama -f"
-      echo ">> stop:  highllama stop"
-      exit 0
-    fi
-    sleep 0.5
-  done
-  echo ">> not ready after 120s (large model / first download?)"
-  echo ">> follow progress: journalctl -t highllama -f"
-  exit 0
+    echo ">> starting in background (logs -> journal, tag 'highllama')"
+    setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
+        KVTYPE="$KVTYPE" DRAFT="$DRAFT" HOST="$HOST" PORT="$PORT" \
+        BACKEND="$BACKEND" PARALLEL="$PARALLEL" \
+        systemd-cat -t highllama "$SCRIPT_PATH" ${EXTRA[@]+-- "${EXTRA[@]}"} \
+        </dev/null >/dev/null 2>&1 &
+    DPID=$!
+    # wait for the server to come up (model load can take a while)
+    for _ in $(seq 1 240); do
+        if ! kill -0 "$DPID" 2>/dev/null && [ -z "$(server_running)" ]; then
+            echo "!! exited before the server became ready — see: journalctl -t highllama -e" >&2
+            exit 1
+        fi
+        if port_busy "$PORT"; then
+            echo ">> ready: http://${HOST}:${PORT}/v1"
+            echo ">> logs:  journalctl -t highllama -f"
+            echo ">> stop:  highllama stop"
+            exit 0
+        fi
+        sleep 0.5
+    done
+    echo ">> not ready after 120s (large model / first download?)"
+    echo ">> follow progress: journalctl -t highllama -f"
+    exit 0
 fi
 
 # ---- normalize context (accepts 32k / 64k / 128k or a raw token count) -----
 CONTEXT="$(to_tokens "$CONTEXT")"
 if ! [[ "$CONTEXT" =~ ^[0-9]+$ ]]; then
-  echo "!! invalid context size: '$CONTEXT' (use e.g. 32k, 64k, 128k, or a number)" >&2
-  exit 1
+    echo "!! invalid context size: '$CONTEXT' (use e.g. 32k, 64k, 128k, or a number)" >&2
+    exit 1
 fi
 
 # NCMOE (expert offload) is computed after `lms unload`, so the estimate sees
@@ -676,8 +756,8 @@ fi
 
 # runtime library paths (only where the toolkit lives outside the loader path)
 case "$BACKEND" in
-  cuda) [ -d /opt/cuda/lib64 ] && export LD_LIBRARY_PATH="/opt/cuda/lib64:${LD_LIBRARY_PATH:-}" ;;
-  rocm) [ -d /opt/rocm/lib ]   && export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}" ;;
+cuda) [ -d /opt/cuda/lib64 ] && export LD_LIBRARY_PATH="/opt/cuda/lib64:${LD_LIBRARY_PATH:-}" ;;
+rocm) [ -d /opt/rocm/lib ] && export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}" ;;
 esac
 
 # ---- model source resolution (avoid re-downloading what you already have) ----
@@ -686,38 +766,44 @@ esac
 #   3) otherwise treat as HF repo tag -> -hf (downloads, or reuses HF cache)
 MODEL_ARGS=()
 if [ -f "$MODEL" ]; then
-  MODEL_ARGS=(-m "$MODEL")
-  echo ">> using local file: $MODEL"
+    MODEL_ARGS=(-m "$MODEL")
+    echo ">> using local file: $MODEL"
 else
-  LOCAL_HIT="$(resolve_local_gguf "$MODEL")"
-  if [ -n "$LOCAL_HIT" ]; then
-    MODEL_ARGS=(-m "$LOCAL_HIT")
-    echo ">> matched local model (no download): $LOCAL_HIT"
-  else
-    MODEL_ARGS=(-hf "$MODEL")
-    echo ">> no local match; fetching from Hugging Face (reuses cache if present): $MODEL"
-  fi
+    LOCAL_HIT="$(resolve_local_gguf "$MODEL")"
+    if [ -n "$LOCAL_HIT" ]; then
+        MODEL_ARGS=(-m "$LOCAL_HIT")
+        echo ">> matched local model (no download): $LOCAL_HIT"
+    else
+        MODEL_ARGS=(-hf "$MODEL")
+        echo ">> no local match; fetching from Hugging Face (reuses cache if present): $MODEL"
+    fi
 fi
 
 # ---- friendly alias (clean name reported by /v1/models -> opencode picker) -
 case "${MODEL_ARGS[0]}" in
-  -m)  ALIAS="$(basename "${MODEL_ARGS[1]}")"; ALIAS="${ALIAS%.gguf}" ;;
-  -hf) ALIAS="${MODEL##*/}"; ALIAS="${ALIAS%%:*}" ;;
-  *)   ALIAS="model" ;;
+-m)
+    ALIAS="$(basename "${MODEL_ARGS[1]}")"
+    ALIAS="${ALIAS%.gguf}"
+    ;;
+-hf)
+    ALIAS="${MODEL##*/}"
+    ALIAS="${ALIAS%%:*}"
+    ;;
+*) ALIAS="model" ;;
 esac
 
 # ---- optional speculative decoding ---------------------------------------
 SPEC_ARGS=()
 if [ -n "$DRAFT" ]; then
-  if [ -f "$DRAFT" ]; then SPEC_ARGS=(-md "$DRAFT"); else SPEC_ARGS=(--hf-repo-draft "$DRAFT"); fi
-  SPEC_ARGS+=(-ngld 99 --spec-draft-n-max 16 --spec-draft-n-min 0)
+    if [ -f "$DRAFT" ]; then SPEC_ARGS=(-md "$DRAFT"); else SPEC_ARGS=(--hf-repo-draft "$DRAFT"); fi
+    SPEC_ARGS+=(-ngld 99 --spec-draft-n-max 16 --spec-draft-n-min 0)
 fi
 
 # ---- free the GPU ---------------------------------------------------------
 if command -v lms >/dev/null 2>&1; then
-  echo ">> Unloading LM Studio models to free VRAM..."
-  lms unload --all || true
-  sleep 1
+    echo ">> Unloading LM Studio models to free VRAM..."
+    lms unload --all || true
+    sleep 1
 fi
 echo ">> GPU before launch:"
 gpu_status "$BACKEND"
@@ -725,39 +811,42 @@ gpu_status "$BACKEND"
 # ---- smart expert-offload estimate (model + free-VRAM + context aware) ------
 # KV bits-per-element for the chosen cache type (used to size the KV reserve).
 case "$KVTYPE" in
-  q4_0|q4_1|iq4_nl) KVBITS=4.5 ;;
-  q5_0|q5_1)        KVBITS=5.5 ;;
-  q8_0)             KVBITS=8.5 ;;
-  f16|bf16)         KVBITS=16  ;;
-  *)                KVBITS=16  ;;
+q4_0 | q4_1 | iq4_nl) KVBITS=4.5 ;;
+q5_0 | q5_1) KVBITS=5.5 ;;
+q8_0) KVBITS=8.5 ;;
+f16 | bf16) KVBITS=16 ;;
+*) KVBITS=16 ;;
 esac
 
-NCMOE_CAP=64        # upper bound for auto-retry; refined to layer count if known
+NCMOE_CAP=64 # upper bound for auto-retry; refined to layer count if known
 if [ -z "$NCMOE" ]; then
-  case "$BACKEND" in
-    metal|cpu)
-      # unified memory / no discrete VRAM: expert offload buys nothing by default
-      NCMOE=0
-      ;;
+    case "$BACKEND" in
+    metal | cpu)
+        # unified memory / no discrete VRAM: expert offload buys nothing by default
+        NCMOE=0
+        ;;
     *)
-      FREE_MIB="$(free_vram_mib "$BACKEND")"
-      est=""
-      if [ "${MODEL_ARGS[0]}" = "-m" ] && [ -n "${FREE_MIB:-}" ] && command -v python3 >/dev/null 2>&1; then
-        est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
-      fi
-      if [ -n "$est" ]; then
-        NCMOE="${est%% *}"                 # "<ncmoe> <layers>"
-        NCMOE_CAP="${est##* }"
-        echo ">> estimated n-cpu-moe=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
-      else                                 # fallback: context buckets
-        if   [ "$CONTEXT" -le 16384 ]; then NCMOE=28
-        elif [ "$CONTEXT" -le 65536 ]; then NCMOE=32
-        else                                NCMOE=40
+        FREE_MIB="$(free_vram_mib "$BACKEND")"
+        est=""
+        if [ "${MODEL_ARGS[0]}" = "-m" ] && [ -n "${FREE_MIB:-}" ] && command -v python3 >/dev/null 2>&1; then
+            est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
         fi
-        echo ">> estimate unavailable; using fallback n-cpu-moe=$NCMOE"
-      fi
-      ;;
-  esac
+        if [ -n "$est" ]; then
+            NCMOE="${est%% *}" # "<ncmoe> <layers>"
+            NCMOE_CAP="${est##* }"
+            echo ">> estimated n-cpu-moe=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
+        else # fallback: context buckets
+            if [ "$CONTEXT" -le 16384 ]; then
+                NCMOE=28
+            elif [ "$CONTEXT" -le 65536 ]; then
+                NCMOE=32
+            else
+                NCMOE=40
+            fi
+            echo ">> estimate unavailable; using fallback n-cpu-moe=$NCMOE"
+        fi
+        ;;
+    esac
 fi
 
 # mmap is the right default on unified memory (Metal); --no-mmap elsewhere so
@@ -765,7 +854,10 @@ fi
 MMAP_ARGS=(--no-mmap)
 [ "$BACKEND" = "metal" ] && MMAP_ARGS=()
 
-# ---- launch ---------------------------------------------------------------
+# if [ -z "${IGNORE_TEMPLATE:-}" ] && [ -f "$SCRIPT_DIR/fixed.jinja" ]; then
+#     EXTRA+=(--chat-template-file "$SCRIPT_DIR/fixed.jinja")
+# fi
+
 echo ">> model=$MODEL"
 echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  draft=${DRAFT:-none}"
 echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
@@ -773,14 +865,19 @@ cd "$LLAMA_DIR"
 
 LLAMA_BIN="${LLAMA_BIN:-./build/bin/llama-server}"
 if [ ! -x "$LLAMA_BIN" ]; then
-  echo "!! $LLAMA_BIN not found. Build llama.cpp for backend '$BACKEND' (see header: $0 -h)" >&2
-  exit 1
+    echo "!! $LLAMA_BIN not found. Build llama.cpp for backend '$BACKEND' (see header: $0 -h)" >&2
+    exit 1
 fi
 
 # ---- launch with OOM auto-retry: bump expert-offload until it fits ----------
 LOG="$(mktemp "${TMPDIR:-/tmp}/highllama.XXXXXX")"
-SRV=""; TAILER=""
-cleanup() { [ -n "$TAILER" ] && kill "$TAILER" 2>/dev/null; [ -n "$SRV" ] && kill "$SRV" 2>/dev/null; rm -f "$LOG"; }
+SRV=""
+TAILER=""
+cleanup() {
+    [ -n "$TAILER" ] && kill "$TAILER" 2>/dev/null
+    [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
+    rm -f "$LOG"
+}
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
@@ -789,53 +886,60 @@ OOM_RE='out of memory|failed to allocate|failed to create context|cudaMalloc fai
 
 STEP=3
 while :; do
-  : > "$LOG"
-  echo ">> launching with n-cpu-moe=$NCMOE ..."
-  "$LLAMA_BIN" \
-    "${MODEL_ARGS[@]}" \
-    --alias "$ALIAS" \
-    -ngl 99 \
-    --n-cpu-moe "$NCMOE" \
-    -t "$THREADS" \
-    -fa 1 \
-    -ctk "$KVTYPE" -ctv "$KVTYPE" \
-    -c "$CONTEXT" \
-    --parallel "$PARALLEL" \
-    ${MMAP_ARGS[@]+"${MMAP_ARGS[@]}"} \
-    --jinja \
-    ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
-    --host "$HOST" --port "$PORT" \
-    ${EXTRA[@]+"${EXTRA[@]}"} >"$LOG" 2>&1 &
-  SRV=$!
-  tail -f -n +1 "$LOG" &   # stream server logs live (killed in cleanup; no GNU --pid)
-  TAILER=$!
+    : >"$LOG"
+    echo ">> launching with n-cpu-moe=$NCMOE ..."
+    "$LLAMA_BIN" \
+        "${MODEL_ARGS[@]}" \
+        --alias "$ALIAS" \
+        -ngl 99 \
+        --n-cpu-moe "$NCMOE" \
+        -t "$THREADS" \
+        -fa 1 \
+        -ctk "$KVTYPE" -ctv "$KVTYPE" \
+        -c "$CONTEXT" \
+        --parallel "$PARALLEL" \
+        ${MMAP_ARGS[@]+"${MMAP_ARGS[@]}"} \
+        --jinja \
+        ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
+        --host "$HOST" --port "$PORT" \
+        ${EXTRA[@]+"${EXTRA[@]}"} >"$LOG" 2>&1 &
+    SRV=$!
+    tail -f -n +1 "$LOG" & # stream server logs live (killed in cleanup; no GNU --pid)
+    TAILER=$!
 
-  # watch for readiness vs. out-of-memory while the server is starting
-  outcome=""
-  while kill -0 "$SRV" 2>/dev/null; do
-    if command grep -q "server is listening" "$LOG"; then outcome="ok"; break; fi
-    if command grep -qiE "$OOM_RE" "$LOG"; then
-      outcome="oom"; break
+    # watch for readiness vs. out-of-memory while the server is starting
+    outcome=""
+    while kill -0 "$SRV" 2>/dev/null; do
+        if command grep -q "server is listening" "$LOG"; then
+            outcome="ok"
+            break
+        fi
+        if command grep -qiE "$OOM_RE" "$LOG"; then
+            outcome="oom"
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "$outcome" = "ok" ]; then
+        wait "$SRV"
+        exit $? # serve until stopped
     fi
-    sleep 0.5
-  done
 
-  if [ "$outcome" = "ok" ]; then
-    wait "$SRV"; exit $?               # serve until stopped
-  fi
-
-  # not ok: stop this attempt, then either retry (OOM) or give up
-  kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null || true
-  kill "$TAILER" 2>/dev/null; TAILER=""
-  if [ "$outcome" != "oom" ]; then
-    echo "!! server exited without becoming ready (not an OOM). Last log lines:" >&2
-    tail -n 15 "$LOG" >&2
-    exit 1
-  fi
-  NCMOE=$((NCMOE + STEP))
-  if [ "$NCMOE" -gt "$NCMOE_CAP" ]; then
-    echo "!! still OOM at max offload (n-cpu-moe=$NCMOE_CAP). Try smaller -c (context) or a smaller model." >&2
-    exit 1
-  fi
-  echo ">> OOM — retrying with more CPU offload (n-cpu-moe=$NCMOE)"
+    # not ok: stop this attempt, then either retry (OOM) or give up
+    kill "$SRV" 2>/dev/null
+    wait "$SRV" 2>/dev/null || true
+    kill "$TAILER" 2>/dev/null
+    TAILER=""
+    if [ "$outcome" != "oom" ]; then
+        echo "!! server exited without becoming ready (not an OOM). Last log lines:" >&2
+        tail -n 15 "$LOG" >&2
+        exit 1
+    fi
+    NCMOE=$((NCMOE + STEP))
+    if [ "$NCMOE" -gt "$NCMOE_CAP" ]; then
+        echo "!! still OOM at max offload (n-cpu-moe=$NCMOE_CAP). Try smaller -c (context) or a smaller model." >&2
+        exit 1
+    fi
+    echo ">> OOM — retrying with more CPU offload (n-cpu-moe=$NCMOE)"
 done
