@@ -35,6 +35,8 @@
 #   highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
 #   highllama -m <model> --daemon                # background; logs -> journal
 #   highllama logs                              # stream daemon journal logs
+#   highllama --no-embeddings                    # remove the embeddings from the server
+#                                                # model (CLS pooling, /v1/embeddings)
 #
 # Everything is overridable by flag OR env var (flag wins):
 #   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT HOST PORT BACKEND
@@ -63,6 +65,10 @@ PORT="${PORT:-8089}"      # 8080 is a very common conflict; auto-advances if bus
 BACKEND="${BACKEND:-}"    # empty = autodetect (see detect_backend)
 DAEMON=""                 # --daemon: detach to background, logs -> journal
 EXTRA=()                  # any extra args after `--` are passed straight to llama-server
+ALLMODELS=1
+ALLMODELS_EXTRA=()
+MODELS_DIR="${MODELS_DIR:-$HOME/.lmstudio/models}" # router-mode model root (one-level subdirs)
+MODELS_MAX="${MODELS_MAX:-2}"                      # router-mode: max models loaded c
 
 # Where local GGUFs live: LM Studio models + llama.cpp/HF download caches
 # + Unsloth Studio (legacy HF cache, fine-tune exports/outputs; its main
@@ -648,6 +654,10 @@ while [ $# -gt 0 ]; do
         DAEMON=1
         shift
         ;;
+    --no-embeddings)
+        ALLMODELS=""
+        shift
+        ;;
     --)
         shift
         EXTRA+=("$@")
@@ -893,6 +903,10 @@ echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  dra
 echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
 cd "$LLAMA_DIR"
 
+if [ -n "$ALLMODELS" ]; then
+    ALLMODELS_EXTRA=(--models-dir "$MODELS_DIR" --models-max "$MODELS_MAX" --pooling cls --embeddings)
+fi
+
 LLAMA_BIN="${LLAMA_BIN:-./build/bin/llama-server}"
 if [ ! -x "$LLAMA_BIN" ]; then
     echo "!! $LLAMA_BIN not found. Build llama.cpp for backend '$BACKEND' (see header: $0 -h)" >&2
@@ -932,6 +946,7 @@ while :; do
         --jinja \
         ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
         --host "$HOST" --port "$PORT" \
+        ${ALLMODELS_EXTRA[@]+"${ALLMODELS_EXTRA[@]}"} \
         ${EXTRA[@]+"${EXTRA[@]}"} >"$LOG" 2>&1 &
     SRV=$!
     tail -f -n +1 "$LOG" & # stream server logs live (killed in cleanup; no GNU --pid)
