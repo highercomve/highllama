@@ -15,6 +15,7 @@
 #   localagent apply  <branch> [--into REF] # fast-forward/merge the branch into the repo
 #   localagent discard <branch>             # delete the worktree + branch
 #   localagent export [--format FMT] [-o OUT] # export logged dataset calls
+#   localagent info                         # show proxy and database status/size
 #
 # All sub-agent output (transcript, diff, meta) is written under:
 #   <repo>/.git/localagent/<branch>/
@@ -245,6 +246,51 @@ cmd_discard() {
   echo "discarded $branch"
 }
 
+cmd_info() {
+  local db_file="${LLAMA_PROXY_DATASET:-$STATE_DIR/dataset.db}"
+  # If LLAMA_PROXY_DATASET has .jsonl extension, replace with .db
+  if [[ "$db_file" == *.jsonl ]]; then
+    db_file="${db_file%.jsonl}.db"
+  fi
+  
+  echo "$(c_grn "LocalAgent Session Information:")"
+  echo "----------------------------------------"
+  
+  # Proxy Status
+  if proxy_healthy; then
+    local model; model=$(curl -s "$PROXY_URL/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["model"])' 2>/dev/null || echo "unknown")
+    echo "Proxy Status : $(c_grn "UP") ($PROXY_URL)"
+    echo "Active Model : $model"
+    echo "Upstream API : $LLAMA_BASE"
+  else
+    echo "Proxy Status : $(c_red "DOWN") ($PROXY_URL)"
+  fi
+  
+  echo "Proxy Log    : $PROXY_LOG"
+  if [[ -f "$PROXY_LOG" ]]; then
+    echo "  Log Size   : $(du -sh "$PROXY_LOG" | awk '{print $1}')"
+  fi
+  
+  echo "Database     : $db_file"
+  if [[ -f "$db_file" ]]; then
+    echo "  DB Size    : $(du -sh "$db_file" | awk '{print $1}')"
+    # Row count using sqlite3
+    if command -v sqlite3 >/dev/null; then
+      local count; count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM dataset_calls" 2>/dev/null || echo "0")
+      echo "  Log Count  : $count entries"
+    fi
+  else
+    echo "  DB Size    : 0B (not created yet)"
+  fi
+  
+  # Raw jsonl if it exists
+  local jsonl_file="${db_file%.db}.jsonl"
+  if [[ -f "$jsonl_file" ]]; then
+    echo "Legacy JSONL : $jsonl_file"
+    echo "  File Size  : $(du -sh "$jsonl_file" | awk '{print $1}')"
+  fi
+}
+
 # ---------------------------------------------------------------- dispatch
 usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -262,6 +308,7 @@ case "$cmd" in
   apply)   cmd_apply "$@";;
   discard) cmd_discard "$@";;
   export)  python3 "$HERE/export_dataset.py" "$@";;
+  info)    cmd_info;;
   ""|-h|--help|help) usage;;
-  *) die "unknown command: $cmd (try: proxy|run|list|diff|apply|discard|export)";;
+  *) die "unknown command: $cmd (try: proxy|run|list|diff|apply|discard|export|info)";;
 esac
