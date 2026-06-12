@@ -14,6 +14,7 @@
 #   localagent diff   <branch>              # re-print the diff for a run
 #   localagent apply  <branch> [--into REF] # fast-forward/merge the branch into the repo
 #   localagent discard <branch>             # delete the worktree + branch
+#   localagent export [--format FMT] [-o OUT] # export logged dataset calls for training
 #
 # All sub-agent output (transcript, diff, meta) is written under:
 #   <repo>/.git/localagent/<branch>/
@@ -260,6 +261,7 @@ case "$cmd" in
   diff)    cmd_diff "$@";;
   apply)   cmd_apply "$@";;
   discard) cmd_discard "$@";;
+  export)  python3 "$HERE/export_dataset.py" "$@";;
   ""|-h|--help|help) usage;;
-  *) die "unknown command: $cmd (try: proxy|run|list|diff|apply|discard)";;
+  *) die "unknown command: $cmd (try: proxy|run|list|diff|apply|discard|export)";;
 esac

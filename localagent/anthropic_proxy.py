@@ -31,12 +31,16 @@ Env:
   LLAMA_PROXY_LOG           append a debug log here   (default: none; stderr only)
 """
 
+import datetime
 import http.client
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -438,6 +442,309 @@ def estimate_tokens(body):
     return max(1, n // 4)
 
 
+# ---------------------------------------------------------------------------
+# Dataset logging helper
+# ---------------------------------------------------------------------------
+_dataset_queue = queue.Queue()
+
+
+def _flatten_content(content):
+    if isinstance(content, str):
+        return content
+    if not content:
+        return ""
+    parts = []
+    for b in content:
+        if isinstance(b, str):
+            parts.append(b)
+        elif isinstance(b, dict):
+            t = b.get("type")
+            if t == "text":
+                parts.append(b.get("text", ""))
+            elif t == "tool_use":
+                call_obj = {
+                    "name": b.get("name"),
+                    "arguments": b.get("input", {})
+                }
+                parts.append(f"\n<tool_call>\n{json.dumps(call_obj)}\n</tool_call>\n")
+            elif t == "tool_result":
+                result = b.get("content")
+                if isinstance(result, list):
+                    result_str = _flatten_content(result)
+                elif isinstance(result, str):
+                    result_str = result
+                else:
+                    result_str = json.dumps(result)
+                parts.append(f"\n<tool_response>\n{result_str}\n</tool_response>\n")
+            elif t == "image":
+                parts.append("[image]")
+    return "".join(parts)
+
+
+def _build_dataset_item(body, response_content):
+    try:
+        req_model = body.get("model", MODEL)
+        system = body.get("system")
+        tools = body.get("tools")
+        messages = list(body.get("messages", []))
+
+        assistant_message = {"role": "assistant", "content": response_content}
+        messages.append(assistant_message)
+
+        system_str = ""
+        if system:
+            system_str = system if isinstance(system, str) else _flatten_content(system)
+
+        messages_flat = []
+        if system_str:
+            messages_flat.append({"role": "system", "content": system_str})
+        for msg in messages:
+            messages_flat.append({
+                "role": msg.get("role"),
+                "content": _flatten_content(msg.get("content"))
+            })
+
+        conversations = []
+        if system_str:
+            conversations.append({"from": "system", "value": system_str})
+        for msg in messages:
+            role = msg.get("role")
+            from_val = "human" if role == "user" else ("gpt" if role == "assistant" else role)
+            conversations.append({
+                "from": from_val,
+                "value": _flatten_content(msg.get("content"))
+            })
+
+        item = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": req_model,
+            "system": system_str,
+            "messages": messages,
+            "messages_flat": messages_flat,
+            "conversations": conversations
+        }
+        if tools:
+            item["tools"] = tools
+        return item
+    except Exception as e:
+        log("Error building dataset item:", e)
+        return None
+
+
+def _init_sqlite_db(db_path, jsonl_path):
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Check if table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dataset_calls'")
+        table_exists = cursor.fetchone() is not None
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dataset_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                model TEXT NOT NULL,
+                system TEXT,
+                messages TEXT NOT NULL,
+                messages_flat TEXT NOT NULL,
+                conversations TEXT NOT NULL,
+                tools TEXT
+            )
+        """)
+        conn.commit()
+        
+        # If the table did not exist and we have a jsonl file, migrate it!
+        if not table_exists and os.path.exists(jsonl_path):
+            log("Database migration: migrating historical entries from JSONL to SQLite...")
+            count = 0
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                        cursor.execute("""
+                            INSERT INTO dataset_calls (timestamp, model, system, messages, messages_flat, conversations, tools)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            item.get("timestamp"),
+                            item.get("model", ""),
+                            item.get("system", ""),
+                            json.dumps(item.get("messages", [])),
+                            json.dumps(item.get("messages_flat", [])),
+                            json.dumps(item.get("conversations", [])),
+                            json.dumps(item.get("tools", [])) if "tools" in item else None
+                        ))
+                        count += 1
+                    except Exception as e:
+                        log("Migration error for line:", e)
+            conn.commit()
+            log(f"Database migration: successfully imported {count} entries into SQLite database.")
+            
+        conn.close()
+    except Exception as e:
+        log("Database initialization / migration error:", e, traceback.format_exc())
+
+
+def _write_to_sqlite(db_path, item):
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO dataset_calls (timestamp, model, system, messages, messages_flat, conversations, tools)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            item["timestamp"],
+            item["model"],
+            item.get("system", ""),
+            json.dumps(item["messages"]),
+            json.dumps(item["messages_flat"]),
+            json.dumps(item["conversations"]),
+            json.dumps(item.get("tools", [])) if "tools" in item else None
+        ))
+        conn.commit()
+        conn.close()
+        log("Dataset writer: successfully logged call to SQLite database!")
+    except Exception as e:
+        log("Failed to write to SQLite database:", e, traceback.format_exc())
+
+
+def _dataset_writer_thread():
+    dataset_path = os.environ.get("LLAMA_PROXY_DATASET")
+    if not dataset_path:
+        if LOG_PATH:
+            log_dir = os.path.dirname(LOG_PATH)
+            dataset_path = os.path.join(log_dir, "dataset.jsonl")
+        else:
+            dataset_path = os.path.expanduser("~/.local/state/localagent/dataset.jsonl")
+
+    db_path = dataset_path.rsplit(".", 1)[0] + ".db"
+    try:
+        os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+    except Exception:
+        pass
+    _init_sqlite_db(db_path, dataset_path)
+
+    while True:
+        try:
+            task = _dataset_queue.get()
+            if task is None:
+                break
+
+            task_type = task.get("type")
+            log("Dataset writer thread: processing task type:", task_type)
+
+            item = None
+            if task_type == "parsed":
+                body = task["body"]
+                response_content = task["response_content"]
+                item = _build_dataset_item(body, response_content)
+
+            elif task_type == "passthrough_sync":
+                try:
+                    body = json.loads(task["body_raw"])
+                    resp_obj = json.loads(task["response_bytes"])
+                    response_content = resp_obj.get("content", [])
+                    if response_content:
+                        item = _build_dataset_item(body, response_content)
+                except Exception as e:
+                    log("Dataset writer: failed to parse passthrough_sync:", e, traceback.format_exc())
+
+            elif task_type == "passthrough_stream":
+                try:
+                    body_raw = task["body_raw"]
+                    body = json.loads(body_raw)
+                    reconstructor = SSEAssistantResponseReconstructor()
+                    for line in task["raw_lines"]:
+                        reconstructor.feed_line(line)
+                    response_content = reconstructor.get_content()
+                    if response_content:
+                        item = _build_dataset_item(body, response_content)
+                    else:
+                        log("Dataset writer: reconstructor returned empty content!")
+                except Exception as e:
+                    log("Dataset writer: failed to parse passthrough_stream:", e, traceback.format_exc())
+
+            if not item:
+                log("Dataset writer: no item generated for task.")
+                continue
+
+            # Log to SQLite
+            _write_to_sqlite(db_path, item)
+
+        except Exception as e:
+            log("Dataset writer thread loop error:", e, traceback.format_exc())
+
+
+_writer = threading.Thread(target=_dataset_writer_thread, daemon=True)
+_writer.start()
+
+
+class SSEAssistantResponseReconstructor:
+    def __init__(self):
+        self.blocks = {}
+
+    def feed_line(self, line_bytes):
+        try:
+            line = line_bytes.decode("utf-8", errors="ignore").strip()
+            if not line.startswith("data:"):
+                return
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]" or payload == b"[DONE]":
+                return
+            data = json.loads(payload)
+            t = data.get("type")
+            if t == "content_block_start":
+                idx = data.get("index")
+                cb = data.get("content_block", {})
+                cb_type = cb.get("type")
+                if cb_type == "text":
+                    self.blocks[idx] = {"type": "text", "text": cb.get("text", "")}
+                elif cb_type == "tool_use":
+                    self.blocks[idx] = {
+                        "type": "tool_use",
+                        "id": cb.get("id"),
+                        "name": cb.get("name"),
+                        "input_str": "",
+                    }
+            elif t == "content_block_delta":
+                idx = data.get("index")
+                delta = data.get("delta", {})
+                dt = delta.get("type")
+                if idx in self.blocks:
+                    if dt == "text_delta":
+                        self.blocks[idx]["text"] += delta.get("text", "")
+                    elif dt == "input_json_delta":
+                        self.blocks[idx]["input_str"] += delta.get("partial_json", "")
+        except Exception:
+            pass
+
+    def get_content(self):
+        content_list = []
+        for idx in sorted(self.blocks.keys()):
+            block = self.blocks[idx]
+            if block["type"] == "text":
+                content_list.append({"type": "text", "text": block["text"]})
+            elif block["type"] == "tool_use":
+                try:
+                    inp = json.loads(block["input_str"])
+                except Exception:
+                    inp = block["input_str"]
+                content_list.append(
+                    {
+                        "type": "tool_use",
+                        "id": block["id"],
+                        "name": block["name"],
+                        "input": inp,
+                    }
+                )
+        return content_list
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -465,6 +772,14 @@ class Handler(BaseHTTPRequestHandler):
         headers["Host"] = AN_HOST
         if raw:
             headers["Content-Length"] = str(len(raw))
+
+        try:
+            body = json.loads(raw)
+            is_stream = body.get("stream", False)
+        except Exception:
+            body = None
+            is_stream = False
+
         try:
             c = anthropic_conn()
             c.request(self.command, self.path, body=raw or None, headers=headers)
@@ -482,17 +797,58 @@ class Handler(BaseHTTPRequestHandler):
         # delimit by connection close so we don't have to re-chunk streamed SSE
         self.send_header("Connection", "close")
         self.end_headers()
-        try:
-            while True:
-                line = r.readline()
-                if not line:
-                    break
-                self.wfile.write(line)
+
+        capture_response = r.status == 200 and body is not None
+
+        if is_stream:
+            raw_lines = []
+            try:
+                while True:
+                    line = r.readline()
+                    if not line:
+                        break
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                    if capture_response:
+                        raw_lines.append(line)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                c.close()
+
+            if capture_response:
+                log("Proxy: queuing streaming passthrough task...")
+                _dataset_queue.put_nowait(
+                    {
+                        "type": "passthrough_stream",
+                        "body_raw": raw,
+                        "raw_lines": raw_lines,
+                    }
+                )
+            else:
+                log("Proxy: skipping logging for streaming passthrough (capture_response=%s, raw_lines_len=%d)" % (capture_response, len(raw_lines)))
+        else:
+            response_bytes = b""
+            try:
+                response_bytes = r.read()
+                self.wfile.write(response_bytes)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            c.close()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                c.close()
+
+            if capture_response and response_bytes:
+                log("Proxy: queuing sync passthrough task...")
+                _dataset_queue.put_nowait(
+                    {
+                        "type": "passthrough_sync",
+                        "body_raw": raw,
+                        "response_bytes": response_bytes,
+                    }
+                )
+            else:
+                log("Proxy: skipping logging for sync passthrough (capture_response=%s, has_bytes=%s)" % (capture_response, response_bytes is not None))
 
     def do_GET(self):
         if self.path == "/health":
@@ -619,7 +975,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         try:
-            self._stream(r, req_model)
+            self._stream(r, req_model, body)
             self.wfile.write(b"0\r\n\r\n")  # final chunk
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -687,7 +1043,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         self._w(sse("content_block_stop", {"type": "content_block_stop", "index": idx}))
 
-    def _stream(self, r, req_model):
+    def _stream(self, r, req_model, body=None):
         # Buffer the whole local response, then emit clean Anthropic events. This lets us
         # SALVAGE tool calls that a weak model emitted as text (see salvage_tool_calls).
         # Only local-model responses use this path; Opus is passthrough, so live-streaming
@@ -765,8 +1121,10 @@ class Handler(BaseHTTPRequestHandler):
             text, salvaged = salvage_tool_calls(text)
 
         idx = 0
+        response_content = []
         if text.strip():
             self._emit_text_block(idx, text)
+            response_content.append({"type": "text", "text": text})
             idx += 1
         for t in native:
             try:
@@ -779,12 +1137,31 @@ class Handler(BaseHTTPRequestHandler):
                 t["name"] or "",
                 args,
             )
+            response_content.append(
+                {
+                    "type": "tool_use",
+                    "id": t["id"] or ("toolu_" + uuid.uuid4().hex[:24]),
+                    "name": t["name"] or "",
+                    "input": args,
+                }
+            )
             idx += 1
         for t in salvaged:
             self._emit_tool_block(idx, t["id"], t["name"], t["input"])
+            response_content.append(
+                {
+                    "type": "tool_use",
+                    "id": t["id"],
+                    "name": t["name"],
+                    "input": t["input"],
+                }
+            )
             idx += 1
         if idx == 0:  # nothing at all -> empty text block
             self._emit_text_block(0, "")
+            response_content.append({"type": "text", "text": ""})
+
+
 
         stop = (
             "tool_use"
