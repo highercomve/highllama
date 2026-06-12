@@ -7,7 +7,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export Claude Local Proxy database calls to formats ready for Unsloth / Hugging Face training."
+        description="Export local proxy database calls to standard formats."
     )
     parser.add_argument(
         "--db-path",
@@ -19,7 +19,7 @@ def main():
         "-f",
         choices=["sharegpt", "openai", "jsonl"],
         default="sharegpt",
-        help="Export format: 'sharegpt' (for Unsloth / LLaMA-Factory), 'openai' (standard messages), or 'jsonl' (raw dump)"
+        help="Export format: 'sharegpt' (standard ShareGPT conversations), 'openai' (standard messages), or 'jsonl' (raw dump)"
     )
     parser.add_argument(
         "--output",
@@ -174,74 +174,45 @@ def main():
             
     print(f"Format: {output_format.upper()}", file=info_dest)
     if output_format == "sharegpt":
-        print(f"\nTo load this dataset in your Unsloth training script:", file=info_dest)
+        print(f"\nTo load this dataset in Python:", file=info_dest)
         print(f"""```python
 from datasets import load_dataset
-from unsloth.chat_templates import get_chat_template
 
 # 1. Load the exported dataset
 dataset = load_dataset("json", data_files="{output_path or 'dataset_sharegpt.json'}")
 
-# 2. Format it using get_chat_template (e.g. for LLaMA-3)
-tokenizer = get_chat_template(
-    tokenizer,
-    chat_template = "llama-3",
-    mapping = {{"role" : "from", "content" : "value", "user" : "human", "assistant" : "gpt"}},
-)
-
-def format_prompts(examples):
-    convs = examples["conversations"]
-    texts = [tokenizer.apply_chat_template(c, tokenize=False) for c in convs]
-    return {{"text": texts}}
-
-dataset = dataset.map(format_prompts, batched=True)
+# 2. Access conversations
+for entry in dataset["train"]:
+    conversations = entry["conversations"]
+    for msg in conversations:
+        print(f"[{msg['from']}] {msg['value'][:100]}...")
 ```""", file=info_dest)
     elif output_format == "openai":
-        print(f"\nTo load this dataset in your Unsloth training script:", file=info_dest)
+        print(f"\nTo load this dataset in Python:", file=info_dest)
         print(f"""```python
 from datasets import load_dataset
-from unsloth.chat_templates import get_chat_template
 
 # 1. Load the exported dataset
 dataset = load_dataset("json", data_files="{output_path or 'dataset_openai.json'}")
 
-# 2. Format it using standard messages template (e.g. for LLaMA-3)
-tokenizer = get_chat_template(
-    tokenizer,
-    chat_template = "llama-3",
-    mapping = {{"role" : "role", "content" : "content", "user" : "user", "assistant" : "assistant"}},
-)
-
-def format_prompts(examples):
-    msgs = examples["messages"]
-    texts = [tokenizer.apply_chat_template(m, tokenize=False) for m in msgs]
-    return {{"text": texts}}
-
-dataset = dataset.map(format_prompts, batched=True)
+# 2. Access messages
+for entry in dataset["train"]:
+    messages = entry["messages"]
+    for msg in messages:
+        print(f"[{msg['role']}] {msg['content'][:100]}...")
 ```""", file=info_dest)
     elif output_format == "jsonl":
-        print(f"\nTo load this dataset in your Unsloth training script:", file=info_dest)
+        print(f"\nTo load this dataset in Python:", file=info_dest)
         print(f"""```python
 from datasets import load_dataset
-from unsloth.chat_templates import get_chat_template
 
 # 1. Load the exported JSONL dataset
 dataset = load_dataset("json", data_files="{output_path or 'dataset_jsonl.jsonl'}")
 
-# 2. Since JSONL contains all formats, you can map either ShareGPT
-#    (conversations) or OpenAI (messages_flat). Here is the ShareGPT mapping:
-tokenizer = get_chat_template(
-    tokenizer,
-    chat_template = "llama-3",
-    mapping = {{"role" : "from", "content" : "value", "user" : "human", "assistant" : "gpt"}},
-)
-
-def format_prompts(examples):
-    convs = examples["conversations"]
-    texts = [tokenizer.apply_chat_template(c, tokenize=False) for c in convs]
-    return {{"text": texts}}
-
-dataset = dataset.map(format_prompts, batched=True)
+# 2. Access parsed formats
+for entry in dataset["train"]:
+    # Can access entry['conversations'] (ShareGPT) or entry['messages_flat'] (OpenAI)
+    print(entry["conversations"])
 ```""", file=info_dest)
 
 if __name__ == "__main__":

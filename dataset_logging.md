@@ -1,22 +1,22 @@
-# Zero-Latency Dataset Logging in Claude Local Proxy
+# Zero-Latency Session History Logging in Local Proxy
 
-We have optimized the background dataset logging in the local proxy ([anthropic_proxy.py](file:///home/sergiom/Code/llms/localagent/anthropic_proxy.py)) to ensure **absolutely zero performance overhead** on the request path. All JSON parsing, decoding, stream reconstruction, and database writes are offloaded to a dedicated background daemon worker.
+We have optimized the background request logging in the local proxy ([anthropic_proxy.py](file:///home/sergiom/Code/llms/localagent/anthropic_proxy.py)) to ensure **absolutely zero performance overhead** on the request path. All JSON parsing, decoding, stream reconstruction, and database writes are offloaded to a dedicated background daemon worker.
 
 > [!NOTE]
-> This logging only captures queries and responses directed to **remote Anthropic models** (such as Claude 3.5 Sonnet or Claude 3 Opus sent via passthrough). Local model calls (e.g., to `local-llama` routing to `llama-server`) are completely ignored to keep the training dataset clean.
+> This logging only captures queries and responses directed to **remote cloud models** (such as remote assistant models sent via passthrough). Local model calls (e.g., to `local-llama` routing to `llama-server`) are completely ignored to keep the session logs clean.
 
 ## Optimization Architecture
 
 ```mermaid
 sequenceDiagram
-    participant Client as Claude Code Client
+    participant Client as Client
     participant Proxy as Proxy Request Thread
-    participant Upstream as api.anthropic.com
+    participant Upstream as remote-api-server
     participant Queue as Thread-safe Queue
     participant Worker as Background Writer Thread
     participant DB as SQLite (dataset.db)
 
-    Client->>Proxy: POST /v1/messages (Model: Claude 3.5 Sonnet)
+    Client->>Proxy: POST /v1/messages (Model: remote-model)
     Proxy->>Upstream: Forward request
     Upstream-->>Proxy: Stream response tokens
     Proxy-->>Client: Stream tokens to client (Real-time)
@@ -28,7 +28,7 @@ sequenceDiagram
 ```
 
 ### 1. Zero-Blocking Request Pathway
-* For **passthrough streaming** (e.g. Opus/Sonnet), the proxy thread reads lines from the upstream socket and writes them directly to the client socket. It only appends the raw byte lines to a list (`O(1)` append).
+* For **passthrough streaming**, the proxy thread reads lines from the upstream socket and writes them directly to the client socket. It only appends the raw byte lines to a list (`O(1)` append).
 * For **passthrough synchronous** calls, the proxy reads the raw response bytes and writes them to the client.
 * As soon as the connection terminates, the raw byte list/payload is pushed onto a thread-safe `queue.Queue` using a non-blocking `put_nowait()` call.
 * No text decoding, JSON parsing, regular expressions, or disk I/O are performed on the main request processing thread.
@@ -37,7 +37,7 @@ sequenceDiagram
 A background daemon thread (`_dataset_writer_thread`) retrieves the tasks from the queue and handles the computationally expensive operations:
 * JSON decoding of requests and responses.
 * Parsing and reconstructing the SSE token stream to build complete content blocks (including tool uses and text).
-* Injecting timestamps, formatting the training samples, and writing them to the SQLite database.
+* Injecting timestamps, formatting the log entries, and writing them to the SQLite database.
 
 ---
 
@@ -60,7 +60,7 @@ The database logs are written to the `dataset_calls` table with the following sc
 CREATE TABLE dataset_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,       -- ISO UTC Timestamp
-    model TEXT NOT NULL,           -- Model name (e.g., claude-3-5-sonnet)
+    model TEXT NOT NULL,           -- Model name (e.g., remote-model)
     system TEXT,                   -- System prompt (flattened)
     messages TEXT NOT NULL,        -- JSON string of raw messages list
     messages_flat TEXT NOT NULL,   -- JSON string of flattened messages
@@ -71,9 +71,9 @@ CREATE TABLE dataset_calls (
 
 ---
 
-## Exporting for Unsloth / Hugging Face
+## Exporting Logged Conversations
 
-To prepare the dataset for training, use the `localagent export` tool:
+To prepare the session logs for export, use the `localagent export` tool:
 
 ```bash
 # Export all logged queries in ShareGPT format to a file:
@@ -93,26 +93,17 @@ localagent export --format jsonl --latest 5 2>/dev/null | jq '.conversations'
 * `--has-tools`: Filters out non-agentic runs, exporting only sessions that called tools.
 * `--latest N`: Exports only the N most recent conversations.
 
-### Loading in Unsloth:
+### Loading in Python:
 If you exported in `sharegpt` format:
 ```python
 from datasets import load_dataset
-from unsloth.chat_templates import get_chat_template
 
 # 1. Load the exported dataset
 dataset = load_dataset("json", data_files="my_dataset.json")
 
-# 2. Format it using get_chat_template (e.g. for LLaMA-3)
-tokenizer = get_chat_template(
-    tokenizer,
-    chat_template = "llama-3",
-    mapping = {"role" : "from", "content" : "value", "user" : "human", "assistant" : "gpt"},
-)
-
-def format_prompts(examples):
-    convs = examples["conversations"]
-    texts = [tokenizer.apply_chat_template(c, tokenize=False) for c in convs]
-    return {"text": texts}
-
-dataset = dataset.map(format_prompts, batched=True)
+# 2. Access conversations
+for entry in dataset["train"]:
+    conversations = entry["conversations"]
+    for msg in conversations:
+        print(f"[{msg['from']}] {msg['value'][:100]}...")
 ```

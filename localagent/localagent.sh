@@ -14,7 +14,7 @@
 #   localagent diff   <branch>              # re-print the diff for a run
 #   localagent apply  <branch> [--into REF] # fast-forward/merge the branch into the repo
 #   localagent discard <branch>             # delete the worktree + branch
-#   localagent export [--format FMT] [-o OUT] # export logged dataset calls for training
+#   localagent export [--format FMT] [-o OUT] # export logged dataset calls
 #
 # All sub-agent output (transcript, diff, meta) is written under:
 #   <repo>/.git/localagent/<branch>/

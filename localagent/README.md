@@ -115,8 +115,8 @@ localagent discard la/feat-x-20260608-...     # throw it away
 
 localagent list                               # active worktrees awaiting validation
 
-# export logged dataset calls for training:
-localagent export --format sharegpt -o unsloth_dataset.json  # export all calls
+# export logged dataset calls:
+localagent export --format sharegpt -o exported_dataset.json  # export all calls
 localagent export --latest 10 --has-tools                    # view latest 10 tool calls on stdout
 ```
 
