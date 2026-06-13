@@ -377,8 +377,12 @@ class TestWriterIntegration(unittest.TestCase):
             if os.path.exists(self._db):
                 conn = sqlite3.connect(self._db, timeout=1)
                 try:
-                    cur = conn.execute(sql, params)
-                    rows = cur.fetchall()
+                    try:
+                        cur = conn.execute(sql, params)
+                        rows = cur.fetchall()
+                    except sqlite3.OperationalError:
+                        # writer hasn't created the table yet
+                        rows = []
                 finally:
                     conn.close()
                 if rows:
