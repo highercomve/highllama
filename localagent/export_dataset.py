@@ -65,13 +65,19 @@ def main():
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    query = "SELECT timestamp, model, system, messages, messages_flat, conversations, tools FROM dataset_calls"
+    query = "SELECT timestamp, model, system, messages, messages_flat, conversations, tools, has_tool_calls FROM dataset_calls"
+    where_clauses = []
     params = []
-    
+
     if args.model:
-        query += " WHERE model = ?"
+        where_clauses.append("model = ?")
         params.append(args.model)
-        
+    if args.has_tools:
+        where_clauses.append("has_tool_calls = 1")
+
+    if where_clauses:
+        query += " WHERE " + " AND ".join(where_clauses)
+
     if args.latest:
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(args.latest)
@@ -80,47 +86,36 @@ def main():
         if args.limit:
             query += " LIMIT ?"
             params.append(args.limit)
-        
+
     cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
 
     if args.latest:
         rows = rows[::-1]
-    
+
     if not rows:
         print("No entries found in database matching criteria.", file=sys.stderr)
         sys.exit(0)
-        
+
     output_format = args.format
     output_path = args.output
-        
+
     exported_data = []
-    
+
     for row in rows:
-        timestamp, model, system, messages_json, messages_flat_json, conversations_json, tools_json = row
-        
+        timestamp, model, system, messages_json, messages_flat_json, conversations_json, tools_json, has_tool_calls = row
+
         messages = json.loads(messages_json)
         messages_flat = json.loads(messages_flat_json)
         conversations = json.loads(conversations_json)
         tools = json.loads(tools_json) if tools_json else None
-        
-        # Apply filters
+
         if args.min_turns:
             non_system_turns = len([m for m in conversations if m.get("from") in ["human", "gpt"]])
             if non_system_turns < args.min_turns:
                 continue
-                
-        if args.has_tools:
-            has_tool_call = False
-            for m in conversations:
-                val = m.get("value", "")
-                if "<tool_call>" in val or "tool_use" in val:
-                    has_tool_call = True
-                    break
-            if not has_tool_call:
-                continue
-        
+
         if output_format == "sharegpt":
             item = {"conversations": conversations}
             if system:
@@ -185,7 +180,7 @@ dataset = load_dataset("json", data_files="{output_path or 'dataset_sharegpt.jso
 for entry in dataset["train"]:
     conversations = entry["conversations"]
     for msg in conversations:
-        print(f"[{msg['from']}] {msg['value'][:100]}...")
+        print(f"[{{msg['from']}}] {{msg['value'][:100]}}...")
 ```""", file=info_dest)
     elif output_format == "openai":
         print(f"\nTo load this dataset in Python:", file=info_dest)
@@ -199,7 +194,7 @@ dataset = load_dataset("json", data_files="{output_path or 'dataset_openai.json'
 for entry in dataset["train"]:
     messages = entry["messages"]
     for msg in messages:
-        print(f"[{msg['role']}] {msg['content'][:100]}...")
+        print(f"[{{msg['role']}}] {{msg['content'][:100]}}...")
 ```""", file=info_dest)
     elif output_format == "jsonl":
         print(f"\nTo load this dataset in Python:", file=info_dest)

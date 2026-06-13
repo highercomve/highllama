@@ -247,10 +247,20 @@ cmd_discard() {
 }
 
 cmd_info() {
-  local db_file="${LLAMA_PROXY_DATASET:-$STATE_DIR/dataset.db}"
-  # If LLAMA_PROXY_DATASET has .jsonl extension, replace with .db
-  if [[ "$db_file" == *.jsonl ]]; then
-    db_file="${db_file%.jsonl}.db"
+  # Mirror the proxy's resolve_dataset_paths() exactly so we always report
+  # the same DB the proxy is actually writing to.
+  local dataset_path jsonl_file db_file
+  if [[ -n "${LLAMA_PROXY_DATASET:-}" ]]; then
+    dataset_path="$LLAMA_PROXY_DATASET"
+  elif [[ -n "${LLAMA_PROXY_LOG:-}" ]]; then
+    dataset_path="$(dirname "$LLAMA_PROXY_LOG")/dataset.jsonl"
+  else
+    dataset_path="$STATE_DIR/dataset.jsonl"
+  fi
+  db_file="${dataset_path%.jsonl}.db"
+  if [[ "$db_file" == "$dataset_path" ]]; then
+    # dataset_path had no .jsonl extension to strip — append .db
+    db_file="${dataset_path}.db"
   fi
   
   echo "$(c_grn "LocalAgent Session Information:")"

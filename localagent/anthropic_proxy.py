@@ -33,6 +33,7 @@ Env:
 
 import datetime
 import http.client
+import io
 import json
 import os
 import queue
@@ -445,7 +446,27 @@ def estimate_tokens(body):
 # ---------------------------------------------------------------------------
 # Dataset logging helper
 # ---------------------------------------------------------------------------
-_dataset_queue = queue.Queue()
+_DATASET_QUEUE_MAX = int(os.environ.get("LLAMA_PROXY_DATASET_QUEUE_MAX", "10000"))
+_dataset_queue = queue.Queue(maxsize=_DATASET_QUEUE_MAX)
+_dataset_dropped = 0
+_dataset_dropped_lock = threading.Lock()
+
+
+def _enqueue_dataset(task):
+    """Non-blocking enqueue. If the writer falls behind, drop the oldest
+    pending task and count the drop instead of buffering unbounded memory."""
+    global _dataset_dropped
+    while True:
+        try:
+            _dataset_queue.put_nowait(task)
+            return
+        except queue.Full:
+            try:
+                _dataset_queue.get_nowait()
+            except queue.Empty:
+                pass
+            with _dataset_dropped_lock:
+                _dataset_dropped += 1
 
 
 def _flatten_content(content):
@@ -481,6 +502,17 @@ def _flatten_content(content):
     return "".join(parts)
 
 
+def _has_tool_calls(item):
+    """True if any message in the conversation referenced a tool."""
+    for m in item.get("messages", []):
+        content = m.get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result"):
+                    return True
+    return False
+
+
 def _build_dataset_item(body, response_content):
     try:
         req_model = body.get("model", MODEL)
@@ -509,7 +541,14 @@ def _build_dataset_item(body, response_content):
             conversations.append({"from": "system", "value": system_str})
         for msg in messages:
             role = msg.get("role")
-            from_val = "human" if role == "user" else ("gpt" if role == "assistant" else role)
+            if role == "user":
+                from_val = "human"
+            elif role == "assistant":
+                from_val = "gpt"
+            elif role == "tool":
+                from_val = "function"
+            else:
+                from_val = role
             conversations.append({
                 "from": from_val,
                 "value": _flatten_content(msg.get("content"))
@@ -521,7 +560,10 @@ def _build_dataset_item(body, response_content):
             "system": system_str,
             "messages": messages,
             "messages_flat": messages_flat,
-            "conversations": conversations
+            "conversations": conversations,
+            "has_tool_calls": _has_tool_calls(
+                {"messages": messages}
+            ),
         }
         if tools:
             item["tools"] = tools
@@ -531,89 +573,9 @@ def _build_dataset_item(body, response_content):
         return None
 
 
-def _init_sqlite_db(db_path, jsonl_path):
-    try:
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Check if table exists
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dataset_calls'")
-        table_exists = cursor.fetchone() is not None
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS dataset_calls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                model TEXT NOT NULL,
-                system TEXT,
-                messages TEXT NOT NULL,
-                messages_flat TEXT NOT NULL,
-                conversations TEXT NOT NULL,
-                tools TEXT
-            )
-        """)
-        conn.commit()
-        
-        # If the table did not exist and we have a jsonl file, migrate it!
-        if not table_exists and os.path.exists(jsonl_path):
-            log("Database migration: migrating historical entries from JSONL to SQLite...")
-            count = 0
-            with open(jsonl_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        item = json.loads(line)
-                        cursor.execute("""
-                            INSERT INTO dataset_calls (timestamp, model, system, messages, messages_flat, conversations, tools)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            item.get("timestamp"),
-                            item.get("model", ""),
-                            item.get("system", ""),
-                            json.dumps(item.get("messages", [])),
-                            json.dumps(item.get("messages_flat", [])),
-                            json.dumps(item.get("conversations", [])),
-                            json.dumps(item.get("tools", [])) if "tools" in item else None
-                        ))
-                        count += 1
-                    except Exception as e:
-                        log("Migration error for line:", e)
-            conn.commit()
-            log(f"Database migration: successfully imported {count} entries into SQLite database.")
-            
-        conn.close()
-    except Exception as e:
-        log("Database initialization / migration error:", e, traceback.format_exc())
-
-
-def _write_to_sqlite(db_path, item):
-    try:
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO dataset_calls (timestamp, model, system, messages, messages_flat, conversations, tools)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            item["timestamp"],
-            item["model"],
-            item.get("system", ""),
-            json.dumps(item["messages"]),
-            json.dumps(item["messages_flat"]),
-            json.dumps(item["conversations"]),
-            json.dumps(item.get("tools", [])) if "tools" in item else None
-        ))
-        conn.commit()
-        conn.close()
-        log("Dataset writer: successfully logged call to SQLite database!")
-    except Exception as e:
-        log("Failed to write to SQLite database:", e, traceback.format_exc())
-
-
-def _dataset_writer_thread():
+def resolve_dataset_paths():
+    """Resolve (jsonl_path, db_path) using the same precedence as the writer.
+    Exposed so external tools (e.g. localagent.sh info) can find the DB."""
     dataset_path = os.environ.get("LLAMA_PROXY_DATASET")
     if not dataset_path:
         if LOG_PATH:
@@ -621,14 +583,157 @@ def _dataset_writer_thread():
             dataset_path = os.path.join(log_dir, "dataset.jsonl")
         else:
             dataset_path = os.path.expanduser("~/.local/state/localagent/dataset.jsonl")
-
     db_path = dataset_path.rsplit(".", 1)[0] + ".db"
+    return dataset_path, db_path
+
+
+_DATASET_SCHEMA = """
+CREATE TABLE IF NOT EXISTS dataset_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    model TEXT NOT NULL,
+    system TEXT,
+    messages TEXT NOT NULL,
+    messages_flat TEXT NOT NULL,
+    conversations TEXT NOT NULL,
+    tools TEXT,
+    has_tool_calls INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+
+def _ensure_schema(conn):
+    cur = conn.cursor()
+    cur.execute(_DATASET_SCHEMA)
+    cur.execute("PRAGMA user_version")
+    ver = cur.fetchone()[0]
+    if ver < 1:
+        # Add has_tool_calls to pre-existing tables that predate the column
+        try:
+            cur.execute("ALTER TABLE dataset_calls ADD COLUMN has_tool_calls INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        cur.execute("PRAGMA user_version = 1")
+        conn.commit()
+
+
+def _migrate_jsonl(conn, jsonl_path):
+    """One-shot: import a legacy dataset.jsonl into the SQLite DB.
+    Idempotent — only runs if the DB has zero rows AND the file exists.
+    Runs in the writer thread so proxy startup isn't blocked."""
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM dataset_calls")
+    if cur.fetchone()[0] > 0:
+        return
+    if not os.path.exists(jsonl_path):
+        return
+    try:
+        size_mb = os.path.getsize(jsonl_path) / (1024 * 1024)
+    except OSError:
+        return
+    if size_mb > 256:
+        log(f"Database migration: skipping {size_mb:.0f}MB JSONL (set LLAMA_PROXY_DATASET to a smaller file or import manually)")
+        return
+    log(f"Database migration: importing {size_mb:.1f}MB JSONL into SQLite...")
+    count = 0
+    batch = 0
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as e:
+                    log("Migration: skipping malformed line:", e)
+                    continue
+                has_tools = 0
+                for m in item.get("messages", []) or []:
+                    content = m.get("content")
+                    if isinstance(content, list):
+                        for b in content:
+                            if isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result"):
+                                has_tools = 1
+                                break
+                    if has_tools:
+                        break
+                cur.execute(
+                    "INSERT INTO dataset_calls (timestamp, model, system, messages, messages_flat, conversations, tools, has_tool_calls) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        item.get("timestamp"),
+                        item.get("model", ""),
+                        item.get("system", ""),
+                        json.dumps(item.get("messages", [])),
+                        json.dumps(item.get("messages_flat", [])),
+                        json.dumps(item.get("conversations", [])),
+                        json.dumps(item["tools"]) if "tools" in item else None,
+                        has_tools,
+                    ),
+                )
+                count += 1
+                batch += 1
+                if batch >= 500:
+                    conn.commit()
+                    batch = 0
+        conn.commit()
+        log(f"Database migration: imported {count} entries from JSONL")
+    except Exception as e:
+        log("Database migration failed:", e, traceback.format_exc())
+
+
+def _maybe_rotate(db_path):
+    """If LLAMA_PROXY_DATASET_ROTATE_MB is set and the DB exceeds that size,
+    rename it aside and start a fresh one. Best-effort: rename errors are logged."""
+    rotate_mb = os.environ.get("LLAMA_PROXY_DATASET_ROTATE_MB")
+    if not rotate_mb:
+        return
+    try:
+        limit = int(rotate_mb) * 1024 * 1024
+    except ValueError:
+        log("LLAMA_PROXY_DATASET_ROTATE_MB is not an int; ignoring")
+        return
+    try:
+        size = os.path.getsize(db_path)
+    except OSError:
+        return
+    if size < limit:
+        return
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rotated = db_path.rsplit(".", 1)[0] + f".{ts}.db"
+    try:
+        os.rename(db_path, rotated)
+        log(f"Dataset rotation: {db_path} ({size // (1024*1024)}MB) -> {rotated}")
+    except OSError as e:
+        log(f"Dataset rotation: rename failed: {e}")
+
+
+_INSERT_SQL = (
+    "INSERT INTO dataset_calls "
+    "(timestamp, model, system, messages, messages_flat, conversations, tools, has_tool_calls) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _dataset_writer_thread():
+    global _dataset_dropped
+    dataset_path, db_path = resolve_dataset_paths()
     try:
         os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
     except Exception:
         pass
-    _init_sqlite_db(db_path, dataset_path)
 
+    _maybe_rotate(db_path)
+
+    import sqlite3
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    _ensure_schema(conn)
+    _migrate_jsonl(conn, dataset_path)
+
+    write_count = 0
     while True:
         try:
             task = _dataset_queue.get()
@@ -636,14 +741,9 @@ def _dataset_writer_thread():
                 break
 
             task_type = task.get("type")
-            log("Dataset writer thread: processing task type:", task_type)
-
             item = None
             if task_type == "parsed":
-                body = task["body"]
-                response_content = task["response_content"]
-                item = _build_dataset_item(body, response_content)
-
+                item = _build_dataset_item(task["body"], task["response_content"])
             elif task_type == "passthrough_sync":
                 try:
                     body = json.loads(task["body_raw"])
@@ -653,38 +753,73 @@ def _dataset_writer_thread():
                         item = _build_dataset_item(body, response_content)
                 except Exception as e:
                     log("Dataset writer: failed to parse passthrough_sync:", e, traceback.format_exc())
-
             elif task_type == "passthrough_stream":
                 try:
-                    body_raw = task["body_raw"]
-                    body = json.loads(body_raw)
+                    body = json.loads(task["body_raw"])
                     reconstructor = SSEAssistantResponseReconstructor()
-                    for line in task["raw_lines"]:
-                        reconstructor.feed_line(line)
+                    raw = task.get("raw_bytes", b"")
+                    for line_bytes in raw.splitlines(keepends=True):
+                        reconstructor.feed_line(line_bytes)
                     response_content = reconstructor.get_content()
                     if response_content:
                         item = _build_dataset_item(body, response_content)
                     else:
-                        log("Dataset writer: reconstructor returned empty content!")
+                        log("Dataset writer: reconstructor returned empty content for stream")
                 except Exception as e:
                     log("Dataset writer: failed to parse passthrough_stream:", e, traceback.format_exc())
 
             if not item:
-                log("Dataset writer: no item generated for task.")
                 continue
 
-            # Log to SQLite
-            _write_to_sqlite(db_path, item)
-
+            tools_json = json.dumps(item["tools"]) if item.get("tools") else None
+            conn.execute(
+                _INSERT_SQL,
+                (
+                    item["timestamp"],
+                    item["model"],
+                    item.get("system", ""),
+                    json.dumps(item["messages"]),
+                    json.dumps(item["messages_flat"]),
+                    json.dumps(item["conversations"]),
+                    tools_json,
+                    int(bool(item.get("has_tool_calls"))),
+                ),
+            )
+            conn.commit()  # commit per row: WAL keeps the cost low, and external readers (exporter, test harnesses) see writes immediately
+            write_count += 1
+            if _dataset_dropped:
+                with _dataset_dropped_lock:
+                    dropped = _dataset_dropped
+                    _dataset_dropped = 0
+                if dropped:
+                    log(f"Dataset writer: dropped {dropped} tasks due to backlog")
         except Exception as e:
             log("Dataset writer thread loop error:", e, traceback.format_exc())
 
+    try:
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
-_writer = threading.Thread(target=_dataset_writer_thread, daemon=True)
-_writer.start()
+
+def start_dataset_writer():
+    """Spawn the background writer thread. Called by main(); safe to call once."""
+    global _writer
+    if _writer is not None and _writer.is_alive():
+        return _writer
+    _writer = threading.Thread(target=_dataset_writer_thread, daemon=True)
+    _writer.start()
+    return _writer
+
+
+_writer = None
 
 
 class SSEAssistantResponseReconstructor:
+    _ERRORS_LOGGED = 0
+    _ERRORS_LOGGED_MAX = 5
+
     def __init__(self):
         self.blocks = {}
 
@@ -694,7 +829,7 @@ class SSEAssistantResponseReconstructor:
             if not line.startswith("data:"):
                 return
             payload = line[5:].strip()
-            if not payload or payload == "[DONE]" or payload == b"[DONE]":
+            if not payload or payload == "[DONE]":
                 return
             data = json.loads(payload)
             t = data.get("type")
@@ -720,8 +855,10 @@ class SSEAssistantResponseReconstructor:
                         self.blocks[idx]["text"] += delta.get("text", "")
                     elif dt == "input_json_delta":
                         self.blocks[idx]["input_str"] += delta.get("partial_json", "")
-        except Exception:
-            pass
+        except Exception as e:
+            if SSEAssistantResponseReconstructor._ERRORS_LOGGED < SSEAssistantResponseReconstructor._ERRORS_LOGGED_MAX:
+                SSEAssistantResponseReconstructor._ERRORS_LOGGED += 1
+                log("SSEAssistantResponseReconstructor: feed_line error:", e)
 
     def get_content(self):
         content_list = []
@@ -801,7 +938,7 @@ class Handler(BaseHTTPRequestHandler):
         capture_response = r.status == 200 and body is not None
 
         if is_stream:
-            raw_lines = []
+            response_buf = io.BytesIO()
             try:
                 while True:
                     line = r.readline()
@@ -810,7 +947,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(line)
                     self.wfile.flush()
                     if capture_response:
-                        raw_lines.append(line)
+                        response_buf.write(line)
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
@@ -818,15 +955,15 @@ class Handler(BaseHTTPRequestHandler):
 
             if capture_response:
                 log("Proxy: queuing streaming passthrough task...")
-                _dataset_queue.put_nowait(
+                _enqueue_dataset(
                     {
                         "type": "passthrough_stream",
                         "body_raw": raw,
-                        "raw_lines": raw_lines,
+                        "raw_bytes": response_buf.getvalue(),
                     }
                 )
             else:
-                log("Proxy: skipping logging for streaming passthrough (capture_response=%s, raw_lines_len=%d)" % (capture_response, len(raw_lines)))
+                log("Proxy: skipping logging for streaming passthrough (capture_response=%s, raw_bytes=%d)" % (capture_response, len(response_buf.getvalue())))
         else:
             response_bytes = b""
             try:
@@ -840,7 +977,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if capture_response and response_bytes:
                 log("Proxy: queuing sync passthrough task...")
-                _dataset_queue.put_nowait(
+                _enqueue_dataset(
                     {
                         "type": "passthrough_sync",
                         "body_raw": raw,
@@ -966,7 +1103,13 @@ class Handler(BaseHTTPRequestHandler):
         if not stream:
             data = json.loads(r.read())
             c.close()
-            return self._json(200, openai_to_anthropic(data, req_model))
+            anth = openai_to_anthropic(data, req_model)
+            _enqueue_dataset({
+                "type": "parsed",
+                "body": body,
+                "response_content": anth["content"],
+            })
+            return self._json(200, anth)
 
         # streaming: translate OpenAI SSE -> Anthropic SSE (chunked transfer)
         self.send_response(200)
@@ -1180,8 +1323,15 @@ class Handler(BaseHTTPRequestHandler):
         )
         self._w(sse("message_stop", {"type": "message_stop"}))
 
+        _enqueue_dataset({
+            "type": "parsed",
+            "body": body,
+            "response_content": response_content,
+        })
+
 
 def main():
+    start_dataset_writer()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
         srv.serve_forever()
