@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+Agentic variant of the code benchmark: run the SAME private tasks through the
+OpenCode agent (`opencode run`) with tools enabled, instead of a single
+chat-completion. The model can write a file, run it, read errors, and fix its
+code before finishing — so this measures model+tooling+iteration, not raw
+one-shot generation. Results are graded by the exact same hidden harness, so
+they sit directly next to the single-shot numbers in score_compare.py.
+
+For each task we:
+  1. make a throwaway working dir,
+  2. ask `opencode run -m <model> --dir <dir>` to write the solution into
+     solution.<ext> (and let it test however it likes),
+  3. read that file back and grade it with runners.run_solution.
+
+Needs opencode installed and the provider authenticated (`opencode auth list`).
+The chosen model must be reachable, e.g. opencode-go/kimi-k2.7-code.
+
+The model id MUST be a fully-qualified opencode 'provider/model' (run
+`opencode models` to see them). A bare name is auto-resolved against that list,
+so the local llama.cpp model works either way:
+
+Usage:
+    python run_agentic_benchmark.py --opencode-go kimi-k2.7-code
+    python run_agentic_benchmark.py --model llamacpp/gemma-4-26B-A4B-it-QAT-Q4_0
+    python run_agentic_benchmark.py --model gemma-4-26B-A4B-it-QAT-Q4_0   # auto-resolved
+    python run_agentic_benchmark.py --opencode-go glm-5.1 --tasks py_,rs_ --task-timeout 240
+
+WARNING: this runs the agent with --dangerously-skip-permissions, i.e. it will
+execute commands the model chooses inside the per-task scratch dir. Only run
+models you trust on this machine.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+import run_code_benchmark as R
+from runners import available_languages, run_solution
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# What file the agent must write its solution into, per language. The contents
+# are fed to run_solution() exactly like the single-shot extracted code, so the
+# same {{SOLUTION}}/separate-file harness logic applies (Go -> its own file).
+SOLUTION_FILE = {
+    "python": "solution.py", "javascript": "solution.mjs", "typescript": "solution.ts",
+    "rust": "solution.rs", "go": "solution.go", "c": "solution.c",
+    "cpp": "solution.cpp", "bash": "solution.sh",
+}
+
+
+def agent_prompt(task):
+    lang = task["language"]
+    sol = SOLUTION_FILE[lang]
+    extra = ""
+    if lang == "go":
+        extra = (f" The file {sol} must begin with `package main`, include the imports "
+                 f"you need, and define the function — but do NOT add a main function.")
+    return (
+        f"{task['prompt']}\n\n"
+        f"Create a file named {sol} in the current working directory containing ONLY "
+        f"the {lang} implementation described above: the requested function/definition "
+        f"with the exact name and signature, plus any imports it needs.{extra} Do not "
+        f"put a main function, tests, example usage, or stray print/debug statements in "
+        f"{sol}. You MAY create other files and run commands to test and debug your "
+        f"solution — please verify it actually works before finishing. When done, {sol} "
+        f"must contain just the implementation."
+    )
+
+
+def run_agent(model, workdir, prompt, timeout, logpath):
+    """Drive `opencode run` headlessly in workdir; return (returncode, timed_out)."""
+    cmd = ["opencode", "run", "-m", model, "--dir", workdir,
+           "--dangerously-skip-permissions", prompt]
+    with open(logpath, "w") as log:
+        p = subprocess.Popen(cmd, cwd=workdir, stdout=log, stderr=subprocess.STDOUT,
+                             text=True, start_new_session=True)
+        try:
+            p.communicate(timeout=timeout)
+            return p.returncode, False
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.communicate()
+            return -signal.SIGKILL, True
+
+
+def read_solution(workdir, sol):
+    """Return the agent's solution file contents, searching subdirs as a fallback."""
+    direct = os.path.join(workdir, sol)
+    if os.path.isfile(direct):
+        return open(direct).read()
+    for root, _dirs, files in os.walk(workdir):
+        if sol in files:
+            return open(os.path.join(root, sol)).read()
+    return None
+
+
+def opencode_model_ids():
+    """Parse `opencode models` into the list of fully-qualified provider/model ids."""
+    try:
+        out = subprocess.run(["opencode", "models"], capture_output=True, text=True,
+                             timeout=60).stdout
+    except Exception as e:
+        print(f">> warning: could not list opencode models ({e}); skipping validation")
+        return None
+    ids = []
+    for line in out.splitlines():
+        line = line.strip()
+        # model ids look like 'provider/model'; skip plugin chatter ('[...]') and blanks
+        if "/" in line and not line.startswith("[") and " " not in line:
+            ids.append(line)
+    return ids
+
+
+def resolve_model(want):
+    """
+    Turn a user model string into a valid opencode 'provider/model' id.
+
+    opencode REQUIRES the provider prefix (e.g. llamacpp/gemma-4-26B-...). A bare
+    name like 'gemma-4-26B-A4B-it-QAT-Q4_0' silently fails — so if there's no
+    prefix (or it doesn't match), match by the part after '/' against
+    `opencode models` and resolve it, erroring with suggestions if it's
+    missing/ambiguous instead of launching a doomed run.
+    """
+    ids = opencode_model_ids()
+    if ids is None:            # couldn't list — trust the user's input as-is
+        return want
+    if want in ids:
+        return want
+    base = want.split("/")[-1]
+    matches = [m for m in ids if m.split("/")[-1] == base]
+    if len(matches) == 1:
+        print(f">> resolved '{want}' -> '{matches[0]}'")
+        return matches[0]
+    if not matches:
+        sample = "\n  ".join(ids[:25])
+        sys.exit(f"!! model '{want}' not found in `opencode models`. Available include:\n  {sample}\n"
+                 f"   (the local llama.cpp model is e.g. llamacpp/<name>)")
+    opts = "\n  ".join(matches)
+    sys.exit(f"!! '{base}' is ambiguous across providers — pass the full id with --model:\n  {opts}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="",
+                    help="opencode model id 'provider/model' (bare names are auto-resolved "
+                         "against `opencode models`, e.g. the local llamacpp/... one)")
+    ap.add_argument("--opencode-go", default="", metavar="MODEL",
+                    help="sugar for --model opencode-go/<MODEL> (e.g. kimi-k2.7-code)")
+    ap.add_argument("--tasks-dir", default=os.path.join(HERE, "tasks"))
+    ap.add_argument("--langs", default="", help="comma-separated language filter")
+    ap.add_argument("--difficulty", default="",
+                    help="comma-separated difficulty filter (easy,medium,hard,expert)")
+    ap.add_argument("--tasks", default="", help="comma-separated id-prefix filter")
+    ap.add_argument("--task-timeout", type=int, default=300,
+                    help="per-task wall-clock budget for the agent (seconds)")
+    ap.add_argument("--out", default="", help="results json (default results/<model>__agent.json)")
+    ap.add_argument("--keep-workdirs", action="store_true", help="don't delete the agent scratch dirs")
+    args = ap.parse_args()
+
+    raw_model = args.model or (f"opencode-go/{args.opencode_go}" if args.opencode_go else "")
+    if not raw_model:
+        sys.exit("!! choose a model: --opencode-go <id>, or --model provider/model "
+                 "(see `opencode models`)")
+    if shutil.which("opencode") is None:
+        sys.exit("!! opencode not found on PATH (https://opencode.ai)")
+    model = resolve_model(raw_model)
+
+    avail = available_languages()
+    lang_filter = {x for x in args.langs.split(",") if x} or None
+    diff_filter = {x for x in args.difficulty.split(",") if x} or None
+    id_filters = [x for x in args.tasks.split(",") if x]
+    tasks, skipped = R.load_tasks(args.tasks_dir, lang_filter, id_filters, avail, diff_filter)
+    if not tasks:
+        sys.exit("!! no tasks matched (check --tasks-dir / filters / toolchains)")
+
+    label = f"{model} (opencode-agent)"
+    print(f">> agent model={model}  tasks={len(tasks)}  timeout={args.task_timeout}s/task")
+    scratch_root = os.path.join(HERE, ".scratch-agent")
+    os.makedirs(scratch_root, exist_ok=True)
+
+    records = []
+    t0 = time.time()
+    for i, task in enumerate(tasks, 1):
+        sol = SOLUTION_FILE[task["language"]]
+        print(f"   [{i}/{len(tasks)}] {task['id']} ...", end=" ", flush=True)
+        workdir = tempfile.mkdtemp(prefix=f"{task['id']}_", dir=scratch_root)
+        logpath = os.path.join(workdir, "_agent.log")
+        ts = time.time()
+        rc, timed_out = run_agent(model, workdir, agent_prompt(task), args.task_timeout, logpath)
+        gen_s = round(time.time() - ts, 2)
+
+        code = read_solution(workdir, sol)
+        if code is None:
+            stage = "timeout" if timed_out else "no_solution_file"
+            rec = {"id": task["id"], "language": task["language"],
+                   "difficulty": task.get("difficulty", "?"), "category": task.get("category", "?"),
+                   "num_checks": task["num_checks"], "passed_checks": 0, "pass_at_1": False,
+                   "stage": stage, "gen_s": gen_s, "completion_tokens": None, "tok_s": None, "code": ""}
+        else:
+            res = run_solution(task["language"], code, task["harness_template"], task.get("timeout_s", 15))
+            n = task["num_checks"]
+            passed = min(len(res["passed"]), n)
+            rec = {"id": task["id"], "language": task["language"],
+                   "difficulty": task.get("difficulty", "?"), "category": task.get("category", "?"),
+                   "num_checks": n, "passed_checks": passed,
+                   "pass_at_1": passed == n and not res["failed"],
+                   "stage": ("timeout_partial" if timed_out else res["stage"]),
+                   "gen_s": gen_s, "completion_tokens": None, "tok_s": None, "code": code}
+        records.append(rec)
+        print(f"{rec['passed_checks']}/{rec['num_checks']}  {gen_s}s ({rec['stage']})")
+        if not args.keep_workdirs:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    summ = R.aggregate(records)
+    R.print_summary(label, summ, records, skipped)
+
+    out = args.out or os.path.join(HERE, "results", re.sub(r"[^\w.-]", "_", label) + ".json")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        json.dump({"model": label, "mode": "opencode-agent", "agent_model": model,
+                   "elapsed_s": round(time.time() - t0, 1),
+                   "params": {"task_timeout_s": args.task_timeout},
+                   "summary": summ, "tasks": records}, f, indent=2)
+    print(f"\n>> wrote {out}")
+
+
+if __name__ == "__main__":
+    main()
