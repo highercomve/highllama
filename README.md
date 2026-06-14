@@ -52,6 +52,7 @@ highllama pull unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_XL   # direct
 highllama -m unsloth/gpt-oss-20b-GGUF:Q8_0   # any HF repo:quant (cached)
 highllama -m qwen3-coder -c 128k             # fuzzy-match a local GGUF
 highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec decoding
+highllama -m <mtp-model> --mtp 2             # multi-token prediction (self-draft)
 highllama --backend mlx -m mlx-community/Qwen3-8B-4bit      # MLX on macOS
 highllama ls                                 # list local models (picker view)
 highllama list | stop | status | logs        # full paths | kill | status | view logs
@@ -74,13 +75,22 @@ highllama update                             # git pull llama.cpp + rebuild for 
   (LM Studio dirs + HF/llama.cpp caches + Unsloth Studio cache/exports) →
   HF download. Never re-downloads what you already have.
 - **Smart offload:** free VRAM is measured (`nvidia-smi` / `rocm-smi`), then
-  `gguf-estimate.py` sizes `--n-cpu-moe` so weights + KV cache + compute
-  buffers fit. On OOM the launcher retries with more CPU offload automatically.
-  Unified-memory backends (Metal) skip offload and use mmap.
+  `gguf-estimate.py` sizes the offload so weights + KV cache + compute buffers
+  fit. MoE models peel experts to the CPU (`--n-cpu-moe`); **dense models**
+  (Gemma, Llama, etc.) keep whole layers on the GPU (`-ngl`) instead, since
+  they have no experts to offload. On OOM the launcher retries with more CPU
+  offload automatically. Unified-memory backends (Metal) skip offload and use mmap.
+- **MTP (multi-token prediction):** `--mtp <n>` (or `MTP=<n>`) turns on
+  self-speculative decoding using the model's own MTP head baked into the GGUF —
+  no second draft model, <10% extra VRAM, ~1.5-2× faster generation. Needs a
+  recent `llama.cpp` (`highllama update`) and an MTP-converted GGUF (e.g. Unsloth
+  `*-MTP-*` repos). Maps to `--spec-type draft-mtp --spec-draft-n-max <n>
+  --spec-draft-p-min 0.75`; forces a single slot (`PARALLEL=1`) and is mutually
+  exclusive with `--draft`.
 - **Defaults:** 64k context, q4_0 KV cache, flash attention, threads = physical
   cores (never SMT — it collapses generation speed).
 - Everything is a flag or env var: `MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT
-  HOST PORT BACKEND`; extra args after `--` go straight to `llama-server`.
+  MTP HOST PORT BACKEND`; extra args after `--` go straight to `llama-server`.
 
 ## localagent
 

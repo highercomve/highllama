@@ -33,13 +33,14 @@
 #   highllama -m <model> -c 128k --ncmoe 44     # 128k + manual offload
 #   highllama --backend mlx -m mlx-community/Qwen3-8B-4bit
 #   highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
+#   highllama -m <mtp-model> --mtp 2             # multi-token prediction (self-draft)
 #   highllama -m <model> --daemon                # background; logs -> journal
 #   highllama logs                              # stream daemon journal logs
 #   highllama --no-embeddings                    # remove the embeddings from the server
 #                                                # model (CLS pooling, /v1/embeddings)
 #
 # Everything is overridable by flag OR env var (flag wins):
-#   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT HOST PORT BACKEND
+#   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP HOST PORT BACKEND
 #
 set -euo pipefail
 
@@ -60,6 +61,9 @@ THREADS="${THREADS:-}"    # empty = physical cores. NEVER SMT count (gen collaps
 KVTYPE="${KVTYPE:-q4_0}"  # KV cache quant: q4_0 (lean) | q8_0 (higher quality) | f16
 PARALLEL="${PARALLEL:-1}" # server slots. 1 = single-user (least VRAM). >1 multiplies buffers
 DRAFT="${DRAFT:-}"        # optional draft model (HF tag or path) for speculative decoding
+MTP="${MTP:-}"            # multi-token prediction: n self-drafted tokens (e.g. 2-3); empty=off.
+                          # Uses the model's own MTP head baked into the GGUF (no draft model);
+                          # needs a recent llama.cpp + an MTP-converted GGUF; forces PARALLEL=1.
 HOST="${HOST:-0.0.0.0}"   # 0.0.0.0 = reachable from other machines on the LAN
 PORT="${PORT:-8089}"      # 8080 is a very common conflict; auto-advances if busy
 BACKEND="${BACKEND:-}"    # empty = autodetect (see detect_backend)
@@ -638,6 +642,16 @@ while [ $# -gt 0 ]; do
         DRAFT="$2"
         shift 2
         ;;
+    --mtp)
+        # optional count: `--mtp 3` drafts 3 tokens; bare `--mtp` defaults to 2
+        if [ -n "${2:-}" ] && [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+            MTP="$2"
+            shift 2
+        else
+            MTP=2
+            shift
+        fi
+        ;;
     --host)
         HOST="$2"
         shift 2
@@ -760,7 +774,7 @@ if [ -n "$DAEMON" ]; then
     fi
     echo ">> starting in background (logs -> journal, tag 'highllama')"
     setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
-        KVTYPE="$KVTYPE" DRAFT="$DRAFT" HOST="$HOST" PORT="$PORT" \
+        KVTYPE="$KVTYPE" DRAFT="$DRAFT" MTP="$MTP" HOST="$HOST" PORT="$PORT" \
         BACKEND="$BACKEND" PARALLEL="$PARALLEL" \
         systemd-cat -t highllama "$SCRIPT_PATH" ${EXTRA[@]+-- "${EXTRA[@]}"} \
         </dev/null >/dev/null 2>&1 &
@@ -833,8 +847,29 @@ case "${MODEL_ARGS[0]}" in
 esac
 
 # ---- optional speculative decoding ---------------------------------------
+# Two mutually exclusive flavors:
+#   --draft <model>  external draft model (any small GGUF predicts for the big one)
+#   --mtp <n>        self-speculation via the model's own multi-token-prediction
+#                    head baked into the GGUF — no second model, <10% extra VRAM.
 SPEC_ARGS=()
-if [ -n "$DRAFT" ]; then
+if [ -n "$DRAFT" ] && [ -n "$MTP" ]; then
+    echo "!! --draft and --mtp are both speculative decoding — pick one" >&2
+    exit 1
+fi
+if [ -n "$MTP" ]; then
+    # MTP support landed upstream in mid-2026; run `highllama update` if the
+    # server rejects --spec-type. The GGUF must carry MTP tensors (Unsloth/others
+    # publish "...-MTP-..." repos, or convert with a recent convert_hf_to_gguf.py).
+    if [ "$PARALLEL" != "1" ]; then
+        echo ">> MTP currently supports a single slot — forcing PARALLEL=1 (was $PARALLEL)"
+        PARALLEL=1
+    fi
+    if [ -n "$ALLMODELS" ]; then
+        echo ">> MTP: disabling the embeddings/router add-on (incompatible with single-slot self-draft)"
+        ALLMODELS=""
+    fi
+    SPEC_ARGS=(--spec-type draft-mtp --spec-draft-n-max "$MTP" --spec-draft-p-min 0.75)
+elif [ -n "$DRAFT" ]; then
     if [ -f "$DRAFT" ]; then SPEC_ARGS=(-md "$DRAFT"); else SPEC_ARGS=(--hf-repo-draft "$DRAFT"); fi
     SPEC_ARGS+=(-ngld 99 --spec-draft-n-max 16 --spec-draft-n-min 0)
 fi
@@ -858,7 +893,13 @@ f16 | bf16) KVBITS=16 ;;
 *) KVBITS=16 ;;
 esac
 
-NCMOE_CAP=64 # upper bound for auto-retry; refined to layer count if known
+# OFFLOAD_MODE picks which knob the launcher + OOM auto-retry turn:
+#   moe   -> --n-cpu-moe (peel experts to CPU); -ngl stays 99
+#   dense -> -ngl        (keep N whole layers on the GPU, rest on CPU)
+OFFLOAD_MODE="moe"
+NGL=99           # dense path lowers this on OOM; 99 = all layers on GPU
+TOTAL_LAYERS=0   # known layer count (for the dense retry floor)
+NCMOE_CAP=64     # upper bound for moe auto-retry; refined to layer count if known
 if [ -z "$NCMOE" ]; then
     case "$BACKEND" in
     metal | cpu)
@@ -872,10 +913,19 @@ if [ -z "$NCMOE" ]; then
             est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
         fi
         if [ -n "$est" ]; then
-            NCMOE="${est%% *}" # "<ncmoe> <layers>"
-            NCMOE_CAP="${est##* }"
-            echo ">> estimated n-cpu-moe=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
-        else # fallback: context buckets
+            OFFLOAD_MODE="${est%% *}"           # "<mode> <offload> <layers>"
+            rest="${est#* }"
+            TOTAL_LAYERS="${rest##* }"
+            if [ "$OFFLOAD_MODE" = "dense" ]; then
+                NGL="${rest%% *}"
+                NCMOE=0
+                echo ">> dense model: estimated -ngl=$NGL (of $TOTAL_LAYERS layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
+            else
+                NCMOE="${rest%% *}"
+                NCMOE_CAP="$TOTAL_LAYERS"
+                echo ">> estimated n-cpu-moe=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
+            fi
+        else # fallback: context buckets (assume MoE; dense just no-ops --n-cpu-moe)
             if [ "$CONTEXT" -le 16384 ]; then
                 NCMOE=28
             elif [ "$CONTEXT" -le 65536 ]; then
@@ -899,7 +949,7 @@ MMAP_ARGS=(--no-mmap)
 # fi
 
 echo ">> model=$MODEL"
-echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  draft=${DRAFT:-none}"
+echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  draft=${DRAFT:-none}  mtp=${MTP:-off}"
 echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
 cd "$LLAMA_DIR"
 
@@ -931,12 +981,18 @@ OOM_RE='out of memory|failed to allocate|failed to create context|cudaMalloc fai
 STEP=3
 while :; do
     : >"$LOG"
-    echo ">> launching with n-cpu-moe=$NCMOE ..."
+    # dense models offload whole layers (-ngl); MoE peels experts off (--n-cpu-moe)
+    if [ "$OFFLOAD_MODE" = "dense" ]; then
+        OFFLOAD_ARGS=(-ngl "$NGL")
+        echo ">> launching with n-gpu-layers=$NGL ..."
+    else
+        OFFLOAD_ARGS=(-ngl 99 --n-cpu-moe "$NCMOE")
+        echo ">> launching with n-cpu-moe=$NCMOE ..."
+    fi
     "$LLAMA_BIN" \
         "${MODEL_ARGS[@]}" \
         --alias "$ALIAS" \
-        -ngl 99 \
-        --n-cpu-moe "$NCMOE" \
+        "${OFFLOAD_ARGS[@]}" \
         -t "$THREADS" \
         -fa 1 \
         -ctk "$KVTYPE" -ctv "$KVTYPE" \
@@ -981,10 +1037,21 @@ while :; do
         tail -n 15 "$LOG" >&2
         exit 1
     fi
-    NCMOE=$((NCMOE + STEP))
-    if [ "$NCMOE" -gt "$NCMOE_CAP" ]; then
-        echo "!! still OOM at max offload (n-cpu-moe=$NCMOE_CAP). Try smaller -c (context) or a smaller model." >&2
-        exit 1
+    if [ "$OFFLOAD_MODE" = "dense" ]; then
+        # dense: keep fewer whole layers on the GPU each retry
+        if [ "$NGL" -le 0 ]; then
+            echo "!! still OOM with all layers on the CPU (-ngl 0). Try smaller -c (context) or a smaller model." >&2
+            exit 1
+        fi
+        NGL=$((NGL - STEP))
+        [ "$NGL" -lt 0 ] && NGL=0
+        echo ">> OOM — retrying with fewer GPU layers (n-gpu-layers=$NGL)"
+    else
+        NCMOE=$((NCMOE + STEP))
+        if [ "$NCMOE" -gt "$NCMOE_CAP" ]; then
+            echo "!! still OOM at max offload (n-cpu-moe=$NCMOE_CAP). Try smaller -c (context) or a smaller model." >&2
+            exit 1
+        fi
+        echo ">> OOM — retrying with more CPU offload (n-cpu-moe=$NCMOE)"
     fi
-    echo ">> OOM — retrying with more CPU offload (n-cpu-moe=$NCMOE)"
 done

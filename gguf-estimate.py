@@ -7,7 +7,11 @@ instant even on 20GB files). SWA-aware KV sizing so sliding-window models
 (e.g. Gemma) aren't massively over-offloaded.
 
 Usage:  gguf-estimate.py <model.gguf> <free_mib> <ctx_tokens> <parallel> <kv_bits>
-Prints: "<ncmoe> <block_count>"   (ncmoe = MoE layers to put on CPU; 0 = full GPU)
+Prints: "<mode> <offload> <block_count>"
+          mode=moe   -> offload = MoE layers to put on CPU (--n-cpu-moe); 0 = full GPU
+          mode=dense -> offload = layers to keep on the GPU (-ngl); == block_count = full GPU
+        Dense models have no experts to peel off, so they offload whole layers
+        with -ngl instead of --n-cpu-moe.
 On any failure prints nothing and exits non-zero (caller falls back to buckets).
 """
 
@@ -135,15 +139,23 @@ def main():
     reserve = kv_mib + overhead + 350  # + small safety
     gpu_budget = free_mib - reserve
 
-    if gpu_budget >= weights_mib:
-        print(f"0 {L}")
-        return
-
-    expert_frac = 0.90  # experts dominate MoE weight
-    per_layer = expert_frac * weights_mib / L
-    need = weights_mib - gpu_budget
-    ncmoe = max(0, min(L, math.ceil(need / per_layer)))
-    print(f"{ncmoe} {L}")
+    experts = int(md.get("expert_count", 0) or 0)
+    if experts > 1:  # MoE: peel experts off to CPU with --n-cpu-moe
+        if gpu_budget >= weights_mib:
+            print(f"moe 0 {L}")
+            return
+        expert_frac = 0.90  # experts dominate MoE weight
+        per_layer = expert_frac * weights_mib / L
+        need = weights_mib - gpu_budget
+        ncmoe = max(0, min(L, math.ceil(need / per_layer)))
+        print(f"moe {ncmoe} {L}")
+    else:  # dense (e.g. Gemma, Llama): offload whole layers with -ngl instead
+        if gpu_budget >= weights_mib:
+            print(f"dense {L} {L}")
+            return
+        per_layer = weights_mib / L  # weights spread ~evenly across the blocks
+        ngl = max(0, min(L, int(gpu_budget / per_layer)))
+        print(f"dense {ngl} {L}")
 
 
 if __name__ == "__main__":
