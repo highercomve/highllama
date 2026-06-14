@@ -2,3 +2,15 @@ llama.cpp/
 __pycache__/
 *.log
 .claude/settings.local.json
+
+# code benchmark: keep the PRIVATE problems + results out of git so they don't
+# leak into public training data (that is the point of a private benchmark).
+# The framework (runners.py, run_code_benchmark.py, score_compare.py, README,
+# selftest.py) IS tracked; the task content and run artifacts are not.
+code_benchmark/build_tasks.py
+code_benchmark/tasks/
+code_benchmark/results/
+code_benchmark/.scratch/
+code_benchmark/.scratch-agent/
+# provider config holds API keys — never commit it (providers.example.json is the template)
+code_benchmark/providers.json
