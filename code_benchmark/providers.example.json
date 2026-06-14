@@ -1,0 +1,32 @@
+{
+	"_comment": "Copy this file to providers.json (gitignored) and fill in api_key values. Each top-level key is a provider NAME you select at runtime with --provider <name> --model <id>. 'protocol' is the default wire format (openai|anthropic); 'models' optionally overrides the protocol per model id (needed for OpenCode Go, which serves some models as openai and others as anthropic). --opencode-go <id> is sugar for --provider opencode-go --model <id>.",
+
+	"opencode-go": {
+		"base": "https://opencode.ai/zen/go",
+		"api_key": "",
+		"protocol": "openai",
+		"models": {
+			"glm-5.1": "openai",
+			"glm-5": "openai",
+			"kimi-k2.7": "openai",
+			"kimi-k2.70-code": "openai",
+			"kimi-k2.6": "openai",
+			"deepseek-v4-pro": "openai",
+			"deepseek-v4-flash": "openai",
+			"mimo-v2.5": "openai",
+			"mimo-v2.5-pro": "openai",
+			"minimax-m3": "anthropic",
+			"minimax-m2.7": "anthropic",
+			"minimax-m2.5": "anthropic",
+			"qwen3.7-max": "anthropic",
+			"qwen3.7-plus": "anthropic",
+			"qwen3.6-plus": "anthropic"
+		}
+	},
+
+	"local": {
+		"base": "http://localhost:8089",
+		"api_key": "",
+		"protocol": "openai"
+	}
+}
