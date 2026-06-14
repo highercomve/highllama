@@ -1088,7 +1088,10 @@ if [ -n "$USE_ROUTER" ]; then
         printf '\n[%s]\n' "$EMBED_ALIAS"
         printf 'model = %s\n' "$EMBED_HIT"
         printf 'embeddings = true\n'
-        printf 'pooling = %s\n' "${EMBED_POOLING:-cls}"
+        # Use the model's GGUF-native pooling by default — forcing cls on a
+        # mean-trained model (e.g. embeddinggemma) yields near-degenerate vectors
+        # that don't discriminate. Override only via EMBED_POOLING=.
+        [ -n "${EMBED_POOLING:-}" ] && printf 'pooling = %s\n' "$EMBED_POOLING"
         printf 'ctx-size = %s\n' "${EMBED_CTX:-2048}"
         printf 'load-on-startup = true\n'
     } >"$INI"
