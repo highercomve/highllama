@@ -33,13 +33,15 @@
 #   highllama -m <model> -c 128k --ncmoe 44     # 128k + manual offload
 #   highllama --backend mlx -m mlx-community/Qwen3-8B-4bit
 #   highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
+#   highllama -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL --mtp       # multi-token prediction
+#   highllama -m <model> --chat-template ./my.jinja              # override broken GGUF template
 #   highllama -m <model> --daemon                # background; logs -> journal
 #   highllama logs                              # stream daemon journal logs
 #   highllama --no-embeddings                    # remove the embeddings from the server
 #                                                # model (CLS pooling, /v1/embeddings)
 #
 # Everything is overridable by flag OR env var (flag wins):
-#   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT HOST PORT BACKEND
+#   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP MTP_NMAX TEMPLATE HOST PORT BACKEND
 #
 set -euo pipefail
 
@@ -60,6 +62,9 @@ THREADS="${THREADS:-}"    # empty = physical cores. NEVER SMT count (gen collaps
 KVTYPE="${KVTYPE:-q4_0}"  # KV cache quant: q4_0 (lean) | q8_0 (higher quality) | f16
 PARALLEL="${PARALLEL:-1}" # server slots. 1 = single-user (least VRAM). >1 multiplies buffers
 DRAFT="${DRAFT:-}"        # optional draft model (HF tag or path) for speculative decoding
+MTP="${MTP:-}"            # --mtp: multi-token prediction (draft-mtp speculative decoding)
+MTP_NMAX="${MTP_NMAX:-2}" # MTP tokens drafted per step (unsloth recommends 2; try 1-6)
+TEMPLATE="${TEMPLATE:-}"  # --chat-template: override the GGUF's Jinja chat template (file path)
 HOST="${HOST:-0.0.0.0}"   # 0.0.0.0 = reachable from other machines on the LAN
 PORT="${PORT:-8089}"      # 8080 is a very common conflict; auto-advances if busy
 BACKEND="${BACKEND:-}"    # empty = autodetect (see detect_backend)
@@ -638,6 +643,18 @@ while [ $# -gt 0 ]; do
         DRAFT="$2"
         shift 2
         ;;
+    --mtp)
+        MTP=1
+        shift
+        ;;
+    --mtp-nmax)
+        MTP_NMAX="$2"
+        shift 2
+        ;;
+    --chat-template | --template)
+        TEMPLATE="$2"
+        shift 2
+        ;;
     --host)
         HOST="$2"
         shift 2
@@ -760,7 +777,9 @@ if [ -n "$DAEMON" ]; then
     fi
     echo ">> starting in background (logs -> journal, tag 'highllama')"
     setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
-        KVTYPE="$KVTYPE" DRAFT="$DRAFT" HOST="$HOST" PORT="$PORT" \
+        KVTYPE="$KVTYPE" DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
+        TEMPLATE="$TEMPLATE" IGNORE_TEMPLATE="${IGNORE_TEMPLATE:-}" \
+        HOST="$HOST" PORT="$PORT" \
         BACKEND="$BACKEND" PARALLEL="$PARALLEL" \
         systemd-cat -t highllama "$SCRIPT_PATH" ${EXTRA[@]+-- "${EXTRA[@]}"} \
         </dev/null >/dev/null 2>&1 &
@@ -833,8 +852,34 @@ case "${MODEL_ARGS[0]}" in
 esac
 
 # ---- optional speculative decoding ---------------------------------------
+# --mtp (multi-token prediction) and --draft both configure a draft model, so
+# they are mutually exclusive. MTP runs the draft head against the target model
+# via llama.cpp's draft-mtp speculative type.
 SPEC_ARGS=()
-if [ -n "$DRAFT" ]; then
+if [ -n "$MTP" ]; then
+    if [ -n "$DRAFT" ]; then
+        echo "!! --mtp and --draft are mutually exclusive (both set up the draft model)" >&2
+        exit 1
+    fi
+    SPEC_ARGS=(--spec-type draft-mtp --spec-draft-n-max "$MTP_NMAX" -ngld 99)
+    if [ "${MODEL_ARGS[0]}" = "-m" ]; then
+        # Local file: llama.cpp only auto-discovers the bundled "mtp-" sibling on
+        # the -hf path, so locate it ourselves and pass it explicitly with -md.
+        mtp_dir="$(dirname "${MODEL_ARGS[1]}")"
+        mtp_sib="$(command find -L "$mtp_dir" -maxdepth 1 -type f -iname '*mtp*.gguf' 2>/dev/null |
+            command grep -vF "${MODEL_ARGS[1]}" | sort | head -1 || true)"
+        if [ -z "$mtp_sib" ]; then
+            echo "!! --mtp: no 'mtp-*.gguf' draft head found next to ${MODEL_ARGS[1]}" >&2
+            echo "!!        put the MTP GGUF (e.g. mtp-<model>.gguf) in the same folder, or" >&2
+            echo "!!        use -hf <repo> so llama.cpp auto-fetches the bundled MTP head." >&2
+            exit 1
+        fi
+        SPEC_ARGS+=(-md "$mtp_sib")
+        echo ">> MTP draft (local sibling): $mtp_sib"
+    else
+        echo ">> MTP: using the bundled 'mtp-' head auto-detected from the -hf repo"
+    fi
+elif [ -n "$DRAFT" ]; then
     if [ -f "$DRAFT" ]; then SPEC_ARGS=(-md "$DRAFT"); else SPEC_ARGS=(--hf-repo-draft "$DRAFT"); fi
     SPEC_ARGS+=(-ngld 99 --spec-draft-n-max 16 --spec-draft-n-min 0)
 fi
@@ -867,6 +912,12 @@ if [ -z "$NCMOE" ]; then
         ;;
     *)
         FREE_MIB="$(free_vram_mib "$BACKEND")"
+        # MTP keeps an extra draft context resident (~2 GB); shave it off the
+        # free-VRAM figure so the offload estimate leaves headroom instead of
+        # OOM-ing straight into the retry loop.
+        if [ -n "$MTP" ] && [ -n "${FREE_MIB:-}" ]; then
+            FREE_MIB=$((FREE_MIB > 2048 ? FREE_MIB - 2048 : 0))
+        fi
         est=""
         if [ "${MODEL_ARGS[0]}" = "-m" ] && [ -n "${FREE_MIB:-}" ] && command -v python3 >/dev/null 2>&1; then
             est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
@@ -894,14 +945,48 @@ fi
 MMAP_ARGS=(--no-mmap)
 [ "$BACKEND" = "metal" ] && MMAP_ARGS=()
 
-# if [ -z "${IGNORE_TEMPLATE:-}" ] && [ -f "$SCRIPT_DIR/fixed.jinja" ]; then
-#     EXTRA+=(--chat-template-file "$SCRIPT_DIR/fixed.jinja")
-# fi
+# ---- chat template override --------------------------------------------------
+# Some GGUFs ship a Jinja chat template that llama.cpp's minja engine can't
+# render. Gemma 4's tool-use template uses `map('upper')` (a filter-mapping minja
+# doesn't implement), so any request carrying tools 500s with
+# "NotImplemented: map: filter-mapping" — which breaks agent clients like
+# opencode. Allow an explicit override (--chat-template / TEMPLATE=), and
+# auto-apply a bundled fix for known-broken families unless IGNORE_TEMPLATE=1.
+TEMPLATE_ARGS=()
+if [ -n "$TEMPLATE" ]; then
+    if [ ! -f "$TEMPLATE" ]; then
+        echo "!! --chat-template file not found: $TEMPLATE" >&2
+        exit 1
+    fi
+    TEMPLATE_ARGS=(--chat-template-file "$TEMPLATE")
+    echo ">> chat template: $TEMPLATE"
+elif [ -z "${IGNORE_TEMPLATE:-}" ]; then
+    alias_lc="$(printf '%s' "$ALIAS" | tr '[:upper:]' '[:lower:]')"
+    case "$alias_lc" in
+    *gemma-4* | *gemma4*)
+        if [ -f "$SCRIPT_DIR/templates/gemma-4-fixed.jinja" ]; then
+            TEMPLATE_ARGS=(--chat-template-file "$SCRIPT_DIR/templates/gemma-4-fixed.jinja")
+            echo ">> chat template: auto-applied Gemma-4 minja fix (IGNORE_TEMPLATE=1 to disable, --chat-template to override)"
+        fi
+        ;;
+    esac
+fi
 
+if [ -n "$MTP" ]; then MTP_DESC="draft-mtp n-max=$MTP_NMAX"; else MTP_DESC="none"; fi
 echo ">> model=$MODEL"
-echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  draft=${DRAFT:-none}"
+echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  draft=${DRAFT:-none}  mtp=$MTP_DESC"
 echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
 cd "$LLAMA_DIR"
+
+# Speculative decoding (MTP or an explicit draft model) needs a generative
+# context; the embeddings/pooling mode (--embeddings --pooling cls) forces a
+# pooled-embedding output and makes the draft graph abort
+# (GGML_ASSERT "missing result_norm/result_embd tensor"). They are mutually
+# exclusive, so turn embeddings off automatically when either is active.
+if [ -n "$ALLMODELS" ] && { [ -n "$MTP" ] || [ -n "$DRAFT" ]; }; then
+    echo ">> note: disabling embeddings mode (incompatible with speculative/MTP decoding); use a separate server for /v1/embeddings"
+    ALLMODELS=""
+fi
 
 if [ -n "$ALLMODELS" ]; then
     ALLMODELS_EXTRA=(--models-dir "$MODELS_DIR" --models-max "$MODELS_MAX" --pooling cls --embeddings)
@@ -911,6 +996,14 @@ LLAMA_BIN="${LLAMA_BIN:-./build/bin/llama-server}"
 if [ ! -x "$LLAMA_BIN" ]; then
     echo "!! $LLAMA_BIN not found. Build llama.cpp for backend '$BACKEND' (see header: $0 -h)" >&2
     exit 1
+fi
+
+# Newer llama.cpp builds split the server into shared libs (libllama-server-impl.so,
+# libggml*.so, ...) next to the launcher, often without an $ORIGIN rpath — so the
+# loader can't find them. Put that dir on LD_LIBRARY_PATH (absolute, survives the cd).
+LLAMA_LIBDIR="$(cd "$(dirname "$LLAMA_BIN")" && pwd)"
+if ls "$LLAMA_LIBDIR"/*.so >/dev/null 2>&1; then
+    export LD_LIBRARY_PATH="$LLAMA_LIBDIR:${LD_LIBRARY_PATH:-}"
 fi
 
 # ---- launch with OOM auto-retry: bump expert-offload until it fits ----------
@@ -944,6 +1037,7 @@ while :; do
         --parallel "$PARALLEL" \
         ${MMAP_ARGS[@]+"${MMAP_ARGS[@]}"} \
         --jinja \
+        ${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"} \
         ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
         --host "$HOST" --port "$PORT" \
         ${ALLMODELS_EXTRA[@]+"${ALLMODELS_EXTRA[@]}"} \

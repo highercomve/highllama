@@ -52,6 +52,8 @@ highllama pull unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_XL   # direct
 highllama -m unsloth/gpt-oss-20b-GGUF:Q8_0   # any HF repo:quant (cached)
 highllama -m qwen3-coder -c 128k             # fuzzy-match a local GGUF
 highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec decoding
+highllama -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL --mtp       # multi-token prediction
+highllama -m <model> --chat-template ./fixed.jinja          # override a broken GGUF template
 highllama --backend mlx -m mlx-community/Qwen3-8B-4bit      # MLX on macOS
 highllama ls                                 # list local models (picker view)
 highllama list | stop | status | logs        # full paths | kill | status | view logs
@@ -79,8 +81,22 @@ highllama update                             # git pull llama.cpp + rebuild for 
   Unified-memory backends (Metal) skip offload and use mmap.
 - **Defaults:** 64k context, q4_0 KV cache, flash attention, threads = physical
   cores (never SMT — it collapses generation speed).
+- **MTP (multi-token prediction):** `--mtp` enables llama.cpp's `draft-mtp`
+  speculative decoding (~1.4–2.2× faster) for models that ship an MTP head
+  (e.g. Gemma 4). With `-hf <repo>` the bundled `mtp-` head is auto-fetched; with
+  a local file, drop the `mtp-*.gguf` next to the model and it's picked up. Tune
+  drafted tokens with `--mtp-nmax N` / `MTP_NMAX=` (default 2; try 1–6). MTP
+  reserves ~2 GB extra VRAM, which the offload estimate accounts for. Mutually
+  exclusive with `--draft`.
+- **Chat template fixes:** some GGUFs ship a Jinja template llama.cpp's minja
+  engine can't render — Gemma 4's tool-use template uses `map('upper')`, so any
+  request carrying tools 500s with `NotImplemented: map: filter-mapping`, which
+  breaks agent clients (opencode, etc.). highllama auto-applies a bundled fix
+  (`templates/gemma-4-fixed.jinja`) for Gemma 4; override any model's template
+  with `--chat-template <file>` / `TEMPLATE=`, or disable the auto-fix with
+  `IGNORE_TEMPLATE=1`.
 - Everything is a flag or env var: `MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT
-  HOST PORT BACKEND`; extra args after `--` go straight to `llama-server`.
+  MTP MTP_NMAX TEMPLATE HOST PORT BACKEND`; extra args after `--` go straight to `llama-server`.
 
 ## localagent
 
