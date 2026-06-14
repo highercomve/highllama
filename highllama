@@ -41,7 +41,12 @@
 #                                                # model (CLS pooling, /v1/embeddings)
 #
 # Everything is overridable by flag OR env var (flag wins):
-#   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP MTP_NMAX TEMPLATE HOST PORT BACKEND
+#   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+#
+# MTP + embeddings together: when --mtp/--draft is set AND embeddings are on,
+# highllama serves both via llama.cpp router mode (chat model + a small embedding
+# model as separate child processes behind one endpoint). The embedding model is
+# auto-discovered or set with EMBED_MODEL=; --no-embeddings opts out.
 #
 set -euo pipefail
 
@@ -74,6 +79,7 @@ ALLMODELS=1
 ALLMODELS_EXTRA=()
 MODELS_DIR="${MODELS_DIR:-$HOME/.lmstudio/models}" # router-mode model root (one-level subdirs)
 MODELS_MAX="${MODELS_MAX:-2}"                      # router-mode: max models loaded c
+EMBED_MODEL="${EMBED_MODEL:-}"                     # embedding model (path/substring) for MTP+embeddings router; auto-discovered if empty
 
 # Where local GGUFs live: LM Studio models + llama.cpp/HF download caches
 # + Unsloth Studio (legacy HF cache, fine-tune exports/outputs; its main
@@ -176,6 +182,24 @@ resolve_local_gguf() {
     done | command grep -iv 'mmproj' | command grep -v '/blobs/' | command grep -i -- "$term" |
         while read -r f; do printf '%s\t%s\n' "$(file_size "$f")" "$f"; done |
         sort -rn | head -1 | cut -f2- || true
+}
+
+# resolve an embedding model for router mode: $EMBED_MODEL (exact path or local
+# substring match) if set, else auto-discover the smallest local embedding GGUF
+# (embeddinggemma / bge / nomic / gte / e5 / minilm / arctic-embed). Empty if none.
+resolve_embed_model() {
+    if [ -n "${EMBED_MODEL:-}" ]; then
+        if [ -f "$EMBED_MODEL" ]; then printf '%s\n' "$EMBED_MODEL"; else resolve_local_gguf "$EMBED_MODEL"; fi
+        return
+    fi
+    local d
+    for d in "${MODEL_ROOTS[@]}"; do
+        [ -d "$d" ] || continue
+        command find -L "$d" -type f -iname '*.gguf' 2>/dev/null
+    done | command grep -iv 'mmproj' | command grep -v '/blobs/' |
+        command grep -iE 'embed|bge|nomic|gte-|e5-|minilm|arctic-embed' |
+        while read -r f; do printf '%s\t%s\n' "$(file_size "$f")" "$f"; done |
+        sort -n | head -1 | cut -f2- || true # smallest first: embedding models are small
 }
 
 # all local model paths, one per line (for the interactive picker)
@@ -779,6 +803,7 @@ if [ -n "$DAEMON" ]; then
     setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
         KVTYPE="$KVTYPE" DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
         TEMPLATE="$TEMPLATE" IGNORE_TEMPLATE="${IGNORE_TEMPLATE:-}" \
+        EMBED_MODEL="$EMBED_MODEL" EMBED_POOLING="${EMBED_POOLING:-}" EMBED_CTX="${EMBED_CTX:-}" \
         HOST="$HOST" PORT="$PORT" \
         BACKEND="$BACKEND" PARALLEL="$PARALLEL" \
         systemd-cat -t highllama "$SCRIPT_PATH" ${EXTRA[@]+-- "${EXTRA[@]}"} \
@@ -856,6 +881,7 @@ esac
 # they are mutually exclusive. MTP runs the draft head against the target model
 # via llama.cpp's draft-mtp speculative type.
 SPEC_ARGS=()
+MTP_DRAFT="" # resolved local mtp- head path (also reused by router mode)
 if [ -n "$MTP" ]; then
     if [ -n "$DRAFT" ]; then
         echo "!! --mtp and --draft are mutually exclusive (both set up the draft model)" >&2
@@ -874,6 +900,7 @@ if [ -n "$MTP" ]; then
             echo "!!        use -hf <repo> so llama.cpp auto-fetches the bundled MTP head." >&2
             exit 1
         fi
+        MTP_DRAFT="$mtp_sib"
         SPEC_ARGS+=(-md "$mtp_sib")
         echo ">> MTP draft (local sibling): $mtp_sib"
     else
@@ -978,14 +1005,27 @@ echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  dra
 echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
 cd "$LLAMA_DIR"
 
-# Speculative decoding (MTP or an explicit draft model) needs a generative
-# context; the embeddings/pooling mode (--embeddings --pooling cls) forces a
-# pooled-embedding output and makes the draft graph abort
-# (GGML_ASSERT "missing result_norm/result_embd tensor"). They are mutually
-# exclusive, so turn embeddings off automatically when either is active.
+# Speculative decoding (MTP/draft) and embeddings need SEPARATE model contexts —
+# one causal+draft, one pooled — and cannot share a single in-process model
+# (GGML_ASSERT "missing result_norm/result_embd tensor"). When both are wanted,
+# switch to llama.cpp router mode: each model runs as its own child process with
+# its own params (MTP only on the chat model, embeddings only on the embedding
+# model), all behind one endpoint. Requires a local-file chat model and an
+# embedding model; otherwise fall back to MTP-only with embeddings off.
+USE_ROUTER=""
+EMBED_HIT=""
 if [ -n "$ALLMODELS" ] && { [ -n "$MTP" ] || [ -n "$DRAFT" ]; }; then
-    echo ">> note: disabling embeddings mode (incompatible with speculative/MTP decoding); use a separate server for /v1/embeddings"
-    ALLMODELS=""
+    if [ "${MODEL_ARGS[0]}" = "-m" ] && { [ -z "$DRAFT" ] || [ -f "$DRAFT" ]; }; then
+        EMBED_HIT="$(resolve_embed_model)"
+    fi
+    if [ -n "$EMBED_HIT" ]; then
+        USE_ROUTER=1
+        ALLMODELS="" # the router serves embeddings itself; skip single-process embeddings flags
+        echo ">> embeddings + speculative: router mode (chat=$ALIAS, embeddings=$(basename "$EMBED_HIT"))"
+    else
+        echo ">> note: no embedding model found (set EMBED_MODEL=) — disabling embeddings while speculative decoding is active"
+        ALLMODELS=""
+    fi
 fi
 
 if [ -n "$ALLMODELS" ]; then
@@ -1006,6 +1046,86 @@ if ls "$LLAMA_LIBDIR"/*.so >/dev/null 2>&1; then
     export LD_LIBRARY_PATH="$LLAMA_LIBDIR:${LD_LIBRARY_PATH:-}"
 fi
 
+# device OOM signatures across backends (CUDA / HIP / Vulkan / Metal)
+OOM_RE='out of memory|failed to allocate|failed to create context|cudaMalloc failed|hipMalloc failed|hipErrorOutOfMemory|VK_ERROR_OUT_OF_DEVICE_MEMORY|ErrorOutOfDeviceMemory|Insufficient Memory|kIOGPUCommandBufferCallbackErrorOutOfMemory'
+
+# ---- router mode: one endpoint, a child process per model -------------------
+# Generate a preset INI (chat model with MTP/draft + a small embedding model),
+# launch llama.cpp's router so each model loads as its own child with its own
+# params, then serve until stopped. No expert-offload auto-retry here: each child
+# manages its own VRAM, and n-cpu-moe was already sized for the chat model.
+if [ -n "$USE_ROUTER" ]; then
+    EMBED_ALIAS="$(basename "$EMBED_HIT")"
+    EMBED_ALIAS="${EMBED_ALIAS%.gguf}"
+    TPL_FILE=""
+    [ "${#TEMPLATE_ARGS[@]}" -ge 2 ] && TPL_FILE="${TEMPLATE_ARGS[1]}"
+    INI="$(mktemp "${TMPDIR:-/tmp}/highllama-presets.XXXXXX.ini")"
+    {
+        printf '[%s]\n' "$ALIAS"
+        printf 'model = %s\n' "${MODEL_ARGS[1]}"
+        printf 'n-gpu-layers = 99\n'
+        printf 'n-cpu-moe = %s\n' "$NCMOE"
+        printf 'threads = %s\n' "$THREADS"
+        printf 'flash-attn = on\n'
+        printf 'cache-type-k = %s\n' "$KVTYPE"
+        printf 'cache-type-v = %s\n' "$KVTYPE"
+        printf 'ctx-size = %s\n' "$CONTEXT"
+        printf 'parallel = %s\n' "$PARALLEL"
+        [ "$BACKEND" != "metal" ] && printf 'no-mmap = true\n'
+        printf 'jinja = true\n'
+        [ -n "$TPL_FILE" ] && printf 'chat-template-file = %s\n' "$TPL_FILE"
+        if [ -n "$MTP" ]; then
+            printf 'spec-type = draft-mtp\n'
+            printf 'model-draft = %s\n' "$MTP_DRAFT"
+            printf 'spec-draft-n-max = %s\n' "$MTP_NMAX"
+            printf 'n-gpu-layers-draft = 99\n'
+        elif [ -n "$DRAFT" ]; then
+            printf 'model-draft = %s\n' "$DRAFT"
+            printf 'spec-draft-n-max = 16\n'
+            printf 'n-gpu-layers-draft = 99\n'
+        fi
+        printf 'load-on-startup = true\n'
+        printf '\n[%s]\n' "$EMBED_ALIAS"
+        printf 'model = %s\n' "$EMBED_HIT"
+        printf 'embeddings = true\n'
+        printf 'pooling = %s\n' "${EMBED_POOLING:-cls}"
+        printf 'ctx-size = %s\n' "${EMBED_CTX:-2048}"
+        printf 'load-on-startup = true\n'
+    } >"$INI"
+    echo ">> router preset ($INI):"
+    sed 's/^/     /' "$INI"
+    echo ">> launching router (models-max=$MODELS_MAX) on http://${HOST}:${PORT}/v1 ..."
+    RLOG="$(mktemp "${TMPDIR:-/tmp}/highllama-router.XXXXXX")"
+    RSRV=""
+    RTAIL=""
+    cleanup_router() {
+        [ -n "$RTAIL" ] && kill "$RTAIL" 2>/dev/null
+        [ -n "$RSRV" ] && kill "$RSRV" 2>/dev/null
+        rm -f "$RLOG" "$INI"
+    }
+    trap cleanup_router EXIT
+    trap 'exit 130' INT TERM
+    "$LLAMA_BIN" --models-preset "$INI" --models-max "$MODELS_MAX" \
+        --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"} >"$RLOG" 2>&1 &
+    RSRV=$!
+    tail -f -n +1 "$RLOG" & # stream router + child logs live
+    RTAIL=$!
+    # ready when both children report in, or bail on OOM / a bad preset key
+    while kill -0 "$RSRV" 2>/dev/null; do
+        if [ "$(command grep -c 'cmd_child_to_router:ready' "$RLOG" 2>/dev/null || echo 0)" -ge 2 ]; then
+            echo ">> router ready: chat + embeddings models loaded"
+            break
+        fi
+        if command grep -qiE "$OOM_RE|not recognized in preset|GGML_ASSERT" "$RLOG"; then
+            echo "!! router failed to start (see log above)" >&2
+            exit 1
+        fi
+        sleep 0.5
+    done
+    wait "$RSRV"
+    exit $?
+fi
+
 # ---- launch with OOM auto-retry: bump expert-offload until it fits ----------
 LOG="$(mktemp "${TMPDIR:-/tmp}/highllama.XXXXXX")"
 SRV=""
@@ -1017,9 +1137,6 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-
-# device OOM signatures across backends (CUDA / HIP / Vulkan / Metal)
-OOM_RE='out of memory|failed to allocate|failed to create context|cudaMalloc failed|hipMalloc failed|hipErrorOutOfMemory|VK_ERROR_OUT_OF_DEVICE_MEMORY|ErrorOutOfDeviceMemory|Insufficient Memory|kIOGPUCommandBufferCallbackErrorOutOfMemory'
 
 STEP=3
 while :; do

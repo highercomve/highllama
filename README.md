@@ -88,6 +88,14 @@ highllama update                             # git pull llama.cpp + rebuild for 
   drafted tokens with `--mtp-nmax N` / `MTP_NMAX=` (default 2; try 1–6). MTP
   reserves ~2 GB extra VRAM, which the offload estimate accounts for. Mutually
   exclusive with `--draft`.
+- **MTP + embeddings at once:** speculative decoding (causal) and embeddings
+  (pooled) can't share one model context, so when `--mtp`/`--draft` is active and
+  embeddings are on, highllama switches to llama.cpp **router mode** — the chat
+  model (with MTP) and a small embedding model run as separate child processes
+  behind one endpoint (`/v1/chat/completions` → chat, `/v1/embeddings` → embed).
+  The embedding model is auto-discovered (embeddinggemma / bge / nomic / e5 / …)
+  or set explicitly with `EMBED_MODEL=`; `--no-embeddings` opts out. Needs a
+  local-file chat model.
 - **Chat template fixes:** some GGUFs ship a Jinja template llama.cpp's minja
   engine can't render — Gemma 4's tool-use template uses `map('upper')`, so any
   request carrying tools 500s with `NotImplemented: map: filter-mapping`, which
@@ -96,7 +104,7 @@ highllama update                             # git pull llama.cpp + rebuild for 
   with `--chat-template <file>` / `TEMPLATE=`, or disable the auto-fix with
   `IGNORE_TEMPLATE=1`.
 - Everything is a flag or env var: `MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT
-  MTP MTP_NMAX TEMPLATE HOST PORT BACKEND`; extra args after `--` go straight to `llama-server`.
+  MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND`; extra args after `--` go straight to `llama-server`.
 
 ## localagent
 
