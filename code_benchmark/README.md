@@ -26,11 +26,12 @@ Languages covered (toolchain auto-detected; missing ones are skipped):
 | `build_tasks.py` | authoring source for the tasks (private; gitignored). Run it to emit `tasks/*.json`. |
 | `tasks/*.json` | generated task files the runner consumes (private; gitignored). |
 | `runners.py` | per-language compile/run sandbox + model-output code extraction. |
-| `run_code_benchmark.py` | the runner: hits the live server, scores the current model, writes `results/<model>.json`. |
-| `score_compare.py` | leaderboard across all `results/*.json`. |
+| `run_code_benchmark.py` | the runner: hits the live server, scores the current model, writes `results/YYYY-MM-DD/HH-MM-SS/<model>.json`. |
+| `score_compare.py` | leaderboard across all `results/**/*.json`. |
 | `selftest.py` | validates every harness against its private reference solution (no server needed). |
 | `run_all_models.sh` | optional: swaps the highllama model between runs (the only piece that touches the server). |
 | `run_opencode_go.sh` | optional: sweep several **OpenCode Go** frontier models (remote API — never touches the local server). |
+| `bench.sh` | optional: run single-shot + agentic benchmarks for one model in a single pass. |
 | `providers.example.json` | template for `providers.json` (gitignored) — endpoint base URLs, API keys, and per-model protocol. |
 
 ## Quick start
@@ -41,11 +42,11 @@ python3 build_tasks.py
 python3 selftest.py            # every harness must report ALL HARNESSES OK
 
 # 2. with a model already served by highllama on :8089, score it
-python3 run_code_benchmark.py  # -> results/<model>.json + a printed summary
+python3 run_code_benchmark.py  # -> results/YYYY-MM-DD/HH-MM-SS/<model>.json + a printed summary
 
 # 3. score more models, then compare
 #    (switch the served model yourself, re-run step 2, OR use the orchestrator)
-python3 score_compare.py       # leaderboard across results/
+python3 score_compare.py       # leaderboard across results/ (recursively, including dated subdirs)
 ```
 
 The runner is **server-agnostic**: it reads whatever model `/v1/models` reports
@@ -60,7 +61,7 @@ Tasks are tagged `easy` / `medium` / `hard` / `expert`. Run a subset with
 
 ```bash
 python3 run_code_benchmark.py --difficulty expert          # only the hardest
-python3 run_agentic_benchmark.py --opencode-go kimi-k2.7-code --difficulty hard,expert
+python3 run_agentic_benchmark.py --agent opencode --model kimi-k2.7-code --difficulty hard,expert
 ```
 
 The **expert** tier is aimed at the agentic runs: a write-run-fix loop can pass
@@ -143,41 +144,74 @@ you can still hit a one-off endpoint without editing the file.
 
 ## Agentic mode (same tasks, with tooling)
 
-`run_agentic_benchmark.py` runs the *same* private tasks through the **OpenCode
-agent** (`opencode run`) instead of a single completion, so the model can write
+`run_agentic_benchmark.py` runs the *same* private tasks through an agent with
+tools enabled instead of a single completion, so the model can write
 `solution.<ext>`, run it, read the error, and fix its code before finishing. The
 file it leaves behind is graded by the same hidden harness, so the result lands
 right next to the single-shot number in `score_compare.py`. Latency now includes
 the whole tool loop (expect minutes per task, not seconds).
 
-The model id must be a fully-qualified `provider/model` from `opencode models`.
-A bare name is auto-resolved against that list (so the local llama.cpp model
-works either way), and a wrong/ambiguous id fails loudly *before* a run starts:
+Pick the agent backend with `--agent {opencode,pi}` and pass a plain model name
+with `--model`. For `opencode`, bare model names are automatically prefixed with
+`opencode-go/`; if you need a different provider, pass the full
+`provider/model` id. For `pi`, the model name is passed straight through.
 
 ```bash
-opencode models                              # see provider/model ids
+# OpenCode Go frontier model (default agent)
+python3 run_agentic_benchmark.py --model kimi-k2.7-code
 
-# local highllama (exposed to opencode as the 'llamacpp' provider)
-python3 run_agentic_benchmark.py --model llamacpp/gemma-4-26B-A4B-it-QAT-Q4_0
-python3 run_agentic_benchmark.py --model gemma-4-26B-A4B-it-QAT-Q4_0     # auto-resolves
+# local highllama via opencode (exposed as the 'llamacpp' provider)
+python3 run_agentic_benchmark.py --agent opencode --model llamacpp/gemma-4-26B-A4B-it-QAT-Q4_0
 
-# OpenCode Go frontier model
-python3 run_agentic_benchmark.py --opencode-go kimi-k2.7-code
+# pi coding assistant
+python3 run_agentic_benchmark.py --agent pi --model gemma-4-26B-A4B-it-QAT-Q4_0
 
 python3 score_compare.py                     # single-shot vs agent, side by side
+python3 score_compare.py --serve --port 8080 # interactive HTML leaderboard
 ```
 
 Notes / gotchas:
-- **The id needs its provider prefix.** `gemma-4-26B-...` alone is not a valid
-  opencode model — it must be `llamacpp/gemma-4-26B-...`. The runner now resolves
-  bare names for you, but if you call `opencode run` by hand, use the full id.
-- Runs headless with `--dangerously-skip-permissions`, i.e. the model executes
-  commands it chooses inside a per-task `.scratch-agent/` dir. Only run models
-  you trust. `--keep-workdirs` preserves those dirs (incl. `_agent.log`) for
-  debugging; `--task-timeout` caps each task (default 300s).
+- `--agent` chooses the backend (`opencode` is the default). The model string is
+  always just a name; no `opencode models` lookup or provider selection is
+  required unless you want a non-default opencode provider.
+- The opencode backend runs headless with `--dangerously-skip-permissions`, i.e.
+  the model executes commands it chooses inside a per-task `.scratch-agent/`
+  dir. The pi backend is run with edit/write tools enabled in the same dir.
+  Only run models you trust.
+- `--keep-workdirs` preserves those dirs (incl. `_agent.log`) for debugging;
+  `--task-timeout` caps each task (default 300s).
 - Weak local models may have limited tool-calling and can underperform their
   single-shot score here (they fumble the edit/run loop). That gap *is* the
   signal — it's what agentic tooling does or doesn't buy you per model.
+
+## One-pass benchmark for a single model (`bench.sh`)
+
+`bench.sh` runs the single-shot code benchmark plus any agentic backends you
+want for a single model, then prints (and optionally serves) the leaderboard.
+It manages the local highllama server for you and picks the endpoint
+automatically: local models hit `http://localhost:8089`, and OpenCode Go
+models hit `https://opencode.ai/zen/go`. There is no `--base` flag for
+`bench.sh`; use `--remote opencode-go` or the `opencode-go/` model prefix.
+
+```bash
+# local model: single-shot + opencode + pi
+./code_benchmark/bench.sh --model gemma-4-26B-A4B-it-QAT-Q4_0 --agent opencode,pi
+
+# same, but only agentic with opencode
+./code_benchmark/bench.sh --model gemma-4-26B-A4B-it-QAT-Q4_0 --agent opencode
+
+# remote OpenCode Go model: single-shot + opencode agent
+# (the opencode-go/ prefix is auto-detected, so --remote is optional)
+./code_benchmark/bench.sh --model opencode-go/kimi-k2.7-code --agent opencode
+./code_benchmark/bench.sh --model kimi-k2.7-code --remote opencode-go --agent opencode
+
+# run only python/rust tasks and serve the HTML report when done
+./code_benchmark/bench.sh --model gemma-4-26B-A4B-it-QAT-Q4_0 --agent all \
+    --langs python,rust --tasks py_,rs_ --serve
+```
+
+Use `--agent all` as a shortcut for `--agent opencode,pi`. If `--agent` is
+omitted, only the single-shot benchmark runs.
 
 ## Useful flags (run_code_benchmark.py)
 
@@ -188,7 +222,7 @@ Notes / gotchas:
 --temperature 0.0         sampling temp (default 0 = deterministic, closest to pass@1)
 --max-tokens 8192         generation cap (reasoning models need headroom)
 --save-raw                also store the raw model output in the results json
---out results/foo.json    custom output path
+--out results/foo.json    custom output path (bypasses the dated default)
 --opencode-go <model-id>  sugar for --provider opencode-go --model <id>
 --provider <name>         named provider from providers.json
 --model <id>              model id (skip /v1/models autodetect; required for remote)
@@ -196,6 +230,44 @@ Notes / gotchas:
 --protocol openai|anthropic   wire protocol override
 --api-key <key>           bearer/x-api-key override (or $OPENCODE_API_KEY)
 --provider-config <path>  provider registry json (default providers.json)
+```
+
+## Useful flags (run_agentic_benchmark.py)
+
+```
+--agent {opencode,pi}     agent backend to drive (default: opencode)
+--model <name>            model name passed to the agent (e.g. kimi-k2.7-code)
+--langs python,rust       only these languages
+--difficulty hard,expert  only these difficulties
+--tasks py_,rs_           only tasks whose id starts with one of these prefixes
+--task-timeout 300        per-task wall-clock budget for the agent (seconds)
+--keep-workdirs           don't delete the agent scratch dirs (useful for debugging)
+--out results/foo.json    custom output path (bypasses the dated default)
+```
+
+## Useful flags (score_compare.py)
+
+```
+results/*.json ...        result files to compare (default: all results/**/*.json)
+--serve                   start a local web server with charts
+--port 8080               port for the web server (default 8080)
+```
+
+The web report loads Chart.js from a CDN, so it needs internet access on the
+machine that opens the page.
+
+## Useful flags (`bench.sh`)
+
+```
+--model <name>            model to benchmark (required). Prefix with
+                          opencode-go/ to auto-detect remote mode.
+--agent <list|all>        comma-separated agents: opencode, pi, or all
+--remote opencode-go      use OpenCode Go instead of the local server
+--ctx <size>              context size for the local server (default 32k)
+--langs <list>            language filter passed to runners
+--difficulty <list>       difficulty filter passed to runners
+--tasks <prefixes>        task-prefix filter passed to runners
+--serve                   launch score_compare.py --serve after benchmarking
 ```
 
 ## How scoring works
@@ -226,10 +298,10 @@ they remain contamination-resistant.
 
 ## Privacy
 
-`build_tasks.py`, `tasks/`, and `results/` are gitignored on purpose. If you
-publish this repo, the framework ships but your private problems do not. Keep
-the problems off the public internet to preserve their value as an uncontaminated
-benchmark.
+`build_tasks.py`, `tasks/`, and `results/` (including dated subdirectories) are
+gitignored on purpose. If you publish this repo, the framework ships but your
+private problems and run artifacts do not. Keep the problems off the public
+internet to preserve their value as an uncontaminated benchmark.
 
 ## Safety note
 
