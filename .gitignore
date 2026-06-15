@@ -14,3 +14,8 @@ code_benchmark/.scratch/
 code_benchmark/.scratch-agent/
 # provider config holds API keys — never commit it (providers.example.json is the template)
 code_benchmark/providers.json
+
+# speed benchmark: generated needle datasets and run results (organized per run)
+speed_benchmark/benchmark_data/
+speed_benchmark/results/
+speed_benchmark/.scratch/

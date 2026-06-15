@@ -1,9 +1,11 @@
 import os
 import requests
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 # Configuration
 TOKENIZE_URL = "http://localhost:8089/tokenize"
-OUTPUT_DIR = "benchmark_data"
+OUTPUT_DIR = os.path.join(HERE, "benchmark_data")
 NEEDLE = "\n[SYSTEM_NOTE: The unique verification key for this benchmark is 'KEY-256K-ALPHA'.]\n"
 
 # Target context sizes in tokens. Override with SIZES=512,2048,8192,... (env).
@@ -85,7 +87,7 @@ def build_text(target_tokens):
 
 def generate_dataset():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"Generating datasets in {OUTPUT_DIR}...")
+    print(f"Generating datasets in {OUTPUT_DIR} ...")
 
     for size in TARGET_SIZES:
         file_path = os.path.join(OUTPUT_DIR, f"needle_{size}_tokens.txt")

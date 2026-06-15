@@ -15,6 +15,7 @@ Usage:
     python run_benchmark.py --sizes 512,2048,8192,32768,65536 --gen 160 --repeats 3
 """
 import argparse
+import datetime
 import json
 import os
 import re
@@ -24,8 +25,9 @@ import time
 
 import requests
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BASE = "http://localhost:8089"
-DATA_DIR = "benchmark_data"
+DATA_DIR = os.path.join(HERE, "benchmark_data")
 NEEDLE_KEY = "key-256k-alpha"  # matched case-insensitively in the answer
 KEY_RE = re.compile(r"key-256k-alpha", re.IGNORECASE)
 QUESTION = "\n\nWhat was the unique verification key mentioned in the documentation? Answer with only the key."
@@ -111,14 +113,19 @@ def main():
     ap.add_argument("--base", default=DEFAULT_BASE)
     ap.add_argument("--model", default=None, help="model id (auto-detected if omitted)")
     ap.add_argument("--label", default="run", help="config label, e.g. mtp / nomtp")
-    ap.add_argument("--out", default=None, help="output json (default results_<label>.json)")
+    ap.add_argument("--out", default=None, help="output json (default results/YYYY-MM-DD/HH-MM-SS/results_<label>.json)")
     ap.add_argument("--sizes", default=None, help="comma-separated token sizes to sweep")
     ap.add_argument("--gen", type=int, default=160, help="tokens to generate per call")
     ap.add_argument("--repeats", type=int, default=3, help="runs per size (median reported)")
     args = ap.parse_args()
 
     sizes = [int(x) for x in args.sizes.split(",")] if args.sizes else None
-    out = args.out or f"results_{args.label}.json"
+    if args.out:
+        out = args.out
+    else:
+        now = datetime.datetime.now()
+        out = os.path.join(HERE, "results", now.strftime("%Y-%m-%d"),
+                           now.strftime("%H-%M-%S"), f"results_{args.label}.json")
     model = args.model or detect_model(args.base)
     cases = needle_prompts(sizes)
 
@@ -172,6 +179,7 @@ def main():
         "mtp_active": mtp_seen,
         "sizes": per_size,
     }
+    os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
         json.dump(result, f, indent=2)
     print(f">> wrote {out}  (mtp_active={mtp_seen})")

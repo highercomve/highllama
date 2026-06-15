@@ -15,6 +15,8 @@ the backend is autodetected.
 | `install.sh` | symlink `highllama` into `~/.local/bin` (`--systemd` adds a user service) |
 | `gguf-estimate.py` | reads a GGUF header and estimates `--n-cpu-moe` for the free VRAM + context (SWA-aware) |
 | `localagent/` | run headless `claude` sub-agents on the local llama-server, validated by Opus — see [its README](localagent/README.md) |
+| `code_benchmark/` | private code-quality benchmark for highllama models — see [its README](code_benchmark/README.md) |
+| `speed_benchmark/` | token-generation speed benchmark — see [its README](speed_benchmark/README.md) |
 | `llama.cpp/` | upstream clone + build (not tracked; `highllama build` / `update` creates/updates it) |
 
 ## Quick start
