@@ -22,6 +22,7 @@ Usage:
     python run_code_benchmark.py --out results/foo.json --save-raw
 """
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -322,7 +323,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--max-tokens", type=int, default=8192,
                     help="generation cap (reasoning models need headroom for thinking + code)")
-    ap.add_argument("--out", default="", help="results json (default results/<model>.json)")
+    ap.add_argument("--out", default="", help="results json (default results/YYYY-MM-DD/HH-MM-SS/<model>.json)")
     ap.add_argument("--save-raw", action="store_true", help="also keep raw model output")
     ap.add_argument("--provider-config", default=os.path.join(HERE, "providers.json"),
                     help="provider registry json (default providers.json)")
@@ -376,7 +377,12 @@ def main():
     summ = aggregate(records)
     print_summary(model, summ, records, skipped)
 
-    out = args.out or os.path.join(HERE, "results", re.sub(r"[^\w.-]", "_", model) + ".json")
+    if args.out:
+        out = args.out
+    else:
+        now = datetime.datetime.now()
+        out = os.path.join(HERE, "results", now.strftime("%Y-%m-%d"),
+                           now.strftime("%H-%M-%S"), re.sub(r"[^\w.-]", "_", model) + ".json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     blob = {
         "model": model,
