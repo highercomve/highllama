@@ -270,7 +270,7 @@ install_deps() {
         case "$backend" in
         cuda) $SUDO pacman -S --needed --noconfirm cuda ;;
         rocm) $SUDO pacman -S --needed --noconfirm rocm-hip-sdk rocminfo ;;
-        vulkan) $SUDO pacman -S --needed --noconfirm vulkan-headers vulkan-icd-loader vulkan-tools shaderc ;;
+        vulkan) $SUDO pacman -S --needed --noconfirm vulkan-headers vulkan-icd-loader vulkan-tools shaderc spirv-headers ;;
         esac
     elif command -v apt-get >/dev/null 2>&1; then
         $SUDO apt-get update
@@ -280,8 +280,8 @@ install_deps() {
             echo "!! install the CUDA toolkit from NVIDIA's repo: https://developer.nvidia.com/cuda-downloads" >&2 ;;
         rocm) $SUDO apt-get install -y rocm-hip-sdk rocminfo ||
             echo "!! ROCm needs AMD's repo first: https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
-        vulkan) $SUDO apt-get install -y libvulkan-dev glslc vulkan-tools ||
-            $SUDO apt-get install -y libvulkan-dev glslang-tools vulkan-tools ;;
+        vulkan) $SUDO apt-get install -y libvulkan-dev glslc vulkan-tools spirv-headers ||
+            $SUDO apt-get install -y libvulkan-dev glslang-tools vulkan-tools spirv-headers ;;
         esac
     elif command -v dnf >/dev/null 2>&1; then
         $SUDO dnf install -y gcc-c++ cmake git libcurl-devel python3
@@ -289,14 +289,14 @@ install_deps() {
         cuda) echo "!! CUDA on Fedora: enable NVIDIA's repo, then: dnf install cuda-toolkit" >&2 ;;
         rocm) $SUDO dnf install -y rocm-hip-devel hipblas-devel rocminfo ||
             echo "!! see https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
-        vulkan) $SUDO dnf install -y vulkan-headers vulkan-loader-devel glslc vulkan-tools ;;
+        vulkan) $SUDO dnf install -y vulkan-headers vulkan-loader-devel glslc vulkan-tools spirv-headers-devel ;;
         esac
     elif command -v zypper >/dev/null 2>&1; then
         $SUDO zypper install -y gcc-c++ cmake git libcurl-devel python3
         case "$backend" in
         cuda) echo "!! CUDA on openSUSE: add NVIDIA's repo, then: zypper install cuda-toolkit" >&2 ;;
         rocm) echo "!! ROCm on openSUSE: see https://rocm.docs.amd.com/projects/install-on-linux/" >&2 ;;
-        vulkan) $SUDO zypper install -y vulkan-headers vulkan-loader-devel shaderc vulkan-tools ;;
+        vulkan) $SUDO zypper install -y vulkan-headers vulkan-loader-devel shaderc vulkan-tools SPIRV-Headers-devel ;;
         esac
     else
         echo "!! unknown package manager — install manually: C++ toolchain, cmake, git, libcurl dev" >&2
