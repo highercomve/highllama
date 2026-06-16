@@ -118,13 +118,11 @@ run_agentic() {
     echo ""
     echo "================ agentic code benchmark ($agent) ================"
 
-    if [[ "$REMOTE" == "opencode-go" && "$agent" == "pi" ]]; then
-        echo ">> skipping pi agent for remote OpenCode Go model (incompatible backend)"
-        return 0
-    fi
-
     local model_arg="$MODEL"
-    if [[ -z "$REMOTE" && "$agent" == "opencode" ]]; then
+    if [[ "$REMOTE" == "opencode-go" && "$agent" == "pi" ]]; then
+        # pi needs the provider prefix for remote OpenCode Go models
+        model_arg="opencode-go/$MODEL"
+    elif [[ -z "$REMOTE" && "$agent" == "opencode" ]]; then
         # opencode exposes local models as the 'llamacpp' provider
         model_arg="llamacpp/$MODEL"
     fi
