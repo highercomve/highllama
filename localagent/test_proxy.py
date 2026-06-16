@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for anthropic_proxy.py dataset logging helpers.
+"""Tests for proxy.py dataset logging helpers.
 
 Stdlib unittest only — no pytest, no extra deps. Run with:
-    python3 -m unittest localagent.test_anthropic_proxy -v
+    python3 -m unittest localagent.test_proxy -v
 """
 import json
 import os
@@ -23,7 +23,7 @@ if HERE not in sys.path:
 # Force a stable model id so we don't depend on a running llama-server.
 os.environ.setdefault("LLAMA_MODEL", "test-model")
 
-import anthropic_proxy as ap  # noqa: E402
+import proxy as ap  # noqa: E402
 
 
 def _datasets_available():

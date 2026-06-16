@@ -4,7 +4,7 @@
 # result (diff + transcript) before anything lands on the real branch.
 #
 #   pipeline:  opus  ->  localagent run  ->  claude --bare -p (LOCAL brain)
-#                                              -> anthropic_proxy.py -> llama-server
+#                                              -> proxy.py -> llama-server
 #
 # Subcommands:
 #   localagent proxy start|stop|status|restart
@@ -23,7 +23,7 @@ set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"   # follow the ~/.local/bin symlink
 HERE="$(cd "$(dirname "$SELF")" && pwd)"
-PROXY_PY="$HERE/anthropic_proxy.py"
+PROXY_PY="$HERE/proxy.py"
 PROXY_HOST="${LLAMA_PROXY_HOST:-127.0.0.1}"
 PROXY_PORT="${LLAMA_PROXY_PORT:-8090}"
 PROXY_URL="http://$PROXY_HOST:$PROXY_PORT"

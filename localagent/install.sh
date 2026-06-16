@@ -12,7 +12,7 @@ BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"   # absolute, works from any cwd
 
 # link name -> script in this repo
-LINKS="localagent:localagent.sh claude-local:claude-local.sh"
+LINKS="localagent:localagent.sh agent-local:agent-local.sh claude-local:claude-local.sh"
 
 if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
   for pair in $LINKS; do

@@ -1,6 +1,6 @@
 # Zero-Latency Session History Logging in Local Proxy
 
-We have optimized the background request logging in the local proxy (`localagent/anthropic_proxy.py`) to ensure **absolutely zero performance overhead** on the request path. All JSON parsing, decoding, stream reconstruction, and database writes are offloaded to a dedicated background daemon worker.
+We have optimized the background request logging in the local proxy (`localagent/proxy.py`) to ensure **absolutely zero performance overhead** on the request path. All JSON parsing, decoding, stream reconstruction, and database writes are offloaded to a dedicated background daemon worker.
 
 > [!NOTE]
 > Both **local** and **remote** model calls are logged. The local model's
@@ -159,7 +159,7 @@ migration is idempotent (skipped if the DB already has rows).
 
 ## Tests
 
-`localagent/test_anthropic_proxy.py` is stdlib `unittest`. The
+`localagent/test_proxy.py` is stdlib `unittest`. The
 `TestExporterHFRoundTrip` class is skipped if `huggingface datasets` is
 not installed; when installed, it seeds the writer, runs the exporter
 for every format, and loads the output with `load_dataset` to confirm

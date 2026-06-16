@@ -1,98 +1,110 @@
-# localagent — local-LLM sub-agents, validated by Claude
+# localagent — local-LLM sub-agents, validated by an orchestrator
 
-Run `claude` sub-agents whose **brain is your local `llama-server`** (not the Anthropic
-API), so the orchestrating Claude (Opus) can **validate** the result before anything is
-trusted or lands on a real branch.
+Run sub-agents whose **brain is your local `llama-server`** (not a cloud API), so an
+orchestrating agent can **validate** the result before anything lands on a real branch.
+
+Works with any orchestrator that can call a CLI or route Anthropic-compatible requests:
+**Claude Code**, **pi**, **Codex**, or your own agent harness.
 
 ## Two ways to run a local sub-agent
 
-| | **CLI orchestrator** (`localagent` agent) | **Native gateway** (`local-llama` agent) |
+| | **CLI orchestrator** (`localagent run`) | **Native gateway** (`local-llama` model) |
 |---|---|---|
-| how | Opus calls the `localagent` CLI via Bash | a real subagent with `model: local-llama` |
-| session | works in **any** session, unchanged | only in a session started with `claude-local` |
+| how | orchestrator calls the `localagent` CLI via Bash | a real subagent with `model: local-llama` |
+| session | works in **any** session, unchanged | only in a session started through the gateway |
 | blast radius | **none** — main session never routes through the proxy | proxy sits in front of ALL session traffic |
 | isolation | git worktree per run | normal subagent (parent decides) |
 | best for | the safe default; validate-then-apply | when you want a native subagent on a different model |
 
-Both are powered by the same `anthropic_proxy.py`. The proxy is a **router**: requests
-for a "local" model are translated to llama-server; everything else (Opus) is passed
-through verbatim to `api.anthropic.com`.
+Both are powered by the same `proxy.py`. The proxy is a **router**: requests for a
+"local" model are translated to llama-server; everything else (cloud models) is passed
+through verbatim to the upstream API.
 
 ### Native gateway mode (the `model:` field)
 
-A Claude Code subagent's `model:` is a *name* override, not a network override — subagents
-share the session's endpoint. So to run a subagent on the local model natively, the whole
-session must point at the router. The `claude-local` launcher does this opt-in:
+Some agents (e.g. Claude Code subagents) treat `model:` as a *name* override, not a
+network override — subagents share the session's endpoint. To run a subagent on the local
+model natively, the whole session must point at the router. The `agent-local` launcher
+does this opt-in for any supported agent:
 
 ```bash
-claude-local            # interactive Opus session; `local-llama` subagent available
-                        #   Opus → relayed to Anthropic;  local-llama → llama-server
-claude-local --model local-llama -p "..."   # run the MAIN loop on the local model
+agent-local claude            # interactive Claude Code session; local-llama subagent available
+                              #   cloud model → relayed to upstream; local-llama → llama-server
+agent-local claude --model local-llama -p "..."   # run the MAIN loop on the local model
+agent-local codex             # OpenAI Codex CLI through the proxy
+agent-local pi                # pi through the proxy (configure its llamacpp extension)
 ```
 
-Sets `ANTHROPIC_BASE_URL=http://127.0.0.1:8090` + `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`
-for that session only. Your plain `claude` is untouched. (Auth: subscription OAuth is
-forwarded to Anthropic by the proxy; if Opus passthrough ever 401s, export `ANTHROPIC_API_KEY`.)
+`claude-local` is kept as a backward-compatible alias for `agent-local claude`.
+
+For Claude Code, `agent-local` sets `ANTHROPIC_BASE_URL` + gateway discovery for that
+session only. For OpenAI-native agents it sets `OPENAI_BASE_URL`.
+
+Other agents (e.g. pi) can route subagents to a different provider/model natively, so they
+don't need the gateway — just point the subagent at the `llamacpp` provider or `local-llama`
+alias.
 
 ---
 
 ## CLI orchestrator mode
 
-Headless `claude` sub-agents, isolated in a git worktree, so Opus can validate the
+Headless sub-agents, isolated in a git worktree, so the orchestrator can validate the
 **diff + transcript** before anything lands on the real branch.
 
 ```
-  Opus (orchestrator)
+  Orchestrator (Claude/pi/Codex)
      │  localagent run --task "..."
      ▼
   claude --bare -p   ← LOCAL brain, real agentic tools (Bash/Read/Write/Edit/Grep/Glob)
      │  Anthropic /v1/messages
      ▼
-  anthropic_proxy.py ← stdlib translation proxy (Anthropic ⇄ OpenAI)
+  proxy.py ← stdlib translation / logging proxy (Anthropic ⇄ OpenAI, OpenAI passthrough)
      │  OpenAI /v1/chat/completions
      ▼
   llama-server :8089 ← gemma / qwen / whatever highllama loaded
 
-  Opus reviews .git/localagent/meta/<branch>/changes.diff  →  localagent apply | discard
+  Orchestrator reviews .git/localagent/meta/<branch>/changes.diff  →  localagent apply | discard
 ```
 
 The local model does the cheap grunt work (drafting, investigating, implementing,
-committing on a scratch branch); **Opus is the gatekeeper** for anything that reaches
-your real branches.
+committing on a scratch branch); **the orchestrator is the gatekeeper** for anything that
+reaches your real branches.
 
 ## Why a proxy?
 
-`claude` speaks the **Anthropic Messages API**; `llama-server` speaks the **OpenAI API**.
-`anthropic_proxy.py` translates between them, including:
+`claude --bare` speaks the **Anthropic Messages API**; `llama-server` speaks the **OpenAI
+API**. `proxy.py` translates between them, including:
 - streaming SSE (chunked) ⇄ OpenAI streaming chunks
 - tool definitions, tool_use / tool_result round-trips
 - `stop_reason` normalization, `count_tokens` endpoint
 - **disables the model's `reasoning_content`** by default (`chat_template_kwargs.enable_thinking=false`)
-  so reasoning models don't burn the token budget thinking — we validate
-  *actions*, not chain-of-thought. Set `LLAMA_DISABLE_THINKING=0` to keep thinking.
+  so reasoning models don't burn the token budget thinking — we validate *actions*, not
+  chain-of-thought. Set `LLAMA_DISABLE_THINKING=0` to keep thinking.
 - **tool-call salvage** — some local models (Qwen3-Coder especially) emit tool calls as
-  TEXT (`<function=Name><parameter=k>v</parameter></function>` or Hermes
-  `<tool_call>{json}`) when llama.cpp's parser misses them; Claude Code then sees no tool
-  call and the loop stalls. `salvage_tool_calls()` detects these and rebuilds real
-  `tool_use` blocks. To do this the streaming path **buffers each local response**, salvages,
-  then emits clean Anthropic events (only local responses use this path — Opus is
-  passthrough, so the watched session still streams live).
+  TEXT (`<function=Name><parameter=k>v</parameter></function>` or Hermes `<tool_call>{json}`)
+  when llama.cpp's parser misses them; the upstream agent then sees no tool call and the
+  loop stalls. `salvage_tool_calls()` detects these and rebuilds real `tool_use` blocks. To
+  do this the streaming path **buffers each local response**, salvages, then emits clean
+  Anthropic events (only local responses use this path — cloud passthrough still streams
+  live).
 
 Zero dependencies — Python stdlib only.
 
 ## Install
 
 ```bash
-ln -sf ~/Code/llms/localagent/localagent.sh   ~/.local/bin/localagent     # CLI orchestrator
-ln -sf ~/Code/llms/localagent/claude-local.sh ~/.local/bin/claude-local   # gateway launcher
+ln -sf ~/Code/highllama/localagent/localagent.sh   ~/.local/bin/localagent     # CLI orchestrator
+ln -sf ~/Code/highllama/localagent/agent-local.sh ~/.local/bin/agent-local       # generic gateway launcher
+ln -sf ~/Code/highllama/localagent/claude-local.sh ~/.local/bin/claude-local     # backward-compatible alias
 ```
 
-Agents (Claude Code, loaded at startup — restart to pick up changes):
-- `~/.claude/agents/localagent.md` — CLI-orchestrator agent (runs on Opus, any session).
-- `~/.claude/agents/local-llama.md` — native worker (`model: local-llama`, needs a
-  `claude-local` session).
+Agent examples:
+- **Claude Code**: `~/.claude/agents/localagent.md` (orchestrator) and `~/.claude/agents/local-llama.md` (gateway worker).
+- **pi**: `~/.pi/agent/agents/{scout,planner,worker,reviewer}.md` with `model: llamacpp/<loaded-model>`.
 
-Requires `llama-server` running (use `highllama`) and the `claude` CLI.
+
+Requires `llama-server` running (use `highllama`) and either the `claude` CLI (for CLI
+orchestrator mode) or an agent that can call the proxy directly.
 
 ## Usage
 
@@ -135,7 +147,7 @@ Artifacts per run (worktree mode): `<repo>/.git/localagent/meta/<branch>/`
 (`changes.diff`, `transcript.json`, `stderr.log`). Worktree lives in
 `<repo>/.git/localagent/wt/<branch>/`.
 
-## How Opus orchestrates this
+## How an orchestrator uses this
 
 1. Decompose the task; for each cheap/parallelizable piece call `localagent run`.
 2. Read the printed `result`, `changes.diff`, and (if needed) `transcript.json`.
@@ -152,7 +164,7 @@ is emitted on stdout for the orchestrator to parse.
 | `LLAMA_PROXY_PORT` | `8090` | proxy listen port |
 | `LLAMA_MODEL` | auto-detect | force a specific upstream model id |
 | `LOCAL_MODEL_ALIAS` | `local-llama` | extra name that routes local (also: any name starting `local`) |
-| `ANTHROPIC_PASSTHROUGH_BASE` | `https://api.anthropic.com` | where non-local models (Opus) are relayed |
+| `ANTHROPIC_PASSTHROUGH_BASE` | `https://api.anthropic.com` | where non-local models are relayed |
 | `LLAMA_DISABLE_THINKING` | `1` | `0` keeps the model's reasoning_content |
 | `LLAMA_PROXY_LOG` | `~/.local/state/localagent/proxy.log` | proxy debug log |
 
@@ -179,27 +191,21 @@ Lessons that shaped the agents' prompts:
 - When tools fail they **hallucinate** rather than stop → **always validate**: check cited
   files exist and contain the claim. A wrong run here literally admitted it had no evidence.
 
-## opencode integration
+## Agent-specific notes
 
-opencode talks to llama-server **directly** via its `llamacpp` provider (OpenAI-native) — no
-proxy, so the salvage/thinking-disable above do **not** apply there (another reason to use
-gemma in opencode). Per-subagent models are native to opencode, so no gateway is needed.
+### Claude Code
+- CLI orchestrator agent: `~/.claude/agents/localagent.md`
+- Gateway worker agent: `~/.claude/agents/local-llama.md` (needs an `agent-local claude` session)
+- `--bare` forces `ANTHROPIC_API_KEY` auth (never reads your real OAuth/keychain) and skips
+  hooks/plugins/CLAUDE.md — the nested instance is fully isolated.
 
-- `~/.config/opencode/config.json` — the `llamacpp` provider has a **stable alias model**
-  `local-llama` (llama-server serves whatever GGUF is loaded regardless of the id sent), so
-  it survives model swaps.
-- `~/.config/opencode/agents/local-llama.md` — `mode: subagent`, `model: llamacpp/local-llama`,
-  same worker prompt. Your primary opencode agent delegates to it; it runs on the local model
-  at zero cloud cost and you validate the result.
-
-```bash
-opencode run -m llamacpp/local-llama "..."     # run the primary loop on the local model
-# inside opencode, ask the primary agent to "use the local-llama subagent" to delegate
-```
+### pi
+- Install the subagent extension and agent definitions (e.g. `~/.pi/agent/agents/local-llama.md`).
+- Point the agent `model:` at the `llamacpp` provider: `model: llamacpp/<loaded-model-id>`.
+- Subagents spawn as isolated `pi` processes and use the local model while the parent uses
+  its own model.
 
 ## Caveats
-- The local model is far weaker than Opus. Keep tasks **small and concrete**, constrain
-  `--tools`, and **always validate**. Treat sub-agent commits as drafts.
-- `--bare` forces `ANTHROPIC_API_KEY` auth (never reads your real OAuth/keychain) and
-  skips hooks/plugins/CLAUDE.md — the nested instance is fully isolated.
+- The local model is far weaker than cloud models. Keep tasks **small and concrete**,
+  constrain `--tools`, and **always validate**. Treat sub-agent commits as drafts.
 - No `--max-turns`; runaway loops are bounded by `--timeout`.

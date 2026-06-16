@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """
-anthropic_proxy.py — zero-dependency translation proxy.
+proxy.py — zero-dependency translation / logging proxy.
 
-Exposes the Anthropic Messages API (POST /v1/messages, POST /v1/messages/count_tokens)
-and ROUTES by model name:
-  - a "local" model  -> translate Anthropic <-> OpenAI and serve from llama-server
-  - anything else    -> transparently pass through to api.anthropic.com
+Exposes two APIs on the same port:
 
-That router behaviour is what lets a *native* Claude Code subagent run on the local
-model while the main session stays on Opus: point the whole session at this proxy
-(ANTHROPIC_BASE_URL) and give the subagent `model: local-<x>`. Opus traffic is relayed
-to Anthropic untouched; only the local model is translated to llama-server.
+1. Anthropic Messages API (POST /v1/messages, POST /v1/messages/count_tokens)
+   ROUTES by model name:
+     - a "local" model  -> translate Anthropic <-> OpenAI and serve from llama-server
+     - anything else    -> transparently pass through to api.anthropic.com
 
-It also still works as a plain Anthropic->OpenAI shim for one model (the `localagent`
-CLI uses it this way; passthrough simply never fires for local-only use):
+   This lets a native Claude Code subagent run on the local model while the main
+   session stays on a cloud model: point the session at this proxy (ANTHROPIC_BASE_URL)
+   and give the subagent `model: local-<x>`. Cloud traffic is relayed untouched.
+
+2. OpenAI-compatible API (POST /v1/chat/completions, GET /v1/models)
+   For opencode, Codex, pi, or any other OpenAI-native client that should still be
+   logged by the proxy. These requests are forwarded verbatim to llama-server and
+   recorded in the dataset DB.
+
+The `localagent` CLI uses the Anthropic path; passthrough simply never fires for
+local-only use:
 
     ANTHROPIC_BASE_URL=http://127.0.0.1:8090  ANTHROPIC_API_KEY=local  claude --bare -p "..."
+
+OpenAI clients can point here too:
+
+    OPENAI_BASE_URL=http://127.0.0.1:8090/v1  OPENAI_API_KEY=local  <client>
 
 Stdlib only. Python 3.10+.
 
@@ -60,6 +70,9 @@ LOCAL_ALIAS = os.environ.get("LOCAL_MODEL_ALIAS", "local-llama")
 ANTHROPIC_UP = os.environ.get(
     "ANTHROPIC_PASSTHROUGH_BASE", "https://api.anthropic.com"
 ).rstrip("/")
+OPENAI_UP = os.environ.get(
+    "OPENAI_PASSTHROUGH_BASE", "https://api.openai.com"
+).rstrip("/")
 
 _up = urlparse(LLAMA_BASE)
 UP_HOST = _up.hostname
@@ -70,6 +83,11 @@ _an = urlparse(ANTHROPIC_UP)
 AN_HOST = _an.hostname
 AN_PORT = _an.port or (443 if _an.scheme == "https" else 80)
 AN_HTTPS = _an.scheme == "https"
+
+_oa = urlparse(OPENAI_UP)
+OA_HOST = _oa.hostname
+OA_PORT = _oa.port or (443 if _oa.scheme == "https" else 80)
+OA_HTTPS = _oa.scheme == "https"
 
 # hop-by-hop headers we must not forward when relaying to Anthropic
 _DROP_HEADERS = {
@@ -84,7 +102,7 @@ _DROP_HEADERS = {
 
 
 def is_local_model(name):
-    """Which requests get served by llama-server vs. passed through to Anthropic."""
+    """Which requests get served by llama-server vs. passed through to the cloud."""
     if not name:
         return False
     n = name.lower()
@@ -94,6 +112,119 @@ def is_local_model(name):
         or name == LOCAL_ALIAS
         or n.startswith("local")
     )
+
+
+def openai_conn():
+    if OA_HTTPS:
+        return http.client.HTTPSConnection(OA_HOST, OA_PORT, timeout=600)
+    return http.client.HTTPConnection(OA_HOST, OA_PORT, timeout=600)
+
+
+def _is_openai_format(body):
+    """Heuristic: OpenAI chat bodies have messages whose content is typically a string
+    (or array of {type:text/image_url}) and system is inside messages[]. Anthropic bodies
+    have a top-level `system` and content as list of {type:text/tool_use/tool_result}."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    first = messages[0]
+    if not isinstance(first, dict):
+        return False
+    content = first.get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list) and content:
+        # Anthropic content blocks always have a `type` key; OpenAI content parts have type too.
+        # Distinguish by role names: OpenAI allows 'system' inside messages; Anthropic uses
+        # 'user' | 'assistant' only at the message level.
+        if first.get("role") == "system":
+            return True
+        # If content parts are OpenAI-style {type:'text',text:..} or {type:'image_url',..}
+        # it is still an OpenAI request.
+        return True
+    return False
+
+
+def _openai_messages_flat(messages):
+    """Flatten OpenAI messages to role/content strings for dataset logging."""
+    out = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    t = part.get("type")
+                    if t == "text":
+                        parts.append(part.get("text", ""))
+                    elif t == "image_url":
+                        parts.append("[image]")
+            out.append({"role": role, "content": "".join(parts)})
+        else:
+            out.append({"role": role, "content": json.dumps(content) if content is not None else ""})
+    return out
+
+
+def _build_dataset_item_openai(body, response_content):
+    """Build a dataset item from an OpenAI-format request/response."""
+    try:
+        req_model = body.get("model", MODEL)
+        messages = list(body.get("messages", []))
+        tools = body.get("tools")
+        system = ""
+        for m in messages:
+            if m.get("role") == "system" and isinstance(m.get("content"), str):
+                system = m["content"]
+                break
+
+        assistant_message = {"role": "assistant", "content": response_content}
+        messages.append(assistant_message)
+
+        messages_flat = _openai_messages_flat(messages)
+
+        conversations = []
+        for m in messages:
+            role = m.get("role")
+            if role == "user":
+                from_val = "human"
+            elif role == "assistant":
+                from_val = "gpt"
+            elif role == "tool":
+                from_val = "function"
+            else:
+                from_val = role
+            flat = _openai_messages_flat([m])[0]
+            conversations.append({"from": from_val, "value": flat["content"]})
+
+        has_tools = False
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") in ("tool_call", "tool_calls", "tool_result"):
+                        has_tools = True
+                        break
+            if m.get("tool_calls") or m.get("tool_call_id"):
+                has_tools = True
+
+        item = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": req_model,
+            "system": system,
+            "messages": messages,
+            "messages_flat": messages_flat,
+            "conversations": conversations,
+            "has_tool_calls": has_tools,
+        }
+        if tools:
+            item["tools"] = tools
+        return item
+    except Exception as e:
+        log("Error building OpenAI dataset item:", e)
+        return None
 
 
 def anthropic_conn():
@@ -129,6 +260,11 @@ def detect_model():
         data = json.loads(r.read())
         c.close()
         items = data.get("data") or data.get("models") or []
+        # Prefer a non-embedding chat model; fall back to the first item.
+        for item in items:
+            mid = (item.get("id") or item.get("name") or "").lower()
+            if "embedding" not in mid:
+                return item.get("id") or item.get("name")
         if items:
             return items[0].get("id") or items[0].get("name")
     except Exception as e:  # noqa
@@ -767,6 +903,88 @@ def _dataset_writer_thread():
                         log("Dataset writer: reconstructor returned empty content for stream")
                 except Exception as e:
                     log("Dataset writer: failed to parse passthrough_stream:", e, traceback.format_exc())
+            elif task_type == "openai_parsed":
+                if "response_content" in task:
+                    item = _build_dataset_item_openai(task["body"], task["response_content"])
+                else:
+                    try:
+                        resp_obj = json.loads(task["response_bytes"])
+                        choice = (resp_obj.get("choices") or [{}])[0]
+                        msg = choice.get("message", {})
+                        content = msg.get("content") or ""
+                        tool_calls = msg.get("tool_calls") or []
+                        response_content = []
+                        if content:
+                            response_content.append({"type": "text", "text": content})
+                        for tc in tool_calls:
+                            fn = tc.get("function", {})
+                            try:
+                                args = json.loads(fn.get("arguments") or "{}")
+                            except Exception:
+                                args = {"_raw": fn.get("arguments")}
+                            response_content.append({
+                                "type": "tool_use",
+                                "id": tc.get("id"),
+                                "name": fn.get("name"),
+                                "input": args,
+                            })
+                        if not response_content:
+                            response_content.append({"type": "text", "text": ""})
+                        item = _build_dataset_item_openai(task["body"], response_content)
+                    except Exception as e:
+                        log("Dataset writer: failed to parse openai_parsed:", e, traceback.format_exc())
+            elif task_type == "openai_stream":
+                try:
+                    body = task["body"]
+                    content_parts = []
+                    tool_calls = {}  # index -> {id,name,args}
+                    raw = task.get("raw_bytes", b"")
+                    for line_bytes in raw.splitlines(keepends=True):
+                        line = line_bytes.decode("utf-8", errors="ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                        choice = (chunk.get("choices") or [{}])[0]
+                        delta = choice.get("delta", {}) or {}
+                        if delta.get("content"):
+                            content_parts.append(delta["content"])
+                        for tc in delta.get("tool_calls", []) or []:
+                            idx = tc.get("index", 0)
+                            slot = tool_calls.setdefault(idx, {"id": None, "name": "", "args": ""})
+                            fn = tc.get("function", {}) or {}
+                            if fn.get("id"):
+                                slot["id"] = fn["id"]
+                            if fn.get("name"):
+                                slot["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                slot["args"] += fn["arguments"]
+                    content = "".join(content_parts)
+                    response_content = []
+                    if content:
+                        response_content.append({"type": "text", "text": content})
+                    for idx in sorted(tool_calls.keys()):
+                        t = tool_calls[idx]
+                        try:
+                            args = json.loads(t["args"] or "{}")
+                        except Exception:
+                            args = {"_raw": t["args"]}
+                        response_content.append({
+                            "type": "tool_use",
+                            "id": t["id"] or ("toolu_" + uuid.uuid4().hex[:24]),
+                            "name": t["name"],
+                            "input": args,
+                        })
+                    if not response_content:
+                        response_content.append({"type": "text", "text": ""})
+                    item = _build_dataset_item_openai(body, response_content)
+                except Exception as e:
+                    log("Dataset writer: failed to parse openai_stream:", e, traceback.format_exc())
 
             if not item:
                 continue
@@ -987,6 +1205,21 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 log("Proxy: skipping logging for sync passthrough (capture_response=%s, has_bytes=%s)" % (capture_response, response_bytes is not None))
 
+    def _wants_anthropic_format(self):
+        """Guess whether the client expects Anthropic-style /v1/models or OpenAI-style.
+        Default to Anthropic to preserve existing Claude Code gateway behavior."""
+        ua = (self.headers.get("User-Agent") or "").lower()
+        if "openai" in ua or "opencode" in ua or "codex" in ua:
+            return False
+        if self.headers.get("OpenAI-Organization") or self.headers.get("OpenAI-Project"):
+            return False
+        if self.headers.get("anthropic-version"):
+            return True
+        if self.headers.get("x-api-key"):
+            return True
+        # Fallback: preserve the original Anthropic format for clients we can't identify.
+        return True
+
     def do_GET(self):
         if self.path == "/health":
             return self._json(
@@ -999,34 +1232,63 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
         if self.path.startswith("/v1/models"):
-            # gateway discovery: merge Anthropic's catalogue with the local alias
+            is_anthropic = self._wants_anthropic_format()
+            # Fetch upstream models so the proxy can be used as a full gateway.
+            upstream_data = []
+            if is_anthropic:
+                try:
+                    headers = {
+                        k: v
+                        for k, v in self.headers.items()
+                        if k.lower() not in _DROP_HEADERS
+                    }
+                    headers["Host"] = AN_HOST
+                    c = anthropic_conn()
+                    c.request("GET", self.path, headers=headers)
+                    r = c.getresponse()
+                    payload = r.read()
+                    c.close()
+                    if r.status == 200:
+                        upstream_data = json.loads(payload).get("data", [])
+                except Exception as e:  # noqa
+                    log("models passthrough failed:", e)
+            else:
+                try:
+                    headers = {
+                        k: v
+                        for k, v in self.headers.items()
+                        if k.lower() not in _DROP_HEADERS
+                    }
+                    headers["Host"] = OA_HOST
+                    c = openai_conn()
+                    c.request("GET", self.path, headers=headers)
+                    r = c.getresponse()
+                    payload = r.read()
+                    c.close()
+                    if r.status == 200:
+                        upstream_data = json.loads(payload).get("data", [])
+                except Exception as e:  # noqa
+                    log("OpenAI models passthrough failed:", e)
+
+            # Local model entry: include BOTH OpenAI and Anthropic fields so the
+            # same response works for clients expecting either format.
             local_entry = {
-                "type": "model",
                 "id": LOCAL_ALIAS,
+                "object": "model",
+                "type": "model",
                 "display_name": "Local (%s)" % MODEL,
+                "created": 0,
                 "created_at": "",
+                "owned_by": "llamacpp",
             }
-            data = []
-            try:
-                headers = {
-                    k: v
-                    for k, v in self.headers.items()
-                    if k.lower() not in _DROP_HEADERS
-                }
-                headers["Host"] = AN_HOST
-                c = anthropic_conn()
-                c.request("GET", self.path, headers=headers)
-                r = c.getresponse()
-                payload = r.read()
-                c.close()
-                if r.status == 200:
-                    data = json.loads(payload).get("data", [])
-            except Exception as e:  # noqa
-                log("models passthrough failed:", e)
+
+            data = [local_entry] + upstream_data
+
             return self._json(
                 200,
                 {
-                    "data": [local_entry] + data,
+                    "object": "list",
+                    "data": data,
                     "has_more": False,
                     "first_id": LOCAL_ALIAS,
                     "last_id": data[-1]["id"] if data else LOCAL_ALIAS,
@@ -1048,6 +1310,10 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         req_model = body.get("model", MODEL)
+
+        # OpenAI-compatible chat completions endpoint (used by opencode, Codex, pi, etc.)
+        if self.path.startswith("/v1/chat/completions"):
+            return self._openai_chat_completions(body, raw)
 
         # ROUTER: non-local models are relayed verbatim to Anthropic.
         if self.path.startswith("/v1/") and not is_local_model(req_model):
@@ -1125,6 +1391,188 @@ class Handler(BaseHTTPRequestHandler):
             log("client disconnected mid-stream")
         finally:
             c.close()
+
+    def _openai_chat_completions(self, body, raw):
+        """Route OpenAI-format requests: local models -> llama-server, cloud models
+        -> OpenAI-compatible passthrough. Both paths are logged to the dataset."""
+        req_model = body.get("model", "")
+
+        if not is_local_model(req_model):
+            return self._openai_passthrough(raw)
+
+        # Resolve local aliases to the actual upstream model id.
+        body["model"] = MODEL
+        stream = bool(body.get("stream"))
+        payload = json.dumps(body).encode()
+        log(
+            "→ /v1/chat/completions",
+            "stream" if stream else "sync",
+            "model=%s (local)" % req_model,
+        )
+
+        try:
+            c = upstream_conn()
+            c.request(
+                "POST",
+                "/v1/chat/completions",
+                body=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            r = c.getresponse()
+        except Exception as e:  # noqa
+            log("upstream error:", e)
+            return self._json(
+                502,
+                {"error": {"message": str(e), "type": "api_error"}},
+            )
+
+        if r.status != 200:
+            err = r.read()
+            c.close()
+            log("upstream status", r.status, err[:300])
+            return self._json(
+                r.status,
+                {"error": {"message": err.decode("utf-8", "replace"), "type": "api_error"}},
+            )
+
+        if not stream:
+            data = json.loads(r.read())
+            c.close()
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message", {})
+            content = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls") or []
+            response_content = []
+            if content:
+                response_content.append({"type": "text", "text": content})
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    args = {"_raw": fn.get("arguments")}
+                response_content.append({
+                    "type": "tool_use",
+                    "id": tc.get("id"),
+                    "name": fn.get("name"),
+                    "input": args,
+                })
+            if not response_content:
+                response_content.append({"type": "text", "text": ""})
+            _enqueue_dataset({
+                "type": "openai_parsed",
+                "body": body,
+                "response_content": response_content,
+            })
+            return self._json(200, data)
+
+        # Streaming: proxy OpenAI SSE straight through and log at the end.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        response_buf = io.BytesIO()
+        try:
+            while True:
+                line = r.readline()
+                if not line:
+                    break
+                self._w(line)
+                response_buf.write(line)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            c.close()
+
+        # Log the streamed response.
+        _enqueue_dataset({
+            "type": "openai_stream",
+            "body": body,
+            "raw_bytes": response_buf.getvalue(),
+        })
+        self._w(b"")
+        self.wfile.flush()
+
+    def _openai_passthrough(self, raw):
+        """Relay an OpenAI-format request verbatim to the upstream OpenAI-compatible
+        API and stream the response back. Used for non-local (cloud) models so all
+        agent traffic is captured in the dataset."""
+        headers = {
+            k: v for k, v in self.headers.items() if k.lower() not in _DROP_HEADERS
+        }
+        headers["Host"] = OA_HOST
+        if raw:
+            headers["Content-Length"] = str(len(raw))
+
+        try:
+            body = json.loads(raw) if raw else {}
+            is_stream = body.get("stream", False)
+        except Exception:
+            body = None
+            is_stream = False
+
+        try:
+            c = openai_conn()
+            c.request("POST", "/v1/chat/completions", body=raw or None, headers=headers)
+            r = c.getresponse()
+        except Exception as e:  # noqa
+            log("openai passthrough error:", e)
+            return self._json(
+                502,
+                {"error": {"message": str(e), "type": "api_error"}},
+            )
+
+        self.send_response(r.status)
+        ct = r.getheader("Content-Type", "application/json")
+        self.send_header("Content-Type", ct)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        capture_response = r.status == 200 and body is not None
+
+        if is_stream:
+            response_buf = io.BytesIO()
+            try:
+                while True:
+                    line = r.readline()
+                    if not line:
+                        break
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                    if capture_response:
+                        response_buf.write(line)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                c.close()
+
+            if capture_response:
+                log("Proxy: queuing OpenAI streaming passthrough task...")
+                _enqueue_dataset({
+                    "type": "openai_stream",
+                    "body": body,
+                    "raw_bytes": response_buf.getvalue(),
+                })
+        else:
+            response_bytes = b""
+            try:
+                response_bytes = r.read()
+                self.wfile.write(response_bytes)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                c.close()
+
+            if capture_response and response_bytes:
+                log("Proxy: queuing OpenAI sync passthrough task...")
+                _enqueue_dataset({
+                    "type": "openai_parsed",
+                    "body": body,
+                    "response_bytes": response_bytes,
+                })
 
     def _w(self, chunk):
         # HTTP/1.1 chunked framing: <hex-len>\r\n<data>\r\n

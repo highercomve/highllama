@@ -1,6 +1,6 @@
 # Code review: `localagent` dataset logging
 
-Scope: `localagent/anthropic_proxy.py`, `localagent/export_dataset.py`,
+Scope: `localagent/proxy.py`, `localagent/export_dataset.py`,
 `localagent/localagent.sh`, and the design doc `dataset_logging.md`. The proxy
 is a stdlib-only Anthropic↔OpenAI translator that routes "local" model names to
 `llama-server` and everything else to `api.anthropic.com`. The dataset
@@ -26,14 +26,14 @@ Two places should enqueue to `_dataset_queue` and don't:
 - **Non-streaming local** — `Handler.do_POST` builds `openai_to_anthropic(data,
   req_model)` and returns it via `self._json(200, ...)`. No
   `_dataset_queue.put_nowait(...)` afterwards
-  (`anthropic_proxy.py:966-969`).
+  (`proxy.py:966-969`).
 - **Streaming local** — `_stream()` (called from the streaming branch of
   `do_POST`) already builds a `response_content` list mirroring the same
   content blocks it sends to the client
-  (`anthropic_proxy.py:1046-1163`). It's the perfect capture point — the
+  (`proxy.py:1046-1163`). It's the perfect capture point — the
   `response_content` list contains the cleaned `text` + native + salvaged
   tool blocks in Anthropic form. After
-  `self._w(sse("message_stop", ...))` (`anthropic_proxy.py:1181`) you just
+  `self._w(sse("message_stop", ...))` (`proxy.py:1181`) you just
   need:
   ```python
   _dataset_queue.put_nowait({
@@ -42,10 +42,10 @@ Two places should enqueue to `_dataset_queue` and don't:
       "response_content": response_content,
   })
   ```
-  `body` is already in scope from the caller (`anthropic_proxy.py:978`).
+  `body` is already in scope from the caller (`proxy.py:978`).
 
 The existing `parsed` task type in the writer thread
-(`anthropic_proxy.py:642-645`) is exactly shaped for this — no writer-side
+(`proxy.py:642-645`) is exactly shaped for this — no writer-side
 changes required. Mirror with a `local_sync` task for the non-streaming
 branch or reuse `parsed` for both.
 
@@ -54,7 +54,7 @@ branch or reuse `parsed` for both.
 ## 2. Dead `bytes` vs `str` comparison
 
 `SSEAssistantResponseReconstructor.feed_line()`
-(`anthropic_proxy.py:697`):
+(`proxy.py:697`):
 ```python
 payload = line[5:].strip()             # str
 if not payload or payload == "[DONE]" or payload == b"[DONE]":
@@ -67,7 +67,7 @@ dead code that confuses readers. Drop it.
 
 ## 3. SQLite — one connection per write, no tuning
 
-`_write_to_sqlite()` (`anthropic_proxy.py:592-613`) opens a new
+`_write_to_sqlite()` (`proxy.py:592-613`) opens a new
 `sqlite3.connect(db_path)` for every logged call. Under load that means:
 per-call setup, fsync on commit, no prepared-statement cache.
 
@@ -93,7 +93,7 @@ writing.
 
 ## 4. JSONL migration blocks proxy startup
 
-`_init_sqlite_db()` (`anthropic_proxy.py:534-589`) reads the entire legacy
+`_init_sqlite_db()` (`proxy.py:534-589`) reads the entire legacy
 JSONL into memory and inserts line-by-line **synchronously, before the
 writer thread starts its `get()` loop**. A 1 GB JSONL = multi-minute proxy
 downtime, plus peak memory of ~the full file.
@@ -110,7 +110,7 @@ Mitigations:
 
 ## 5. Queue is unbounded
 
-`_dataset_queue = queue.Queue()` (`anthropic_proxy.py:448`) — no `maxsize`.
+`_dataset_queue = queue.Queue()` (`proxy.py:448`) — no `maxsize`.
 If SQLite stalls (disk full, lock), the proxy thread buffers the whole
 conversation history in memory via `put_nowait` succeeding forever. Use a
 bounded queue with drop-oldest on overflow and a counter:
@@ -132,7 +132,7 @@ weeks in.
 
 ## 6. ShareGPT `tool` role is not standard
 
-`_build_dataset_item()` (`anthropic_proxy.py:507-516`):
+`_build_dataset_item()` (`proxy.py:507-516`):
 ```python
 from_val = "human" if role == "user" else ("gpt" if role == "assistant" else role)
 ```
@@ -167,9 +167,9 @@ that. Costs ~1 byte per row, removes the heuristic.
 ## 8. `tools` serialization is inconsistent
 
 `_build_dataset_item()` adds `"tools"` to the item only if truthy
-(`anthropic_proxy.py:526-527`). `_write_to_sqlite()` writes
+(`proxy.py:526-527`). `_write_to_sqlite()` writes
 `json.dumps(item.get("tools", []))` if the key is present, else `NULL`
-(`anthropic_proxy.py:607`). So an empty `tools: []` is stored as the string
+(`proxy.py:607`). So an empty `tools: []` is stored as the string
 `"[]"`, but a missing `tools` is stored as SQL `NULL`. Pick one (recommend
 `NULL` for both — remove the `if tools:` guard or replace
 `if "tools" in item` with `if item.get("tools")`).
@@ -179,9 +179,9 @@ that. Costs ~1 byte per row, removes the heuristic.
 ## 9. Log spam on the hot path
 
 Every successful insert logs `"Dataset writer: successfully logged call to
-SQLite database!"` (`anthropic_proxy.py:611`) and every task logs
+SQLite database!"` (`proxy.py:611`) and every task logs
 `"Dataset writer thread: processing task type: ..."`
-(`anthropic_proxy.py:639`). At Opus token rates this is hundreds of
+(`proxy.py:639`). At Opus token rates this is hundreds of
 lines/sec into `LLAMA_PROXY_LOG` if it's set. Drop the success line,
 demote task pickup to debug, keep only failure/skip lines.
 
@@ -190,7 +190,7 @@ demote task pickup to debug, keep only failure/skip lines.
 ## 10. `passthrough_stream` keeps the full response in RAM as a list of byte chunks
 
 `_passthrough()` builds `raw_lines` by appending every SSE line byte string
-(`anthropic_proxy.py:804-815`). For a 200 k-token Opus response, this is
+(`proxy.py:804-815`). For a 200 k-token Opus response, this is
 multiple MB held in memory until the response ends, then handed to the
 worker, then re-iterated. Cheaper:
 
@@ -217,7 +217,7 @@ shape is only there to drive the reconstructor).
 ## 11. `SSEAssistantResponseReconstructor` swallows errors
 
 `feed_line()` does `except Exception: pass`
-(`anthropic_proxy.py:723-724`) and `get_content()` silently returns
+(`proxy.py:723-724`) and `get_content()` silently returns
 whatever it managed to build. If a malformed event breaks reconstruction
 you get a half-empty assistant message in the dataset with no diagnostic.
 Log the first few failures at debug level so future bugs are debuggable.
@@ -236,7 +236,7 @@ insurance.
 ## 13. Module-level side effects
 
 `_writer = threading.Thread(...); _writer.start()`
-(`anthropic_proxy.py:683-684`) runs at `import` time, which means
+(`proxy.py:683-684`) runs at `import` time, which means
 importing `anthropic_proxy` for tests (or `python3 -c "import
 anthropic_proxy"`) starts the writer thread, calls `detect_model()` (a
 network call), and creates the DB. Wrap behind
@@ -250,7 +250,7 @@ import-safe.
 `cmd_info` (`localagent.sh:249-292`) reads `LLAMA_PROXY_DATASET` and
 applies the `.jsonl`→`.db` substitution to find the DB, but the proxy
 itself picks its `db_path` only via the writer's resolution
-(`anthropic_proxy.py:617-625`). If the env var differs between proxy
+(`proxy.py:617-625`). If the env var differs between proxy
 startup and `localagent info` (e.g. systemd unit vs. shell), they
 disagree. Make `cmd_info` call `proxy_start`'s path-resolution helper, or
 stash the resolved path in the pidfile env.
