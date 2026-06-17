@@ -37,7 +37,7 @@ Env:
   LOCAL_MODEL_ALIAS         extra name that routes local (default "local-llama"; any
                             model whose name starts with "local" also routes local)
   ANTHROPIC_PASSTHROUGH_BASE upstream for non-local models (default https://api.anthropic.com)
-  LLAMA_DISABLE_THINKING    "0" keeps reasoning_content (default disables it)
+  LLAMA_DISABLE_THINKING    "1" forces enable_thinking=false (default: enabled)
   LLAMA_PROXY_LOG           append a debug log here   (default: none; stderr only)
 """
 
@@ -61,10 +61,24 @@ HOST = os.environ.get("LLAMA_PROXY_HOST", "127.0.0.1")
 LLAMA_BASE = os.environ.get("LLAMA_BASE", "http://127.0.0.1:8089").rstrip("/")
 FORCED_MODEL = os.environ.get("LLAMA_MODEL")
 LOG_PATH = os.environ.get("LLAMA_PROXY_LOG")
-# Many local models (gemma, qwen3) emit verbose reasoning_content that burns the
-# token budget before producing an answer/tool-call. We validate actions, not the
-# chain-of-thought, so disable thinking by default. Set LLAMA_DISABLE_THINKING=0 to keep it.
-DISABLE_THINKING = os.environ.get("LLAMA_DISABLE_THINKING", "1") != "0"
+# Local reasoning models (gemma-4, gpt-oss, etc.) can use thinking when the
+# template supports it. We default to enabling it; set LLAMA_DISABLE_THINKING=1
+# to force it off (useful for weak models that burn tokens thinking).
+DISABLE_THINKING = os.environ.get("LLAMA_DISABLE_THINKING", "0") != "0"
+
+
+def _inject_thinking(body):
+    """Ensure local-model requests use the template's thinking setting.
+
+    When not disabled, default enable_thinking to True so models like gemma-4
+    actually reason. If the client already sent chat_template_kwargs we only
+    fill in a missing enable_thinking, preserving explicit overrides.
+    """
+    if DISABLE_THINKING:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+        return
+    kwargs = body.setdefault("chat_template_kwargs", {})
+    kwargs.setdefault("enable_thinking", True)
 
 LOCAL_ALIAS = os.environ.get("LOCAL_MODEL_ALIAS", "local-llama")
 ANTHROPIC_UP = os.environ.get(
@@ -374,8 +388,7 @@ def anthropic_to_openai(body):
         out["top_p"] = body["top_p"]
     if body.get("stop_sequences"):
         out["stop"] = body["stop_sequences"]
-    if DISABLE_THINKING:
-        out["chat_template_kwargs"] = {"enable_thinking": False}
+    _inject_thinking(out)
 
     # tools
     tools = body.get("tools")
@@ -1402,6 +1415,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Resolve local aliases to the actual upstream model id.
         body["model"] = MODEL
+        _inject_thinking(body)
         stream = bool(body.get("stream"))
         payload = json.dumps(body).encode()
         log(

@@ -19,6 +19,7 @@ Usage:
     python run_code_benchmark.py --langs python,rust  # subset of languages
     python run_code_benchmark.py --tasks py_,rs_      # id-prefix filter
     python run_code_benchmark.py --temperature 0 --max-tokens 4096
+    python run_code_benchmark.py --thinking-effort none
     python run_code_benchmark.py --out results/foo.json --save-raw
 """
 import argparse
@@ -159,7 +160,7 @@ def _post(url, payload, headers):
     return r.json()
 
 
-def _call_openai(backend, user, temperature, max_tokens):
+def _call_openai(backend, user, temperature, max_tokens, thinking_effort=None):
     """OpenAI /v1/chat/completions -> (text, completion_tokens)."""
     headers = {}
     if backend.get("api_key"):
@@ -174,13 +175,18 @@ def _call_openai(backend, user, temperature, max_tokens):
         "max_tokens": max_tokens,
         "stream": False,
     }
+    if thinking_effort is not None:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": thinking_effort != "none",
+            "reasoning_effort": thinking_effort,
+        }
     b = _post(backend["base"].rstrip("/") + "/v1/chat/completions", payload, headers)
     text = b["choices"][0]["message"].get("content") or ""
     ctok = (b.get("usage") or {}).get("completion_tokens")
     return text, ctok
 
 
-def _call_anthropic(backend, user, temperature, max_tokens):
+def _call_anthropic(backend, user, temperature, max_tokens, thinking_effort=None):
     """Anthropic /v1/messages -> (text, output_tokens)."""
     headers = {"anthropic-version": "2023-06-01", "content-type": "application/json"}
     if backend.get("api_key"):
@@ -198,7 +204,7 @@ def _call_anthropic(backend, user, temperature, max_tokens):
     return text, ctok
 
 
-def ask_model(backend, task, temperature, max_tokens):
+def ask_model(backend, task, temperature, max_tokens, thinking_effort=None):
     """Send the task prompt via the backend's protocol; return (text, err, meta)."""
     user = (
         f"Language: {task['language']}\n\n{task['prompt']}\n\n"
@@ -207,7 +213,7 @@ def ask_model(backend, task, temperature, max_tokens):
     call = _call_anthropic if backend["provider"] == "anthropic" else _call_openai
     t0 = time.time()
     try:
-        text, ctok = call(backend, user, temperature, max_tokens)
+        text, ctok = call(backend, user, temperature, max_tokens, thinking_effort)
     except Exception as e:
         return "", f"{type(e).__name__}: {e}", {"gen_s": round(time.time() - t0, 2),
                                                  "completion_tokens": None, "tok_s": None}
@@ -323,6 +329,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--max-tokens", type=int, default=8192,
                     help="generation cap (reasoning models need headroom for thinking + code)")
+    ap.add_argument("--thinking-effort", choices=["none", "low", "medium", "high"], default=None,
+                    help="thinking effort sent via chat_template_kwargs (none disables; OpenAI-protocol backends; ignored by Anthropic)")
     ap.add_argument("--out", default="", help="results json (default results/YYYY-MM-DD/HH-MM-SS/<model>.json)")
     ap.add_argument("--save-raw", action="store_true", help="also keep raw model output")
     ap.add_argument("--provider-config", default=os.path.join(HERE, "providers.json"),
@@ -353,11 +361,13 @@ def main():
 
     print(f">> model={model}  provider={backend['provider']}  base={backend['base']}")
     print(f">> tasks={len(tasks)}  languages={sorted({t['language'] for t in tasks})}")
+    if args.thinking_effort:
+        print(f">> thinking_effort={args.thinking_effort}")
     records, raws = [], {}
     t0 = time.time()
     for i, task in enumerate(tasks, 1):
         print(f"   [{i}/{len(tasks)}] {task['id']} ...", end=" ", flush=True)
-        raw, err, meta = ask_model(backend, task, args.temperature, args.max_tokens)
+        raw, err, meta = ask_model(backend, task, args.temperature, args.max_tokens, args.thinking_effort)
         if err:
             print(f"request failed: {err}")
             records.append({"id": task["id"], "language": task["language"],
@@ -384,12 +394,15 @@ def main():
         out = os.path.join(HERE, "results", now.strftime("%Y-%m-%d"),
                            now.strftime("%H-%M-%S"), re.sub(r"[^\w.-]", "_", model) + ".json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
+    params = {"temperature": args.temperature, "max_tokens": args.max_tokens}
+    if args.thinking_effort:
+        params["thinking_effort"] = args.thinking_effort
     blob = {
         "model": model,
         "base": backend["base"],
         "provider": backend["provider"],
         "elapsed_s": round(time.time() - t0, 1),
-        "params": {"temperature": args.temperature, "max_tokens": args.max_tokens},
+        "params": params,
         "summary": summ,
         "tasks": records,
     }

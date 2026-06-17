@@ -34,6 +34,29 @@ def _datasets_available():
         return False
 
 
+class TestInjectThinking(unittest.TestCase):
+    def test_default_enables_thinking(self):
+        body = {"model": "test-model"}
+        ap._inject_thinking(body)
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": True})
+
+    def test_preserves_explicit_false(self):
+        body = {"model": "test-model", "chat_template_kwargs": {"enable_thinking": False}}
+        ap._inject_thinking(body)
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_preserves_existing_kwargs(self):
+        body = {"model": "test-model", "chat_template_kwargs": {"reasoning_effort": "high"}}
+        ap._inject_thinking(body)
+        self.assertEqual(body["chat_template_kwargs"], {"reasoning_effort": "high", "enable_thinking": True})
+
+    def test_disable_forces_off(self):
+        with mock.patch.object(ap, "DISABLE_THINKING", True):
+            body = {"model": "test-model", "chat_template_kwargs": {"reasoning_effort": "high"}}
+            ap._inject_thinking(body)
+            self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+
+
 class TestFlattenContent(unittest.TestCase):
     def test_string_passthrough(self):
         self.assertEqual(ap._flatten_content("hello"), "hello")

@@ -77,9 +77,9 @@ API**. `proxy.py` translates between them, including:
 - streaming SSE (chunked) ⇄ OpenAI streaming chunks
 - tool definitions, tool_use / tool_result round-trips
 - `stop_reason` normalization, `count_tokens` endpoint
-- **disables the model's `reasoning_content`** by default (`chat_template_kwargs.enable_thinking=false`)
-  so reasoning models don't burn the token budget thinking — we validate *actions*, not
-  chain-of-thought. Set `LLAMA_DISABLE_THINKING=0` to keep thinking.
+- **enables the model's `reasoning_content`** by default (`chat_template_kwargs.enable_thinking=true`)
+  when the template supports it, so reasoning models like gemma-4 actually think. Set
+  `LLAMA_DISABLE_THINKING=1` to force it off if a weak model burns too many tokens.
 - **tool-call salvage** — some local models (Qwen3-Coder especially) emit tool calls as
   TEXT (`<function=Name><parameter=k>v</parameter></function>` or Hermes `<tool_call>{json}`)
   when llama.cpp's parser misses them; the upstream agent then sees no tool call and the
@@ -165,7 +165,7 @@ is emitted on stdout for the orchestrator to parse.
 | `LLAMA_MODEL` | auto-detect | force a specific upstream model id |
 | `LOCAL_MODEL_ALIAS` | `local-llama` | extra name that routes local (also: any name starting `local`) |
 | `ANTHROPIC_PASSTHROUGH_BASE` | `https://api.anthropic.com` | where non-local models are relayed |
-| `LLAMA_DISABLE_THINKING` | `1` | `0` keeps the model's reasoning_content |
+| `LLAMA_DISABLE_THINKING` | `0` | `1` forces `enable_thinking=false` |
 | `LLAMA_PROXY_LOG` | `~/.local/state/localagent/proxy.log` | proxy debug log |
 
 ## Choosing a local model — findings

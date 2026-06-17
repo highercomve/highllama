@@ -29,25 +29,27 @@ REMOTE=""                         # empty = local; "opencode-go" = remote OpenCo
 TASKS=""
 LANGS=""
 DIFFICULTY=""
+THINKING_EFFORT=""
 SERVE=0
 
 usage() {
     echo "usage: $0 --model <name> [--agent <opencode,pi|all>] [--remote opencode-go]"
-    echo "       [--ctx <size>] [--tasks <prefixes>] [--langs <list>] [--difficulty <list>] [--serve]"
+    echo "       [--ctx <size>] [--tasks <prefixes>] [--langs <list>] [--difficulty <list>] [--thinking-effort <none|low|medium|high>] [--serve]"
     exit 1
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)      MODEL="$2"; shift 2 ;;
-        --agent)      AGENTS="$2"; shift 2 ;;
-        --remote)     REMOTE="$2"; shift 2 ;;
-        --ctx)        CTX="$2"; shift 2 ;;
-        --tasks)      TASKS="$2"; shift 2 ;;
-        --langs)      LANGS="$2"; shift 2 ;;
-        --difficulty) DIFFICULTY="$2"; shift 2 ;;
-        --serve)      SERVE=1; shift ;;
-        -h|--help)    usage ;;
+        --model)            MODEL="$2"; shift 2 ;;
+        --agent)            AGENTS="$2"; shift 2 ;;
+        --remote)           REMOTE="$2"; shift 2 ;;
+        --ctx)              CTX="$2"; shift 2 ;;
+        --tasks)            TASKS="$2"; shift 2 ;;
+        --langs)            LANGS="$2"; shift 2 ;;
+        --difficulty)       DIFFICULTY="$2"; shift 2 ;;
+        --thinking-effort)  THINKING_EFFORT="$2"; shift 2 ;;
+        --serve)            SERVE=1; shift ;;
+        -h|--help)          usage ;;
         *) echo "!! unknown argument: $1"; usage ;;
     esac
 done
@@ -105,10 +107,12 @@ stop_server() {
 run_single_shot() {
     echo ""
     echo "================ single-shot code benchmark ================"
+    local thinking_args=()
+    [[ -n "$THINKING_EFFORT" ]] && thinking_args=(--thinking-effort "$THINKING_EFFORT")
     if [[ "$REMOTE" == "opencode-go" ]]; then
-        "$PY" run_code_benchmark.py --opencode-go "$MODEL" "${FILTERS[@]}"
+        "$PY" run_code_benchmark.py --opencode-go "$MODEL" "${FILTERS[@]}" "${thinking_args[@]}"
     else
-        "$PY" run_code_benchmark.py --base "$BASE" "${FILTERS[@]}"
+        "$PY" run_code_benchmark.py --base "$BASE" "${FILTERS[@]}" "${thinking_args[@]}"
     fi
 }
 

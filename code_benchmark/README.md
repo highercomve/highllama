@@ -221,6 +221,7 @@ omitted, only the single-shot benchmark runs.
 --tasks py_,rs_           only tasks whose id starts with one of these prefixes
 --temperature 0.0         sampling temp (default 0 = deterministic, closest to pass@1)
 --max-tokens 8192         generation cap (reasoning models need headroom)
+--thinking-effort none|low|medium|high  control thinking via chat_template_kwargs (OpenAI-protocol backends; ignored by Anthropic)
 --save-raw                also store the raw model output in the results json
 --out results/foo.json    custom output path (bypasses the dated default)
 --opencode-go <model-id>  sugar for --provider opencode-go --model <id>
