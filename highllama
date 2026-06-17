@@ -37,6 +37,7 @@
 #   highllama -m <model> --chat-template ./my.jinja              # override broken GGUF template
 #   highllama -m <model> --daemon                # background; logs -> journal
 #   highllama logs                              # stream daemon journal logs
+#   highllama reload -c 128k --mtp              # stop running server and restart with new flags
 #   highllama --no-embeddings                    # remove the embeddings from the server
 #                                                # model (CLS pooling, /v1/embeddings)
 #
@@ -638,6 +639,15 @@ update)
     update_llama "${2:-$(detect_backend)}"
     exit 0
     ;;
+reload)
+    shift
+    echo ">> reloading server..."
+    if ! "$SCRIPT_PATH" stop >/dev/null 2>&1; then
+        echo "!! failed to stop the existing server" >&2
+        exit 1
+    fi
+    exec "$SCRIPT_PATH" "$@"
+    ;;
 esac
 
 # ---- arg parsing ----------------------------------------------------------
@@ -726,7 +736,7 @@ if [ -n "$running" ]; then
     echo ">> A server is already running:"
     echo "   $running"
     [ -n "$rport" ] && echo ">> Endpoint: http://${HOST}:${rport}/v1"
-    echo ">> To switch models: highllama stop   (then run this again)"
+    echo ">> To switch models: highllama reload [new flags]   (or highllama stop, then run again)"
     exit 0
 fi
 
