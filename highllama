@@ -810,12 +810,16 @@ if [ -n "$DAEMON" ]; then
         exit 1
     fi
     echo ">> starting in background (logs -> journal, tag 'highllama')"
+    # the child launches detached under systemd-cat, so its command-line echo
+    # goes to the journal; have it also drop the resolved line here so we can
+    # show it on this terminal once the server is up.
+    CMDDUMP="$(mktemp "${TMPDIR:-/tmp}/highllama-cmd.XXXXXX")"
     setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
         KVTYPE="$KVTYPE" DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
         TEMPLATE="$TEMPLATE" IGNORE_TEMPLATE="${IGNORE_TEMPLATE:-}" \
         EMBED_MODEL="$EMBED_MODEL" EMBED_POOLING="${EMBED_POOLING:-}" EMBED_CTX="${EMBED_CTX:-}" \
         HOST="$HOST" PORT="$PORT" \
-        BACKEND="$BACKEND" PARALLEL="$PARALLEL" \
+        BACKEND="$BACKEND" PARALLEL="$PARALLEL" HL_CMDDUMP="$CMDDUMP" \
         systemd-cat -t highllama "$SCRIPT_PATH" ${EXTRA[@]+-- "${EXTRA[@]}"} \
         </dev/null >/dev/null 2>&1 &
     DPID=$!
@@ -823,9 +827,12 @@ if [ -n "$DAEMON" ]; then
     for _ in $(seq 1 240); do
         if ! kill -0 "$DPID" 2>/dev/null && [ -z "$(server_running)" ]; then
             echo "!! exited before the server became ready — see: journalctl -t highllama -e" >&2
+            rm -f "$CMDDUMP"
             exit 1
         fi
         if port_busy "$PORT"; then
+            if [ -s "$CMDDUMP" ]; then echo ">> llama-server:"; sed 's/^/   /' "$CMDDUMP"; fi
+            rm -f "$CMDDUMP"
             echo ">> ready: http://${HOST}:${PORT}/v1"
             echo ">> logs:  journalctl -t highllama -f"
             echo ">> stop:  highllama stop"
@@ -833,6 +840,8 @@ if [ -n "$DAEMON" ]; then
         fi
         sleep 0.5
     done
+    if [ -s "$CMDDUMP" ]; then echo ">> llama-server:"; sed 's/^/   /' "$CMDDUMP"; fi
+    rm -f "$CMDDUMP"
     echo ">> not ready after 120s (large model / first download?)"
     echo ">> follow progress: journalctl -t highllama -f"
     exit 0
@@ -904,15 +913,17 @@ if [ -n "$MTP" ]; then
         mtp_dir="$(dirname "${MODEL_ARGS[1]}")"
         mtp_sib="$(command find -L "$mtp_dir" -maxdepth 1 -type f -iname '*mtp*.gguf' 2>/dev/null |
             command grep -vF "${MODEL_ARGS[1]}" | sort | head -1 || true)"
-        if [ -z "$mtp_sib" ]; then
-            echo "!! --mtp: no 'mtp-*.gguf' draft head found next to ${MODEL_ARGS[1]}" >&2
-            echo "!!        put the MTP GGUF (e.g. mtp-<model>.gguf) in the same folder, or" >&2
-            echo "!!        use -hf <repo> so llama.cpp auto-fetches the bundled MTP head." >&2
-            exit 1
+        if [ -n "$mtp_sib" ]; then
+            # Gemma-4 style: separate 'mtp-' head sibling; pass it explicitly.
+            MTP_DRAFT="$mtp_sib"
+            SPEC_ARGS+=(-md "$mtp_sib")
+            echo ">> MTP draft (local sibling): $mtp_sib"
+        else
+            # No sibling: the MTP/nextn head is embedded in the main GGUF (e.g.
+            # unsloth Qwen3.6 MTP). llama.cpp builds the draft context against the
+            # target model itself, so no -md is needed.
+            echo ">> MTP: using the head embedded in ${MODEL_ARGS[1]}"
         fi
-        MTP_DRAFT="$mtp_sib"
-        SPEC_ARGS+=(-md "$mtp_sib")
-        echo ">> MTP draft (local sibling): $mtp_sib"
     else
         echo ">> MTP: using the bundled 'mtp-' head auto-detected from the -hf repo"
     fi
@@ -941,6 +952,7 @@ f16 | bf16) KVBITS=16 ;;
 esac
 
 NCMOE_CAP=64 # upper bound for auto-retry; refined to layer count if known
+MODE=moe     # "moe" (bump --n-cpu-moe up) or "dense" (bump -ngl down); set by estimator
 if [ -z "$NCMOE" ]; then
     case "$BACKEND" in
     metal | cpu)
@@ -960,9 +972,15 @@ if [ -z "$NCMOE" ]; then
             est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
         fi
         if [ -n "$est" ]; then
-            NCMOE="${est%% *}" # "<ncmoe> <layers>"
-            NCMOE_CAP="${est##* }"
-            echo ">> estimated n-cpu-moe=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
+            MODE="${est%% *}" # "<mode> <value> <layers>"
+            rest="${est#* }"
+            NCMOE="${rest%% *}"
+            NCMOE_CAP="${rest##* }"
+            if [ "$MODE" = "dense" ]; then
+                echo ">> dense model: offloading via -ngl=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
+            else
+                echo ">> estimated n-cpu-moe=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
+            fi
         else # fallback: context buckets
             if [ "$CONTEXT" -le 16384 ]; then
                 NCMOE=28
@@ -1086,7 +1104,8 @@ if [ -n "$USE_ROUTER" ]; then
         [ -n "$TPL_FILE" ] && printf 'chat-template-file = %s\n' "$TPL_FILE"
         if [ -n "$MTP" ]; then
             printf 'spec-type = draft-mtp\n'
-            printf 'model-draft = %s\n' "$MTP_DRAFT"
+            # empty when the MTP head is embedded in the main GGUF (no separate -md)
+            [ -n "$MTP_DRAFT" ] && printf 'model-draft = %s\n' "$MTP_DRAFT"
             printf 'spec-draft-n-max = %s\n' "$MTP_NMAX"
             printf 'n-gpu-layers-draft = 99\n'
         elif [ -n "$DRAFT" ]; then
@@ -1118,8 +1137,14 @@ if [ -n "$USE_ROUTER" ]; then
     }
     trap cleanup_router EXIT
     trap 'exit 130' INT TERM
-    "$LLAMA_BIN" --models-preset "$INI" --models-max "$MODELS_MAX" \
-        --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"} >"$RLOG" 2>&1 &
+    RCMD=(
+        "$LLAMA_BIN" --models-preset "$INI" --models-max "$MODELS_MAX"
+        --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"}
+    )
+    printf '>> llama-server (router):'; printf ' %q' "${RCMD[@]}"; printf '\n'
+    echo ">> preset INI ($INI):"; sed 's/^/   /' "$INI"
+    [ -n "${HL_CMDDUMP:-}" ] && { printf '%q ' "${RCMD[@]}"; printf '\n\n'; sed 's/^/# /' "$INI"; } >"$HL_CMDDUMP"
+    "${RCMD[@]}" >"$RLOG" 2>&1 &
     RSRV=$!
     tail -f -n +1 "$RLOG" & # stream router + child logs live
     RTAIL=$!
@@ -1154,24 +1179,34 @@ trap 'exit 130' INT TERM
 STEP=3
 while :; do
     : >"$LOG"
-    echo ">> launching with n-cpu-moe=$NCMOE ..."
-    "$LLAMA_BIN" \
-        "${MODEL_ARGS[@]}" \
-        --alias "$ALIAS" \
-        -ngl 99 \
-        --n-cpu-moe "$NCMOE" \
-        -t "$THREADS" \
-        -fa 1 \
-        -ctk "$KVTYPE" -ctv "$KVTYPE" \
-        -c "$CONTEXT" \
-        --parallel "$PARALLEL" \
-        ${MMAP_ARGS[@]+"${MMAP_ARGS[@]}"} \
-        --jinja \
-        ${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"} \
-        ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
-        --host "$HOST" --port "$PORT" \
-        ${ALLMODELS_EXTRA[@]+"${ALLMODELS_EXTRA[@]}"} \
-        ${EXTRA[@]+"${EXTRA[@]}"} >"$LOG" 2>&1 &
+    if [ "$MODE" = "dense" ]; then
+        OFFLOAD_ARGS=(-ngl "$NCMOE")
+        echo ">> launching with n-gpu-layers=$NCMOE (dense model) ..."
+    else
+        OFFLOAD_ARGS=(-ngl 99 --n-cpu-moe "$NCMOE")
+        echo ">> launching with n-cpu-moe=$NCMOE ..."
+    fi
+    CMD=(
+        "$LLAMA_BIN"
+        "${MODEL_ARGS[@]}"
+        --alias "$ALIAS"
+        "${OFFLOAD_ARGS[@]}"
+        -t "$THREADS"
+        -fa 1
+        -ctk "$KVTYPE" -ctv "$KVTYPE"
+        -c "$CONTEXT"
+        --parallel "$PARALLEL"
+        ${MMAP_ARGS[@]+"${MMAP_ARGS[@]}"}
+        --jinja
+        ${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"}
+        ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
+        --host "$HOST" --port "$PORT"
+        ${ALLMODELS_EXTRA[@]+"${ALLMODELS_EXTRA[@]}"}
+        ${EXTRA[@]+"${EXTRA[@]}"}
+    )
+    printf '>> llama-server:'; printf ' %q' "${CMD[@]}"; printf '\n'
+    [ -n "${HL_CMDDUMP:-}" ] && { printf '%q ' "${CMD[@]}"; printf '\n'; } >"$HL_CMDDUMP"
+    "${CMD[@]}" >"$LOG" 2>&1 &
     SRV=$!
     tail -f -n +1 "$LOG" & # stream server logs live (killed in cleanup; no GNU --pid)
     TAILER=$!
@@ -1205,10 +1240,19 @@ while :; do
         tail -n 15 "$LOG" >&2
         exit 1
     fi
-    NCMOE=$((NCMOE + STEP))
-    if [ "$NCMOE" -gt "$NCMOE_CAP" ]; then
-        echo "!! still OOM at max offload (n-cpu-moe=$NCMOE_CAP). Try smaller -c (context) or a smaller model." >&2
-        exit 1
+    if [ "$MODE" = "dense" ]; then
+        NCMOE=$((NCMOE - STEP))
+        if [ "$NCMOE" -lt 0 ]; then
+            echo "!! still OOM with all layers on CPU (-ngl 0). Try smaller -c (context) or a smaller model." >&2
+            exit 1
+        fi
+        echo ">> OOM — retrying with fewer GPU layers (-ngl $NCMOE)"
+    else
+        NCMOE=$((NCMOE + STEP))
+        if [ "$NCMOE" -gt "$NCMOE_CAP" ]; then
+            echo "!! still OOM at max offload (n-cpu-moe=$NCMOE_CAP). Try smaller -c (context) or a smaller model." >&2
+            exit 1
+        fi
+        echo ">> OOM — retrying with more CPU offload (n-cpu-moe=$NCMOE)"
     fi
-    echo ">> OOM — retrying with more CPU offload (n-cpu-moe=$NCMOE)"
 done
