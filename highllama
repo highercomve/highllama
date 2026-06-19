@@ -22,23 +22,23 @@
 #   macOS:  cmake -B build                                          # Metal default
 #   MLX:    pip install mlx-lm                                      # no build
 #
-# Usage:
+# Usage (run `highllama help` for the full reference; bare `highllama` shows it):
 #   highllama pull                              # browse/search HF, pick + download
 #   highllama pull qwen3 coder                  # search HF by term
 #   highllama pull unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_XL  # direct
-#   highllama                                   # interactive picker, 64k ctx
+#   highllama start                             # interactive picker, 64k ctx
 #   highllama ls                                # list local models (picker view)
-#   highllama -m unsloth/gpt-oss-20b-GGUF:Q8_0  # any HF repo:quant
-#   highllama -m /path/to/model.gguf -c 32k     # any local GGUF
-#   highllama -m <model> -c 128k --ncmoe 44     # 128k + manual offload
-#   highllama --backend mlx -m mlx-community/Qwen3-8B-4bit
-#   highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
-#   highllama -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL --mtp       # multi-token prediction
-#   highllama -m <model> --chat-template ./my.jinja              # override broken GGUF template
-#   highllama -m <model> --daemon                # background; logs -> journal
+#   highllama start -m unsloth/gpt-oss-20b-GGUF:Q8_0  # any HF repo:quant
+#   highllama start -m /path/to/model.gguf -c 32k     # any local GGUF
+#   highllama start -m <model> -c 128k --ncmoe 44     # 128k + manual offload
+#   highllama start --backend mlx -m mlx-community/Qwen3-8B-4bit
+#   highllama start -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
+#   highllama start -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL --mtp      # multi-token prediction
+#   highllama start -m <model> --chat-template ./my.jinja            # override broken GGUF template
+#   highllama start -m <model> --daemon          # background; logs -> journal
 #   highllama logs                              # stream daemon journal logs
 #   highllama reload -c 128k --mtp              # stop running server and restart with new flags
-#   highllama --no-embeddings                    # remove the embeddings from the server
+#   highllama start --no-embeddings              # remove the embeddings from the server
 #                                                # model (CLS pooling, /v1/embeddings)
 #
 # Everything is overridable by flag OR env var (flag wins):
@@ -543,8 +543,68 @@ cmd_pull() {
     pull_files "$repo" "${FILESL[$pick]}"
 }
 
-# ---- subcommands: ls / list / pull / stop / status / deps / build -----------
+# ---- help -------------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+highllama — launch ANY GGUF model on llama.cpp server (NVIDIA / AMD / Apple)
+
+USAGE:
+  highllama start [options]      start the server (interactive picker if no -m)
+  highllama <command> [args]
+
+COMMANDS:
+  start [options]    start the llama.cpp server (see START OPTIONS)
+  pull [term|repo]   browse/search Hugging Face and download a GGUF
+  ls                 list local models (numbered picker view)
+  list               list local models with sizes + full paths
+  status             show whether a server is running
+  stop               stop the running server (and systemd user unit)
+  reload [options]   stop the server and restart with new options
+  logs [args]        stream daemon logs (journalctl -t highllama)
+  deps [backend]     install build requirements (pacman/apt/dnf/zypper/brew)
+  build [backend]    clone (if needed) + cmake-build llama.cpp
+  update [backend]   git pull llama.cpp + rebuild
+  help, -h, --help   show this help
+
+START OPTIONS:
+  -m, --model <id>         local GGUF path, local substring, or HF repo:quant
+  -c, --ctx <size>         context: 32k / 64k / 128k or raw tokens (default 64k)
+      --ncmoe <n>          MoE expert layers pinned to CPU (default: auto by VRAM)
+  -t, --threads <n>        CPU threads (default: physical cores)
+      --kv <type>          KV cache quant: q4_0 | q8_0 | f16 (default q4_0)
+      --draft, -md <id>    draft model for speculative decoding
+      --mtp                multi-token prediction (draft-mtp speculative decoding)
+      --mtp-nmax <n>       MTP tokens drafted per step (default 2)
+      --chat-template <f>  override the GGUF's Jinja chat template (file path)
+      --host <addr>        bind address (default 0.0.0.0)
+      --port <n>           port (default 8089; auto-advances if busy)
+      --backend <b>        cuda|rocm|vulkan|metal|mlx|cpu (default: autodetect)
+  -d, --daemon             run in background, logs -> journal
+      --no-embeddings      don't also serve the embeddings model
+      -- <args>            pass remaining args straight to llama-server
+
+Every option is also settable via env var (flag wins):
+  MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+
+EXAMPLES:
+  highllama start                                  interactive picker, 64k ctx
+  highllama start -m unsloth/gpt-oss-20b-GGUF:Q8_0
+  highllama start -m /path/to/model.gguf -c 128k
+  highllama start -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0
+  highllama pull qwen3 coder
+  highllama reload -c 128k --mtp
+EOF
+}
+
+# ---- subcommands: start / ls / list / pull / stop / status / deps / build ----
 case "${1:-}" in
+"" | help | -h | --help)
+    usage
+    exit 0
+    ;;
+start)
+    shift # launch verb; remaining args fall through to arg parsing below
+    ;;
 ls)
     echo "Available local models:"
     if ! print_model_menu; then
@@ -646,7 +706,7 @@ reload)
         echo "!! failed to stop the existing server" >&2
         exit 1
     fi
-    exec "$SCRIPT_PATH" "$@"
+    exec "$SCRIPT_PATH" start "$@"
     ;;
 esac
 
@@ -715,7 +775,7 @@ while [ $# -gt 0 ]; do
         break
         ;;
     -h | --help)
-        sed -n '2,40p' "$0"
+        usage
         exit 0
         ;;
     *)
@@ -820,7 +880,7 @@ if [ -n "$DAEMON" ]; then
         EMBED_MODEL="$EMBED_MODEL" EMBED_POOLING="${EMBED_POOLING:-}" EMBED_CTX="${EMBED_CTX:-}" \
         HOST="$HOST" PORT="$PORT" \
         BACKEND="$BACKEND" PARALLEL="$PARALLEL" HL_CMDDUMP="$CMDDUMP" \
-        systemd-cat -t highllama "$SCRIPT_PATH" ${EXTRA[@]+-- "${EXTRA[@]}"} \
+        systemd-cat -t highllama "$SCRIPT_PATH" start ${EXTRA[@]+-- "${EXTRA[@]}"} \
         </dev/null >/dev/null 2>&1 &
     DPID=$!
     # wait for the server to come up (model load can take a while)
