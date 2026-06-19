@@ -137,6 +137,7 @@ def main():
         if args.max_length:
             total = json.dumps(conversations, ensure_ascii=False)
             if len(total) > args.max_length:
+                dropped += 1
                 continue
 
         if args.max_char_response:
