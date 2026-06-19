@@ -106,6 +106,28 @@ localagent export --latest 10 --has-tools -o latest_tool_runs.json
 localagent export --format jsonl --latest 5 2>/dev/null | jq '.conversations'
 ```
 
+### Unsloth `train_on_responses_only` pitfall
+
+When loading exported data into Unsloth with `train_on_responses_only=True`, Unsloth tokenizes the **full** conversation to locate where the response starts. If the full sequence exceeds `max_seq_length` (default 4096), the sample is silently dropped. With long agentic conversations (many tool calls, long contexts), this drops 100% of samples.
+
+**Fix: set `max_seq_length` to match your model's context window.**
+
+For models with 128k context (Claude, Llama-3-70b, etc.), set `max_seq_length=131072` in your Unsloth config. For 64k models, use 65536. Don't filter at export time — the data is what you need.
+
+```bash
+# In your Unsloth training config:
+max_seq_length = 131072  # or match your model's actual context
+
+# The exporter --max-length flag is only useful if you intentionally
+# want to cap the data, not as a workaround for a too-small config.
+```
+
+**Common context sizes:**
+- 8k → 8192
+- 32k → 32768
+- 64k → 65536
+- 128k → 131072
+
 ### Exporter Command Options
 * `--format` / `-f`: Export format — `sharegpt`, `openai`, or `jsonl`.
 * `--output` / `-o`: Output file path. If omitted, prints the JSON dataset directly to `stdout` and logs/snippets to `stderr`.
@@ -113,6 +135,8 @@ localagent export --format jsonl --latest 5 2>/dev/null | jq '.conversations'
 * `--has-tools`: Filters out non-agentic runs, exporting only sessions that called tools. Filter is `WHERE has_tool_calls = 1` in SQL.
 * `--latest N`: Exports only the N most recent conversations.
 * `--model NAME`: Restrict to a specific model id.
+* `--max-length N`: Drop conversations whose total serialized size exceeds N characters. Use this to avoid Unsloth dropping samples when `train_on_responses_only=True` and `max_seq_length` is small (e.g. 4096). Character count is a rough proxy for tokens.
+* `--max-char-response N`: Drop conversations where any assistant response exceeds N characters. More targeted — only filters by response length.
 
 ---
 

@@ -53,6 +53,21 @@ def main():
         action="store_true",
         help="Filter: Only export conversations that contain at least one tool call"
     )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=0,
+        help="Filter: Drop conversations longer than N characters (default: 0 = no limit). "
+             "Useful to avoid Unsloth dropping samples when train_on_responses_only=True "
+             "and max_seq_length is small (e.g. 4096). Rough proxy — not token-accurate."
+    )
+    parser.add_argument(
+        "--max-char-response",
+        type=int,
+        default=0,
+        help="Filter: Drop conversations where any assistant response exceeds N characters. "
+             "Helps avoid Unsloth truncation when training on responses only."
+    )
     
     args = parser.parse_args()
     
@@ -102,6 +117,7 @@ def main():
     output_path = args.output
 
     exported_data = []
+    dropped = 0
 
     for row in rows:
         timestamp, model, system, messages_json, messages_flat_json, conversations_json, tools_json, has_tool_calls = row
@@ -116,10 +132,40 @@ def main():
             if non_system_turns < args.min_turns:
                 continue
 
+        # ponytail: char-based filter — not token-accurate but good enough to avoid
+        # Unsloth dropping samples that exceed max_seq_length with train_on_responses_only
+        if args.max_length:
+            total = json.dumps(conversations, ensure_ascii=False)
+            if len(total) > args.max_length:
+                continue
+
+        if args.max_char_response:
+            too_long = any(
+                len(m.get("value", "")) > args.max_char_response
+                for m in conversations if m.get("from") in ("gpt", "assistant")
+            )
+            if too_long:
+                dropped += 1
+                continue
+
         if output_format == "sharegpt":
-            item = {"conversations": conversations}
-            if system:
-                item["system"] = system
+            # Normalize to Unsloth-compatible ShareGPT format
+            system_msg = None
+            filtered = []
+            for msg in conversations:
+                if msg.get("from") == "system":
+                    system_msg = msg.get("value")
+                else:
+                    # Map to Unsloth standard roles
+                    role = msg.get("from", "")
+                    if role in ("human", "user"):
+                        msg["from"] = "human"
+                    elif role in ("gpt", "assistant"):
+                        msg["from"] = "gpt"
+                    filtered.append(msg)
+            item = {"conversations": filtered}
+            if system_msg:
+                item["system"] = system_msg
             if tools:
                 item["tools"] = tools
             exported_data.append(item)
@@ -153,6 +199,8 @@ def main():
                 json.dump(exported_data, f, indent=2, ensure_ascii=False)
                 
         info_dest = sys.stdout
+        if dropped:
+            print(f"Filtered {dropped} conversation(s) exceeding limits (exported {len(exported_data)}).", file=info_dest)
         print(f"Successfully exported {len(exported_data)} entries to: {output_path}", file=info_dest)
     else:
         # Write to stdout
@@ -165,6 +213,8 @@ def main():
         sys.stdout.flush()
         
         info_dest = sys.stderr
+        if dropped:
+            print(f"Filtered {dropped} conversation(s) exceeding limits (exported {len(exported_data)}).", file=info_dest)
         print(f"Successfully exported {len(exported_data)} entries to stdout", file=info_dest)
             
     print(f"Format: {output_format.upper()}", file=info_dest)
