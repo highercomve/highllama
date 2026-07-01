@@ -42,7 +42,7 @@
 #                                                # model (CLS pooling, /v1/embeddings)
 #
 # Everything is overridable by flag OR env var (flag wins):
-#   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+#   MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
 #
 # MTP + embeddings together: when --mtp/--draft is set AND embeddings are on,
 # highllama serves both via llama.cpp router mode (chat model + a small embedding
@@ -65,7 +65,13 @@ MODEL="${MODEL:-}"        # empty => interactive picker (no-arg dynamic mode)
 CONTEXT="${CONTEXT:-64k}" # accepts 32k / 64k / 128k or a raw token count
 NCMOE="${NCMOE:-}"        # MoE layers pinned to CPU; empty = auto by free VRAM
 THREADS="${THREADS:-}"    # empty = physical cores. NEVER SMT count (gen collapses)
-KVTYPE="${KVTYPE:-q4_0}"  # KV cache quant: q4_0 (lean) | q8_0 (higher quality) | f16
+KVTYPE="${KVTYPE:-}"      # KV cache quant shorthand: when set, overrides both sides (q4_0|q8_0|f16)
+KVTYPE_K="${KVTYPE_K:-}"  # K-cache quant; empty => q4_0 (lean), or KVTYPE if given. set via --kv-k
+KVTYPE_V="${KVTYPE_V:-}"  # V-cache quant; empty => q8_0. V hurts quality most, so default it higher
+FA="${FA:-auto}"          # flash-attn: auto|on|off. auto keeps FA on but forces f16 KV for
+                          # head_dim>256 (quantized KV there falls back to CPU). off = non-FA path.
+DRY="${DRY:-0.8}"         # DRY sampler multiplier (loop insurance; 0 disables). penalizes repeated
+                          # token *sequences* (not single tokens) so it's safe for code. --dry <n>
 PARALLEL="${PARALLEL:-1}" # server slots. 1 = single-user (least VRAM). >1 multiplies buffers
 DRAFT="${DRAFT:-}"        # optional draft model (HF tag or path) for speculative decoding
 MTP="${MTP:-}"            # --mtp: multi-token prediction (draft-mtp speculative decoding)
@@ -571,7 +577,12 @@ START OPTIONS:
   -c, --ctx <size>         context: 32k / 64k / 128k or raw tokens (default 64k)
       --ncmoe <n>          MoE expert layers pinned to CPU (default: auto by VRAM)
   -t, --threads <n>        CPU threads (default: physical cores)
-      --kv <type>          KV cache quant: q4_0 | q8_0 | f16 (default q4_0)
+      --kv <type>          KV cache quant, both sides: q4_0 | q8_0 | f16
+      --kv-k <type>        K-cache quant only (default q4_0)
+      --kv-v <type>        V-cache quant only (default q8_0; V hurts quality most)
+      --fa <mode>          flash-attn: auto|on|off (default auto). auto forces f16 KV for
+                           head_dim>256 (quantized KV falls back to CPU); keeps FA on. off=non-FA
+      --dry <mult>         DRY sampler multiplier, anti-loop insurance (default 0.8; 0 disables)
       --draft, -md <id>    draft model for speculative decoding
       --mtp                multi-token prediction (draft-mtp speculative decoding)
       --mtp-nmax <n>       MTP tokens drafted per step (default 2)
@@ -584,7 +595,7 @@ START OPTIONS:
       -- <args>            pass remaining args straight to llama-server
 
 Every option is also settable via env var (flag wins):
-  MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+  MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
 
 EXAMPLES:
   highllama start                                  interactive picker, 64k ctx
@@ -733,6 +744,22 @@ while [ $# -gt 0 ]; do
         KVTYPE="$2"
         shift 2
         ;;
+    --kv-k)
+        KVTYPE_K="$2"
+        shift 2
+        ;;
+    --kv-v)
+        KVTYPE_V="$2"
+        shift 2
+        ;;
+    --fa)
+        FA="$2"
+        shift 2
+        ;;
+    --dry)
+        DRY="$2"
+        shift 2
+        ;;
     --draft | -md)
         DRAFT="$2"
         shift 2
@@ -787,6 +814,11 @@ done
 
 [ -n "$BACKEND" ] || BACKEND="$(detect_backend)"
 [ -n "$THREADS" ] || THREADS="$(physical_cores)"
+# Precedence: --kv-k/--kv-v (per side) > --kv (both sides) > defaults (k=q4_0, v=q8_0).
+# V-cache quant degrades quality more than K, so V defaults higher. Resolve to
+# concrete per-side types so everything downstream (estimate, preset, launch) is explicit.
+KVTYPE_K="${KVTYPE_K:-${KVTYPE:-q4_0}}"
+KVTYPE_V="${KVTYPE_V:-${KVTYPE:-q8_0}}"
 echo ">> backend=$BACKEND"
 
 # ---- if a server is already up, just report it and exit -------------------
@@ -875,7 +907,8 @@ if [ -n "$DAEMON" ]; then
     # show it on this terminal once the server is up.
     CMDDUMP="$(mktemp "${TMPDIR:-/tmp}/highllama-cmd.XXXXXX")"
     setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
-        KVTYPE="$KVTYPE" DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
+        KVTYPE="$KVTYPE" KVTYPE_K="$KVTYPE_K" KVTYPE_V="$KVTYPE_V" FA="$FA" DRY="$DRY" \
+        DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
         TEMPLATE="$TEMPLATE" IGNORE_TEMPLATE="${IGNORE_TEMPLATE:-}" \
         EMBED_MODEL="$EMBED_MODEL" EMBED_POOLING="${EMBED_POOLING:-}" EMBED_CTX="${EMBED_CTX:-}" \
         HOST="$HOST" PORT="$PORT" \
@@ -992,6 +1025,83 @@ elif [ -n "$DRAFT" ]; then
     SPEC_ARGS+=(-ngld 99 --spec-draft-n-max 16 --spec-draft-n-min 0)
 fi
 
+# ---- flash-attention resolution -------------------------------------------
+# The *quantized*-KV FA kernel (vec path) only supports head_dim <= 256. With a
+# quantized KV cache, a larger head_dim (e.g. gemma4's 512) makes -fa silently
+# fall back to CPU attention: the GPU sits ~idle and prompt processing collapses
+# ~20x. The f16 FA kernel (mma/tensor-core path) DOES support head_dim 512/576
+# and is both faster and lighter (no O(n^2) score matrix). So 'auto' probes
+# head_dim and, when it exceeds 256, forces f16 KV while KEEPING FA on.
+# (--fa off also works but uses the slower non-FA GPU path; it too needs f16 KV.)
+detect_head_dim() {
+    [ "${MODEL_ARGS[0]}" = "-m" ] || return 0   # only local files are probable
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "${MODEL_ARGS[1]}" <<'PY' 2>/dev/null
+import sys,struct
+try:
+    f=open(sys.argv[1],'rb'); f.read(4); struct.unpack('<I',f.read(4)); struct.unpack('<Q',f.read(8))
+    n_kv=struct.unpack('<Q',f.read(8))[0]
+    def rs():
+        n=struct.unpack('<Q',f.read(8))[0]; return f.read(n).decode('utf-8','replace')
+    def rv(t):
+        if t==8: return rs()
+        if t==9:
+            et=struct.unpack('<I',f.read(4))[0]; ln=struct.unpack('<Q',f.read(8))[0]; return [rv(et) for _ in range(ln)]
+        fm={0:'B',1:'b',2:'H',3:'h',4:'I',5:'i',6:'f',7:'?',10:'Q',11:'q',12:'d'}[t]
+        return struct.unpack('<'+fm,f.read(struct.calcsize(fm)))[0]
+    kv={}
+    for _ in range(n_kv):
+        k=rs(); t=struct.unpack('<I',f.read(4))[0]; v=rv(t)
+        if not (isinstance(v,list) and len(v)>64): kv[k]=v
+    def g(sfx):
+        for k in kv:
+            if k.endswith(sfx): return kv[k]
+        return None
+    kl=g('.attention.key_length')
+    if kl is None:
+        ed=g('.embedding_length'); nh=g('.attention.head_count')
+        kl=ed//nh if (ed and nh) else None
+    if kl: print(int(kl))
+except Exception:
+    pass
+PY
+}
+
+FA_ON=1
+FORCE_F16=0   # head_dim>256 (quantized KV -> CPU fallback) or FA off -> KV must be f16
+case "$FA" in
+on)  FA_ON=1 ;;
+off) FA_ON=0; FORCE_F16=1 ;;
+auto)
+    HEAD_DIM="$(detect_head_dim)"
+    if [ -n "$HEAD_DIM" ] && [ "$HEAD_DIM" -gt 256 ] 2>/dev/null; then
+        FORCE_F16=1   # keep FA on: the f16 mma kernel handles head_dim 512/576 on-GPU
+        echo ">> flash-attn: head_dim=$HEAD_DIM > 256 -> forcing f16 KV (quantized KV would fall back to CPU)"
+    fi
+    ;;
+*)
+    echo "!! --fa must be auto|on|off (got '$FA')" >&2; exit 1 ;;
+esac
+
+# f16 KV is required both when FA is off and for the large-head_dim FA (mma) path.
+if [ "$FORCE_F16" = 1 ]; then
+    if { [ "$KVTYPE_K" != f16 ] || [ "$KVTYPE_V" != f16 ]; }; then
+        echo ">> forcing f16 KV cache (was k=$KVTYPE_K/v=$KVTYPE_V)"
+    fi
+    KVTYPE_K=f16
+    KVTYPE_V=f16
+fi
+
+# ---- sampler defaults (loop insurance) ------------------------------------
+# DRY penalizes repeated token *sequences* (with default sequence breakers so
+# normal code structure isn't punished) — the right backstop against the
+# degenerate <think></think> / repeat loops. Set as server defaults; any client
+# request that specifies its own dry_multiplier overrides these.
+SAMPLER_ARGS=()
+if [ -n "$DRY" ] && [ "$DRY" != 0 ] && [ "$DRY" != 0.0 ]; then
+    SAMPLER_ARGS=(--dry-multiplier "$DRY" --dry-base 1.75 --dry-allowed-length 2)
+fi
+
 # ---- free the GPU ---------------------------------------------------------
 if command -v lms >/dev/null 2>&1; then
     echo ">> Unloading LM Studio models to free VRAM..."
@@ -1003,13 +1113,17 @@ gpu_status "$BACKEND"
 
 # ---- smart expert-offload estimate (model + free-VRAM + context aware) ------
 # KV bits-per-element for the chosen cache type (used to size the KV reserve).
-case "$KVTYPE" in
-q4_0 | q4_1 | iq4_nl) KVBITS=4.5 ;;
-q5_0 | q5_1) KVBITS=5.5 ;;
-q8_0) KVBITS=8.5 ;;
-f16 | bf16) KVBITS=16 ;;
-*) KVBITS=16 ;;
-esac
+# K and V each hold half the cache, so average their per-side bits.
+kv_bits() {
+    case "$1" in
+    q4_0 | q4_1 | iq4_nl) echo 4.5 ;;
+    q5_0 | q5_1) echo 5.5 ;;
+    q8_0) echo 8.5 ;;
+    f16 | bf16) echo 16 ;;
+    *) echo 16 ;;
+    esac
+}
+KVBITS="$(awk -v k="$(kv_bits "$KVTYPE_K")" -v v="$(kv_bits "$KVTYPE_V")" 'BEGIN{print (k+v)/2}')"
 
 NCMOE_CAP=64 # upper bound for auto-retry; refined to layer count if known
 MODE=moe     # "moe" (bump --n-cpu-moe up) or "dense" (bump -ngl down); set by estimator
@@ -1089,7 +1203,8 @@ fi
 
 if [ -n "$MTP" ]; then MTP_DESC="draft-mtp n-max=$MTP_NMAX"; else MTP_DESC="none"; fi
 echo ">> model=$MODEL"
-echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  draft=${DRAFT:-none}  mtp=$MTP_DESC"
+if [ "$KVTYPE_K" = "$KVTYPE_V" ]; then KV_DESC="$KVTYPE_K"; else KV_DESC="k=$KVTYPE_K/v=$KVTYPE_V"; fi
+echo ">> context=$CONTEXT  threads=$THREADS  kv=$KV_DESC  fa=$([ "$FA_ON" = 1 ] && echo on || echo off)  dry=${DRY:-off}  parallel=$PARALLEL  draft=${DRAFT:-none}  mtp=$MTP_DESC"
 echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
 cd "$LLAMA_DIR"
 
@@ -1154,11 +1269,16 @@ if [ -n "$USE_ROUTER" ]; then
         printf 'n-gpu-layers = 99\n'
         printf 'n-cpu-moe = %s\n' "$NCMOE"
         printf 'threads = %s\n' "$THREADS"
-        printf 'flash-attn = on\n'
-        printf 'cache-type-k = %s\n' "$KVTYPE"
-        printf 'cache-type-v = %s\n' "$KVTYPE"
+        printf 'flash-attn = %s\n' "$([ "$FA_ON" = 1 ] && echo on || echo off)"
+        printf 'cache-type-k = %s\n' "$KVTYPE_K"
+        printf 'cache-type-v = %s\n' "$KVTYPE_V"
         printf 'ctx-size = %s\n' "$CONTEXT"
         printf 'parallel = %s\n' "$PARALLEL"
+        if [ "${#SAMPLER_ARGS[@]}" -gt 0 ]; then
+            printf 'dry-multiplier = %s\n' "$DRY"
+            printf 'dry-base = 1.75\n'
+            printf 'dry-allowed-length = 2\n'
+        fi
         [ "$BACKEND" != "metal" ] && printf 'no-mmap = true\n'
         printf 'jinja = true\n'
         [ -n "$TPL_FILE" ] && printf 'chat-template-file = %s\n' "$TPL_FILE"
@@ -1252,10 +1372,11 @@ while :; do
         --alias "$ALIAS"
         "${OFFLOAD_ARGS[@]}"
         -t "$THREADS"
-        -fa 1
-        -ctk "$KVTYPE" -ctv "$KVTYPE"
+        -fa "$FA_ON"
+        -ctk "$KVTYPE_K" -ctv "$KVTYPE_V"
         -c "$CONTEXT"
         --parallel "$PARALLEL"
+        ${SAMPLER_ARGS[@]+"${SAMPLER_ARGS[@]}"}
         ${MMAP_ARGS[@]+"${MMAP_ARGS[@]}"}
         --jinja
         ${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"}
