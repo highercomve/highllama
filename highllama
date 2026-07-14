@@ -42,7 +42,7 @@
 #                                                # model (CLS pooling, /v1/embeddings)
 #
 # Everything is overridable by flag OR env var (flag wins):
-#   MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+#   MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
 #
 # MTP + embeddings together: when --mtp/--draft is set AND embeddings are on,
 # highllama serves both via llama.cpp router mode (chat model + a small embedding
@@ -65,10 +65,17 @@ MODEL="${MODEL:-}"        # empty => interactive picker (no-arg dynamic mode)
 CONTEXT="${CONTEXT:-64k}" # accepts 32k / 64k / 128k or a raw token count
 NCMOE="${NCMOE:-}"        # MoE layers pinned to CPU; empty = auto by free VRAM
 THREADS="${THREADS:-}"    # empty = physical cores. NEVER SMT count (gen collapses)
-KVTYPE="${KVTYPE:-q4_0}"  # KV cache quant: q4_0 (lean) | q8_0 (higher quality) | f16
+KVTYPE="${KVTYPE:-}"      # KV cache quant shorthand: when set, overrides both sides (q4_0|q8_0|f16)
+KVTYPE_K="${KVTYPE_K:-}"  # K-cache quant; empty => q8_0, or KVTYPE if given. set via --kv-k
+KVTYPE_V="${KVTYPE_V:-}"  # V-cache quant; empty => q8_0 (symmetric: FA kernels need k==v). --kv-v
+FA="${FA:-auto}"          # flash-attn: auto|on|off. auto keeps FA on; KV defaults to symmetric
+                          # q8_0 (mismatched k/v falls back to CPU). off = non-FA path (needs f16).
+DRY="${DRY:-0.8}"         # DRY sampler multiplier (loop insurance; 0 disables). penalizes repeated
+                          # token *sequences* (not single tokens) so it's safe for code. --dry <n>
 PARALLEL="${PARALLEL:-1}" # server slots. 1 = single-user (least VRAM). >1 multiplies buffers
 DRAFT="${DRAFT:-}"        # optional draft model (HF tag or path) for speculative decoding
-MTP="${MTP:-}"            # --mtp: multi-token prediction (draft-mtp speculative decoding)
+MTP="${MTP:-auto}"        # multi-token prediction: auto|on|off. auto enables it when a
+                          # local model ships an MTP head (mtp- sibling or embedded nextn)
 MTP_NMAX="${MTP_NMAX:-2}" # MTP tokens drafted per step (unsloth recommends 2; try 1-6)
 TEMPLATE="${TEMPLATE:-}"  # --chat-template: override the GGUF's Jinja chat template (file path)
 HOST="${HOST:-0.0.0.0}"   # 0.0.0.0 = reachable from other machines on the LAN
@@ -571,9 +578,16 @@ START OPTIONS:
   -c, --ctx <size>         context: 32k / 64k / 128k or raw tokens (default 64k)
       --ncmoe <n>          MoE expert layers pinned to CPU (default: auto by VRAM)
   -t, --threads <n>        CPU threads (default: physical cores)
-      --kv <type>          KV cache quant: q4_0 | q8_0 | f16 (default q4_0)
+      --kv <type>          KV cache quant, both sides: q8_0 (default) | q4_0 | f16
+      --kv-k <type>        K-cache quant only (default q8_0; keep symmetric with -v)
+      --kv-v <type>        V-cache quant only (default q8_0; FA kernels need k==v)
+      --fa <mode>          flash-attn: auto|on|off (default auto). auto keeps FA on; KV
+                           defaults to symmetric q8_0 (mismatched k/v -> CPU). off=non-FA (f16)
+      --dry <mult>         DRY sampler multiplier, anti-loop insurance (default 0.8; 0 disables)
       --draft, -md <id>    draft model for speculative decoding
-      --mtp                multi-token prediction (draft-mtp speculative decoding)
+      --mtp                force multi-token prediction on (default: auto — on when
+                           the model ships an MTP head: mtp- sibling or embedded nextn)
+      --no-mtp             disable MTP even if the model has a head
       --mtp-nmax <n>       MTP tokens drafted per step (default 2)
       --chat-template <f>  override the GGUF's Jinja chat template (file path)
       --host <addr>        bind address (default 0.0.0.0)
@@ -584,7 +598,7 @@ START OPTIONS:
       -- <args>            pass remaining args straight to llama-server
 
 Every option is also settable via env var (flag wins):
-  MODEL CONTEXT NCMOE THREADS KVTYPE DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+  MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
 
 EXAMPLES:
   highllama start                                  interactive picker, 64k ctx
@@ -733,12 +747,32 @@ while [ $# -gt 0 ]; do
         KVTYPE="$2"
         shift 2
         ;;
+    --kv-k)
+        KVTYPE_K="$2"
+        shift 2
+        ;;
+    --kv-v)
+        KVTYPE_V="$2"
+        shift 2
+        ;;
+    --fa)
+        FA="$2"
+        shift 2
+        ;;
+    --dry)
+        DRY="$2"
+        shift 2
+        ;;
     --draft | -md)
         DRAFT="$2"
         shift 2
         ;;
     --mtp)
-        MTP=1
+        MTP=on
+        shift
+        ;;
+    --no-mtp)
+        MTP=off
         shift
         ;;
     --mtp-nmax)
@@ -787,6 +821,15 @@ done
 
 [ -n "$BACKEND" ] || BACKEND="$(detect_backend)"
 [ -n "$THREADS" ] || THREADS="$(physical_cores)"
+# Precedence: --kv-k/--kv-v (per side) > --kv (both sides) > default (q8_0 both).
+# The KV cache defaults SYMMETRIC (k==v): CUDA flash-attn kernels are only built
+# for matching k/v types unless GGML_CUDA_FA_ALL_QUANTS is set (it isn't here), so
+# a mismatched cache returns no GPU kernel and attention falls back to CPU (~14x
+# slower prefill). q8_0 is near-lossless and half the VRAM of f16, which keeps
+# more layers/experts on GPU at long context. Resolve to concrete per-side types
+# so everything downstream (estimate, preset, launch) is explicit.
+KVTYPE_K="${KVTYPE_K:-${KVTYPE:-q8_0}}"
+KVTYPE_V="${KVTYPE_V:-${KVTYPE:-q8_0}}"
 echo ">> backend=$BACKEND"
 
 # ---- if a server is already up, just report it and exit -------------------
@@ -875,7 +918,8 @@ if [ -n "$DAEMON" ]; then
     # show it on this terminal once the server is up.
     CMDDUMP="$(mktemp "${TMPDIR:-/tmp}/highllama-cmd.XXXXXX")"
     setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
-        KVTYPE="$KVTYPE" DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
+        KVTYPE="$KVTYPE" KVTYPE_K="$KVTYPE_K" KVTYPE_V="$KVTYPE_V" FA="$FA" DRY="$DRY" \
+        DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
         TEMPLATE="$TEMPLATE" IGNORE_TEMPLATE="${IGNORE_TEMPLATE:-}" \
         EMBED_MODEL="$EMBED_MODEL" EMBED_POOLING="${EMBED_POOLING:-}" EMBED_CTX="${EMBED_CTX:-}" \
         HOST="$HOST" PORT="$PORT" \
@@ -956,40 +1000,151 @@ case "${MODEL_ARGS[0]}" in
 esac
 
 # ---- optional speculative decoding ---------------------------------------
-# --mtp (multi-token prediction) and --draft both configure a draft model, so
-# they are mutually exclusive. MTP runs the draft head against the target model
-# via llama.cpp's draft-mtp speculative type.
-SPEC_ARGS=()
-MTP_DRAFT="" # resolved local mtp- head path (also reused by router mode)
-if [ -n "$MTP" ]; then
-    if [ -n "$DRAFT" ]; then
+# MTP (multi-token prediction) and --draft both configure a draft model, so they
+# are mutually exclusive. MTP runs the draft head against the target model via
+# llama.cpp's draft-mtp speculative type. MTP mode is auto|on|off (default auto):
+# 'auto' enables it whenever a LOCAL model actually ships an MTP head and stays
+# off otherwise; 'on' (--mtp) forces it; 'off' (--no-mtp) disables it.
+
+# Does the main GGUF carry an *embedded* MTP/nextn head? Models like unsloth
+# Qwen3.6 advertise a `.nextn_predict_layers` key; most (incl. gemma-4 chat
+# GGUFs, whose MTP head ships as a separate 'mtp-*.gguf' sibling) do not.
+# Requesting draft-mtp against a model with no embedded head makes llama.cpp
+# abort at load ("context type MTP requested but model doesn't contain MTP
+# layers"). Prints "1" only when an embedded head is present.
+model_has_embedded_mtp() {
+    [ "${MODEL_ARGS[0]}" = "-m" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "${MODEL_ARGS[1]}" <<'PY' 2>/dev/null
+import sys,struct
+try:
+    f=open(sys.argv[1],'rb'); f.read(4); struct.unpack('<I',f.read(4)); struct.unpack('<Q',f.read(8))
+    n_kv=struct.unpack('<Q',f.read(8))[0]
+    def rs():
+        n=struct.unpack('<Q',f.read(8))[0]; return f.read(n).decode('utf-8','replace')
+    def rv(t):
+        if t==8: return rs()
+        if t==9:
+            et=struct.unpack('<I',f.read(4))[0]; ln=struct.unpack('<Q',f.read(8))[0]; return [rv(et) for _ in range(ln)]
+        fm={0:'B',1:'b',2:'H',3:'h',4:'I',5:'i',6:'f',7:'?',10:'Q',11:'q',12:'d'}[t]
+        return struct.unpack('<'+fm,f.read(struct.calcsize(fm)))[0]
+    for _ in range(n_kv):
+        k=rs(); t=struct.unpack('<I',f.read(4))[0]; v=rv(t)
+        if 'nextn' in k or k.endswith('.nextn_predict_layers'):
+            print(1); break
+        if k.startswith('tokenizer.'): break
+except Exception:
+    pass
+PY
+}
+
+# Normalize the MTP intent (accepts legacy MTP=1/0 too). MTP is rewritten below
+# to the resolved flag downstream code checks: "" = off, 1 = on.
+case "$MTP" in
+1 | on | true | yes) MTP_MODE=on ;;
+0 | off | no | false) MTP_MODE=off ;;
+*) MTP_MODE=auto ;;
+esac
+if [ "$MTP_MODE" != off ] && [ -n "$DRAFT" ]; then
+    # --draft configures its own draft model. An explicit --mtp alongside it is a
+    # conflict; in auto mode, defer to the explicit draft model.
+    if [ "$MTP_MODE" = on ]; then
         echo "!! --mtp and --draft are mutually exclusive (both set up the draft model)" >&2
         exit 1
     fi
-    SPEC_ARGS=(--spec-type draft-mtp --spec-draft-n-max "$MTP_NMAX" -ngld 99)
+    MTP_MODE=off
+fi
+
+SPEC_ARGS=()
+MTP="" # resolved flag: "" = off, 1 = on (set only when a usable head is found)
+MTP_DRAFT="" # resolved local mtp- head path (also reused by router mode)
+if [ "$MTP_MODE" != off ]; then
+    # Find an MTP head: a separate 'mtp-*.gguf' sibling (gemma-4 style) or one
+    # embedded in the main GGUF (unsloth Qwen3.6, `nextn` metadata). We can only
+    # probe LOCAL files; for -hf repos we can't without downloading.
+    mtp_sib=""
+    embedded=""
     if [ "${MODEL_ARGS[0]}" = "-m" ]; then
-        # Local file: llama.cpp only auto-discovers the bundled "mtp-" sibling on
-        # the -hf path, so locate it ourselves and pass it explicitly with -md.
         mtp_dir="$(dirname "${MODEL_ARGS[1]}")"
         mtp_sib="$(command find -L "$mtp_dir" -maxdepth 1 -type f -iname '*mtp*.gguf' 2>/dev/null |
             command grep -vF "${MODEL_ARGS[1]}" | sort | head -1 || true)"
-        if [ -n "$mtp_sib" ]; then
-            # Gemma-4 style: separate 'mtp-' head sibling; pass it explicitly.
-            MTP_DRAFT="$mtp_sib"
-            SPEC_ARGS+=(-md "$mtp_sib")
-            echo ">> MTP draft (local sibling): $mtp_sib"
-        else
-            # No sibling: the MTP/nextn head is embedded in the main GGUF (e.g.
-            # unsloth Qwen3.6 MTP). llama.cpp builds the draft context against the
-            # target model itself, so no -md is needed.
-            echo ">> MTP: using the head embedded in ${MODEL_ARGS[1]}"
-        fi
-    else
-        echo ">> MTP: using the bundled 'mtp-' head auto-detected from the -hf repo"
+        [ -z "$mtp_sib" ] && [ "$(model_has_embedded_mtp)" = 1 ] && embedded=1
     fi
-elif [ -n "$DRAFT" ]; then
+
+    if [ -n "$mtp_sib" ]; then
+        # llama.cpp only auto-discovers the bundled 'mtp-' sibling on the -hf path,
+        # so for a local file locate it ourselves and pass it explicitly with -md.
+        MTP=1
+        MTP_DRAFT="$mtp_sib"
+        SPEC_ARGS=(--spec-type draft-mtp --spec-draft-n-max "$MTP_NMAX" -ngld 99 -md "$mtp_sib")
+        echo ">> MTP: draft head (local sibling) $mtp_sib"
+    elif [ -n "$embedded" ]; then
+        # Embedded head: llama.cpp builds the draft context against the target
+        # model itself, so no -md is needed.
+        MTP=1
+        SPEC_ARGS=(--spec-type draft-mtp --spec-draft-n-max "$MTP_NMAX" -ngld 99)
+        echo ">> MTP: using the head embedded in ${MODEL_ARGS[1]}"
+    elif [ "${MODEL_ARGS[0]}" != "-m" ] && [ "$MTP_MODE" = on ]; then
+        # -hf repo: can't probe cheaply. Only trust it when explicitly forced on;
+        # rely on llama.cpp to auto-discover the repo's 'mtp-' sibling.
+        MTP=1
+        SPEC_ARGS=(--spec-type draft-mtp --spec-draft-n-max "$MTP_NMAX" -ngld 99)
+        echo ">> MTP: relying on the 'mtp-' head auto-detected from the -hf repo"
+    elif [ "$MTP_MODE" = on ]; then
+        # Explicitly requested but no head found on a local model. Rather than let
+        # llama.cpp abort at load, serve without MTP — it's a decode-speed
+        # optimization only, so output is unaffected.
+        echo "!! MTP requested but $(basename "${MODEL_ARGS[1]}") has no MTP head (no 'mtp-*.gguf' sibling, no embedded nextn head) — disabling MTP" >&2
+    fi
+    # auto + no head (local or -hf): silently stays off.
+fi
+
+if [ -z "$MTP" ] && [ -n "$DRAFT" ]; then
     if [ -f "$DRAFT" ]; then SPEC_ARGS=(-md "$DRAFT"); else SPEC_ARGS=(--hf-repo-draft "$DRAFT"); fi
     SPEC_ARGS+=(-ngld 99 --spec-draft-n-max 16 --spec-draft-n-min 0)
+fi
+
+# ---- flash-attention resolution -------------------------------------------
+FA_ON=1
+FORCE_F16=0   # --fa off (non-FA GPU path) can't use a quantized KV cache
+case "$FA" in
+on)  FA_ON=1 ;;
+off) FA_ON=0; FORCE_F16=1 ;;
+auto) FA_ON=1 ;;
+*)
+    echo "!! --fa must be auto|on|off (got '$FA')" >&2; exit 1 ;;
+esac
+
+# KV cache type resolution:
+#  - --fa off (non-FA GPU path): llama.cpp requires an f16 KV cache.
+#  - flash-attn on: the CUDA FA kernels are only built for a SYMMETRIC cache
+#    (k==v: f16/f16, q4_0/q4_0, q8_0/q8_0, bf16/bf16) unless GGML_CUDA_FA_ALL_QUANTS
+#    is set (it isn't). A mismatched k/v cache returns no GPU kernel and attention
+#    falls back to CPU -> prompt processing collapses ~14x (measured 112 vs 1551
+#    t/s at 256k). The default is already symmetric q8_0; this only fires if an
+#    explicit per-side --kv-k/--kv-v disagree. Large head_dim (e.g. gemma4's 512)
+#    is fine either way: it runs on the f16 mma kernel, which dequantizes a
+#    quantized cache on read and stays on GPU.
+if [ "$FORCE_F16" = 1 ]; then
+    if { [ "$KVTYPE_K" != f16 ] || [ "$KVTYPE_V" != f16 ]; }; then
+        echo ">> --fa off: forcing f16 KV cache (was k=$KVTYPE_K/v=$KVTYPE_V)"
+    fi
+    KVTYPE_K=f16
+    KVTYPE_V=f16
+elif [ "$FA_ON" = 1 ] && [ "$KVTYPE_K" != "$KVTYPE_V" ]; then
+    echo ">> flash-attn needs a symmetric KV cache on this build -> using q8_0/q8_0 (was k=$KVTYPE_K/v=$KVTYPE_V; mismatched k/v falls back to CPU)"
+    KVTYPE_K=q8_0
+    KVTYPE_V=q8_0
+fi
+
+# ---- sampler defaults (loop insurance) ------------------------------------
+# DRY penalizes repeated token *sequences* (with default sequence breakers so
+# normal code structure isn't punished) — the right backstop against the
+# degenerate <think></think> / repeat loops. Set as server defaults; any client
+# request that specifies its own dry_multiplier overrides these.
+SAMPLER_ARGS=()
+if [ -n "$DRY" ] && [ "$DRY" != 0 ] && [ "$DRY" != 0.0 ]; then
+    SAMPLER_ARGS=(--dry-multiplier "$DRY" --dry-base 1.75 --dry-allowed-length 2)
 fi
 
 # ---- free the GPU ---------------------------------------------------------
@@ -1003,13 +1158,17 @@ gpu_status "$BACKEND"
 
 # ---- smart expert-offload estimate (model + free-VRAM + context aware) ------
 # KV bits-per-element for the chosen cache type (used to size the KV reserve).
-case "$KVTYPE" in
-q4_0 | q4_1 | iq4_nl) KVBITS=4.5 ;;
-q5_0 | q5_1) KVBITS=5.5 ;;
-q8_0) KVBITS=8.5 ;;
-f16 | bf16) KVBITS=16 ;;
-*) KVBITS=16 ;;
-esac
+# K and V each hold half the cache, so average their per-side bits.
+kv_bits() {
+    case "$1" in
+    q4_0 | q4_1 | iq4_nl) echo 4.5 ;;
+    q5_0 | q5_1) echo 5.5 ;;
+    q8_0) echo 8.5 ;;
+    f16 | bf16) echo 16 ;;
+    *) echo 16 ;;
+    esac
+}
+KVBITS="$(awk -v k="$(kv_bits "$KVTYPE_K")" -v v="$(kv_bits "$KVTYPE_V")" 'BEGIN{print (k+v)/2}')"
 
 NCMOE_CAP=64 # upper bound for auto-retry; refined to layer count if known
 MODE=moe     # "moe" (bump --n-cpu-moe up) or "dense" (bump -ngl down); set by estimator
@@ -1089,7 +1248,8 @@ fi
 
 if [ -n "$MTP" ]; then MTP_DESC="draft-mtp n-max=$MTP_NMAX"; else MTP_DESC="none"; fi
 echo ">> model=$MODEL"
-echo ">> context=$CONTEXT  threads=$THREADS  kv=$KVTYPE  parallel=$PARALLEL  draft=${DRAFT:-none}  mtp=$MTP_DESC"
+if [ "$KVTYPE_K" = "$KVTYPE_V" ]; then KV_DESC="$KVTYPE_K"; else KV_DESC="k=$KVTYPE_K/v=$KVTYPE_V"; fi
+echo ">> context=$CONTEXT  threads=$THREADS  kv=$KV_DESC  fa=$([ "$FA_ON" = 1 ] && echo on || echo off)  dry=${DRY:-off}  parallel=$PARALLEL  draft=${DRAFT:-none}  mtp=$MTP_DESC"
 echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
 cd "$LLAMA_DIR"
 
@@ -1151,14 +1311,27 @@ if [ -n "$USE_ROUTER" ]; then
     {
         printf '[%s]\n' "$ALIAS"
         printf 'model = %s\n' "${MODEL_ARGS[1]}"
-        printf 'n-gpu-layers = 99\n'
-        printf 'n-cpu-moe = %s\n' "$NCMOE"
+        # Honor the estimator's offload decision (mirrors the non-router path):
+        # dense models offload via -ngl (n-cpu-moe is a no-op there), MoE models
+        # keep all layers on GPU and push experts to CPU via n-cpu-moe. Hardcoding
+        # n-gpu-layers=99 for a dense model ignores the estimate and OOMs.
+        if [ "$MODE" = "dense" ]; then
+            printf 'n-gpu-layers = %s\n' "$NCMOE"
+        else
+            printf 'n-gpu-layers = 99\n'
+            printf 'n-cpu-moe = %s\n' "$NCMOE"
+        fi
         printf 'threads = %s\n' "$THREADS"
-        printf 'flash-attn = on\n'
-        printf 'cache-type-k = %s\n' "$KVTYPE"
-        printf 'cache-type-v = %s\n' "$KVTYPE"
+        printf 'flash-attn = %s\n' "$([ "$FA_ON" = 1 ] && echo on || echo off)"
+        printf 'cache-type-k = %s\n' "$KVTYPE_K"
+        printf 'cache-type-v = %s\n' "$KVTYPE_V"
         printf 'ctx-size = %s\n' "$CONTEXT"
         printf 'parallel = %s\n' "$PARALLEL"
+        if [ "${#SAMPLER_ARGS[@]}" -gt 0 ]; then
+            printf 'dry-multiplier = %s\n' "$DRY"
+            printf 'dry-base = 1.75\n'
+            printf 'dry-allowed-length = 2\n'
+        fi
         [ "$BACKEND" != "metal" ] && printf 'no-mmap = true\n'
         printf 'jinja = true\n'
         [ -n "$TPL_FILE" ] && printf 'chat-template-file = %s\n' "$TPL_FILE"
@@ -1252,10 +1425,11 @@ while :; do
         --alias "$ALIAS"
         "${OFFLOAD_ARGS[@]}"
         -t "$THREADS"
-        -fa 1
-        -ctk "$KVTYPE" -ctv "$KVTYPE"
+        -fa "$FA_ON"
+        -ctk "$KVTYPE_K" -ctv "$KVTYPE_V"
         -c "$CONTEXT"
         --parallel "$PARALLEL"
+        ${SAMPLER_ARGS[@]+"${SAMPLER_ARGS[@]}"}
         ${MMAP_ARGS[@]+"${MMAP_ARGS[@]}"}
         --jinja
         ${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"}
