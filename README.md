@@ -55,8 +55,8 @@ highllama -m unsloth/gpt-oss-20b-GGUF:Q8_0   # any HF repo:quant (cached)
 highllama -m qwen3-coder -c 128k             # fuzzy-match a local GGUF
 highllama -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec decoding
 highllama -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL --mtp       # multi-token prediction
-highllama -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL -c 160k    # head_dim=512: --fa auto picks f16 KV, stays on-GPU
-highllama -m <model> --kv-v q8_0 --dry 0                    # per-side KV quant; disable the DRY sampler
+highllama -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL -c 160k    # head_dim=512: symmetric q8_0 KV, stays on-GPU
+highllama -m <model> --kv q4_0 --dry 0                      # leaner symmetric KV; disable the DRY sampler
 highllama -m <model> --chat-template ./fixed.jinja          # override a broken GGUF template
 highllama --backend mlx -m mlx-community/Qwen3-8B-4bit      # MLX on macOS
 highllama ls                                 # list local models (picker view)
@@ -83,18 +83,20 @@ highllama update                             # git pull llama.cpp + rebuild for 
   `gguf-estimate.py` sizes `--n-cpu-moe` so weights + KV cache + compute
   buffers fit. On OOM the launcher retries with more CPU offload automatically.
   Unified-memory backends (Metal) skip offload and use mmap.
-- **Defaults:** 64k context, KV cache `k=q4_0`/`v=q8_0`, flash attention (auto),
+- **Defaults:** 64k context, symmetric `q8_0` KV cache, flash attention (auto),
   DRY anti-loop sampler (0.8), threads = physical cores (never SMT — it collapses
   generation speed).
-- **Flash-attn & KV precision:** `--fa auto|on|off` (default `auto`). Some models
-  use a large `head_dim` (e.g. Gemma 4 = 512) that the CUDA *quantized*-KV
-  flash-attn kernel doesn't support — with a quantized KV cache `-fa` silently
-  falls back to CPU attention and prompt processing collapses ~20× (GPU sits
-  idle). `auto` probes `head_dim` from the GGUF and, when it exceeds 256, forces
-  an **f16 KV cache** (which uses the on-GPU tensor-core FA path) while keeping FA
-  on. Sliding-window models (Gemma) keep f16 KV small, so 128k–160k still fits a
-  12 GB card fully on-GPU. Set KV quant per side with `--kv-k` / `--kv-v`
-  (defaults `q4_0` / `q8_0`; V precision matters more) or both with `--kv`.
+- **Flash-attn & KV precision:** `--fa auto|on|off` (default `auto`, FA on). The KV
+  cache defaults to **symmetric `q8_0`** because the CUDA flash-attn kernels are
+  only built for a matching k/v type (`f16/f16`, `q4_0/q4_0`, `q8_0/q8_0`, …)
+  unless `GGML_CUDA_FA_ALL_QUANTS` is set — a *mismatched* cache returns no GPU
+  kernel and attention falls back to CPU, collapsing prompt processing ~14× (GPU
+  sits idle). Symmetric `q8_0` is near-lossless, half the VRAM of `f16`, and runs
+  on-GPU even for large `head_dim` (Gemma 4 = 512, via the f16 mma kernel that
+  dequantizes on read) — so more layers/experts stay resident at long context.
+  Override with `--kv q4_0` (leaner) or `--kv f16` (max precision); `--fa off`
+  uses the non-FA path and forces `f16`. Keep any per-side `--kv-k`/`--kv-v`
+  symmetric.
 - **Anti-loop insurance (DRY):** `--dry <mult>` / `DRY=` (default 0.8; `0`
   disables) sets a server-side DRY sampler that penalizes repeated token
   *sequences* — the backstop against degenerate `<think></think>` / repeat loops.
