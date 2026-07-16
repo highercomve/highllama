@@ -24,7 +24,8 @@ set -euo pipefail
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"   # follow the ~/.local/bin symlink
 HERE="$(cd "$(dirname "$SELF")" && pwd)"
 PROXY_PY="$HERE/proxy.py"
-PROXY_HOST="${LLAMA_PROXY_HOST:-127.0.0.1}"
+LISTEN_HOST="${LLAMA_PROXY_HOST:-0.0.0.0}"   # bind addr: 0.0.0.0 = reachable from LAN
+PROXY_HOST="127.0.0.1"                        # host we curl/connect to locally
 PROXY_PORT="${LLAMA_PROXY_PORT:-8090}"
 PROXY_URL="http://$PROXY_HOST:$PROXY_PORT"
 LLAMA_BASE="${LLAMA_BASE:-http://127.0.0.1:8089}"
@@ -51,8 +52,8 @@ proxy_start() {
   command -v python3 >/dev/null || die "python3 not found"
   curl -s --max-time 3 "$LLAMA_BASE/v1/models" >/dev/null 2>&1 \
     || echo "$(c_red warn:) llama-server not reachable at $LLAMA_BASE (start it with highllama)" >&2
-  echo "starting proxy: $PROXY_URL -> $LLAMA_BASE"
-  LLAMA_PROXY_HOST="$PROXY_HOST" LLAMA_PROXY_PORT="$PROXY_PORT" \
+  echo "starting proxy: $PROXY_URL (bind $LISTEN_HOST:$PROXY_PORT) -> $LLAMA_BASE"
+  LLAMA_PROXY_HOST="$LISTEN_HOST" LLAMA_PROXY_PORT="$PROXY_PORT" \
   LLAMA_BASE="$LLAMA_BASE" LLAMA_PROXY_LOG="$PROXY_LOG" \
     setsid nohup python3 "$PROXY_PY" >>"$PROXY_LOG" 2>&1 < /dev/null &
   echo $! > "$PIDFILE"

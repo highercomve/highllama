@@ -5,6 +5,7 @@ dataset_full.json
 *.db
 *.db-shm
 *.db-wal
+.env
 
 # Python cache
 __pycache__/

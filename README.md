@@ -96,7 +96,13 @@ highllama update                             # git pull llama.cpp + rebuild for 
   dequantizes on read) — so more layers/experts stay resident at long context.
   Override with `--kv q4_0` (leaner) or `--kv f16` (max precision); `--fa off`
   uses the non-FA path and forces `f16`. Keep any per-side `--kv-k`/`--kv-v`
-  symmetric.
+  symmetric. When no `--kv` is given and q8_0 would push weights (or the MTP
+  head) off the GPU, highllama auto-steps the cache down to q4_0 — but ONLY
+  when that restores full GPU offload (gemma-4-12B @64k on a 12GB 4070:
+  74 → 104 t/s). It never trades KV precision for a merely-partial win: q4_0
+  KV on an already-4-bit QAT model can cause repetition loops. The startup
+  probe also checks the response for degenerate (looping) output and refuses
+  to record it as a speed baseline. Pass `--kv q8_0` to pin the cache type.
 - **Anti-loop insurance (DRY):** `--dry <mult>` / `DRY=` (default 0.8; `0`
   disables) sets a server-side DRY sampler that penalizes repeated token
   *sequences* — the backstop against degenerate `<think></think>` / repeat loops.
@@ -107,8 +113,22 @@ highllama update                             # git pull llama.cpp + rebuild for 
   (e.g. Gemma 4). With `-hf <repo>` the bundled `mtp-` head is auto-fetched; with
   a local file, drop the `mtp-*.gguf` next to the model and it's picked up. Tune
   drafted tokens with `--mtp-nmax N` / `MTP_NMAX=` (default 2; try 1–6). MTP
-  reserves ~2 GB extra VRAM, which the offload estimate accounts for. Mutually
-  exclusive with `--draft`.
+  reserves ~2 GB extra VRAM, which the offload estimate accounts for — and in
+  `auto` mode MTP self-disables whenever that reserve would push model layers
+  off the GPU (losing layers costs far more decode speed than MTP recovers).
+  Mutually exclusive with `--draft`.
+- **Speed guarantees:** three layers of protection against silently-slow
+  launches. (1) When the requested context forces weights off the GPU, a loud
+  `DEGRADED OFFLOAD` banner shows the rough speed cost and the largest `-c`
+  that still fits fully on GPU. (2) Every start ends with a ~5 s decode probe
+  (`>> measured decode: N t/s`); the best result per (model, GPU, ctx band) is
+  kept in `~/.config/highllama/speed.tsv`, and a launch below
+  `PROBE_REGRESS_PCT` (default 70%) of best prints a `SPEED REGRESSION` banner
+  with both configs. Opt out with `--no-probe` / `PROBE=0`. (3)
+  `highllama tune -m <model> [-c <ctx>]` measures candidate configs for real
+  (MTP on/off when the model fully fits; nearby offload values when it
+  doesn't) and persists the winner — future `start`s apply it automatically,
+  with explicit flags still winning.
 - **MTP + embeddings at once:** speculative decoding (causal) and embeddings
   (pooled) can't share one model context, so when `--mtp`/`--draft` is active and
   embeddings are on, highllama switches to llama.cpp **router mode** — the chat
@@ -125,7 +145,8 @@ highllama update                             # git pull llama.cpp + rebuild for 
   with `--chat-template <file>` / `TEMPLATE=`, or disable the auto-fix with
   `IGNORE_TEMPLATE=1`.
 - Everything is a flag or env var: `MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K
-  KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND`;
+  KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+  PROBE PROBE_REGRESS_PCT HL_STATE`;
   extra args after `--` go straight to `llama-server`.
 
 ## localagent

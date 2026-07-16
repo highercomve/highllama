@@ -129,6 +129,17 @@ class TestFlattenContent(unittest.TestCase):
         self.assertIn("<tool_call>", out)
         self.assertIn(" after", out)
 
+    def test_thinking_blocks(self):
+        content = [
+            {"type": "thinking", "thinking": "why not this"},
+            {"type": "redacted_thinking", "data": "opaque_signature"},
+            {"type": "text", "text": "final answer"}
+        ]
+        out = ap._flatten_content(content)
+        self.assertIn("<thinking>\nwhy not this\n</thinking>", out)
+        self.assertIn("<redacted_thinking>\nopaque_signature\n</redacted_thinking>", out)
+        self.assertIn("final answer", out)
+
 
 class TestBuildDatasetItem(unittest.TestCase):
     def _build(self, **overrides):
@@ -247,6 +258,18 @@ class TestBuildDatasetItem(unittest.TestCase):
         self.assertEqual(item["system"], "part1 part2")
         self.assertEqual(item["conversations"][0], {"from": "system", "value": "part1 part2"})
 
+    def test_openai_messages_flat_reasoning(self):
+        # OpenAI style message with reasoning_content
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "final reply", "reasoning_content": "some thought"}
+        ]
+        flat = ap._openai_messages_flat(messages)
+        self.assertEqual(flat[0], {"role": "user", "content": "hello"})
+        self.assertEqual(flat[1]["role"], "assistant")
+        self.assertIn("<thinking>\nsome thought\n</thinking>", flat[1]["content"])
+        self.assertIn("final reply", flat[1]["content"])
+
 
 class TestResolveDatasetPaths(unittest.TestCase):
     def test_explicit_env_wins(self):
@@ -329,6 +352,27 @@ class TestSSEResponseReconstructor(unittest.TestCase):
         r.feed_line(b"data: {not json\n")
         r.feed_line(b"data: [DONE]\n")
         self.assertEqual(r.get_content(), [])
+
+    def test_reconstructs_thinking_blocks(self):
+        r = ap.SSEAssistantResponseReconstructor()
+        # Test standard thinking
+        r.feed_line(b'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}\n\n')
+        r.feed_line(b'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thinking flow "}}\n\n')
+        r.feed_line(b'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"continues"}}\n\n')
+        r.feed_line(b'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_abc"}}\n\n')
+        
+        # Test redacted thinking
+        r.feed_line(b'data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":""}}\n\n')
+        r.feed_line(b'data: {"type":"content_block_delta","index":1,"delta":{"type":"redacted_thinking_delta","data":"opaque_123"}}\n\n')
+        
+        # Test final text response
+        r.feed_line(b'data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":"hello"}}\n\n')
+        
+        out = r.get_content()
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0], {"type": "thinking", "thinking": "thinking flow continues", "signature": "sig_abc"})
+        self.assertEqual(out[1], {"type": "redacted_thinking", "data": "opaque_123"})
+        self.assertEqual(out[2], {"type": "text", "text": "hello"})
 
 
 class TestEnsureSchema(unittest.TestCase):
@@ -450,6 +494,37 @@ class TestWriterIntegration(unittest.TestCase):
         rows = self._wait_for_row("SELECT has_tool_calls FROM dataset_calls")
         self.assertIsNotNone(rows, "writer never produced a row")
         self.assertEqual(rows[0][0], 1)
+
+    def test_openai_stream_reasoning_integration(self):
+        body = {
+            "model": "test-model-reasoning",
+            "messages": [{"role": "user", "content": "solve math"}],
+        }
+        # Simulate OpenAI SSE stream chunks containing reasoning_content
+        raw_stream = (
+            b'data: {"choices": [{"delta": {"reasoning_content": "let us think about "}}]}\n'
+            b'data: {"choices": [{"delta": {"reasoning_content": "the solution"}}]}\n'
+            b'data: {"choices": [{"delta": {"content": " 42"}}]}\n'
+            b"data: [DONE]\n"
+        )
+        ap._enqueue_dataset({
+            "type": "openai_stream",
+            "body": body,
+            "raw_bytes": raw_stream,
+        })
+        
+        rows = self._wait_for_row("SELECT messages_flat, conversations FROM dataset_calls WHERE model = 'test-model-reasoning'")
+        self.assertIsNotNone(rows, "writer never produced a row")
+        
+        # Check messages_flat
+        flat = json.loads(rows[0][0])
+        self.assertEqual(flat[-1]["role"], "assistant")
+        self.assertIn("<thinking>\nlet us think about the solution\n</thinking>\n 42", flat[-1]["content"])
+        
+        # Check conversations
+        conv = json.loads(rows[0][1])
+        self.assertEqual(conv[-1]["from"], "gpt")
+        self.assertIn("<thinking>\nlet us think about the solution\n</thinking>\n 42", conv[-1]["value"])
 
 
 @unittest.skipUnless(
@@ -602,8 +677,53 @@ class TestExporterHFRoundTrip(unittest.TestCase):
         self.assertEqual(m[-1]["content"][0]["name"], "Bash")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class TestOpenCodeRouting(unittest.TestCase):
+    def test_model_matching_with_prefix(self):
+        # Known openai model in provider dict
+        model, proto = ap.get_opencode_model_and_protocol("opencode-go/kimi-k2.7-code")
+        self.assertEqual(model, "kimi-k2.7-code")
+        self.assertEqual(proto, "openai")
+
+        # Known anthropic model in provider dict
+        model, proto = ap.get_opencode_model_and_protocol("opencode-qwen3.7-max")
+        self.assertEqual(model, "qwen3.7-max")
+        self.assertEqual(proto, "anthropic")
+
+        # Unknown model starting with opencode- (should fallback to openai by default)
+        model, proto = ap.get_opencode_model_and_protocol("opencode-go/new-unknown-model")
+        self.assertEqual(model, "new-unknown-model")
+        self.assertEqual(proto, "openai")
+
+        # Unknown model starting with opencode- containing qwen (should fallback to anthropic)
+        model, proto = ap.get_opencode_model_and_protocol("opencode-new-qwen-model")
+        self.assertEqual(model, "new-qwen-model")
+        self.assertEqual(proto, "anthropic")
+
+        # No prefix but exists in dict
+        model, proto = ap.get_opencode_model_and_protocol("kimi-k2.7-code")
+        self.assertEqual(model, "kimi-k2.7-code")
+        self.assertEqual(proto, "openai")
+
+        # No prefix and doesn't exist in dict
+        model, proto = ap.get_opencode_model_and_protocol("other-random-model")
+        self.assertIsNone(model)
+        self.assertIsNone(proto)
+
+    def test_load_dotenv(self):
+        # Test that load_dotenv reads k=v lines
+        with tempfile.TemporaryDirectory() as d:
+            dotenv_path = os.path.join(d, ".env")
+            with open(dotenv_path, "w") as f:
+                f.write("TEST_ENV_VAR_X = val_x\n")
+                f.write("# comment line\n")
+                f.write("TEST_ENV_VAR_Y='val_y'\n")
+            
+            with mock.patch("os.path.abspath") as mock_abs:
+                mock_abs.return_value = os.path.join(d, "proxy.py")
+                ap.load_dotenv()
+                
+            self.assertEqual(os.environ.get("TEST_ENV_VAR_X"), "val_x")
+            self.assertEqual(os.environ.get("TEST_ENV_VAR_Y"), "val_y")
 
 
 if __name__ == "__main__":

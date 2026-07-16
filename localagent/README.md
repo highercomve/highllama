@@ -158,15 +158,21 @@ The machine-readable footer line `::localagent:: repo=… branch=… diff=… tr
 is emitted on stdout for the orchestrator to parse.
 
 ## Config (env)
+
+All of the environment variables below can optionally be loaded from a `.env` file placed in the `localagent/` directory.
+
 | var | default | meaning |
 |-----|---------|---------|
 | `LLAMA_BASE` | `http://127.0.0.1:8089` | upstream llama-server |
 | `LLAMA_PROXY_PORT` | `8090` | proxy listen port |
+| `LLAMA_PROXY_HOST` | `0.0.0.0` | proxy bind addr (LAN-reachable; set `127.0.0.1` for local-only) |
 | `LLAMA_MODEL` | auto-detect | force a specific upstream model id |
 | `LOCAL_MODEL_ALIAS` | `local-llama` | extra name that routes local (also: any name starting `local`) |
 | `ANTHROPIC_PASSTHROUGH_BASE` | `https://api.anthropic.com` | where non-local models are relayed |
 | `LLAMA_DISABLE_THINKING` | `0` | `1` forces `enable_thinking=false` |
 | `LLAMA_PROXY_LOG` | `~/.local/state/localagent/proxy.log` | proxy debug log |
+| `OPENCODE_API_KEY` | empty | API key / subscription token for OpenCode Go frontier models |
+| `OPENCODE_PASSTHROUGH_BASE` | `https://opencode.ai/zen/go` | upstream base endpoint URL for OpenCode Go models |
 
 ## Choosing a local model — findings
 

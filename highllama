@@ -38,6 +38,7 @@
 #   highllama start -m <model> --daemon          # background; logs -> journal
 #   highllama logs                              # stream daemon journal logs
 #   highllama reload -c 128k --mtp              # stop running server and restart with new flags
+#   highllama restart                           # stop + start with the same settings as last start
 #   highllama start --no-embeddings              # remove the embeddings from the server
 #                                                # model (CLS pooling, /v1/embeddings)
 #
@@ -70,8 +71,9 @@ KVTYPE_K="${KVTYPE_K:-}"  # K-cache quant; empty => q8_0, or KVTYPE if given. se
 KVTYPE_V="${KVTYPE_V:-}"  # V-cache quant; empty => q8_0 (symmetric: FA kernels need k==v). --kv-v
 FA="${FA:-auto}"          # flash-attn: auto|on|off. auto keeps FA on; KV defaults to symmetric
                           # q8_0 (mismatched k/v falls back to CPU). off = non-FA path (needs f16).
-DRY="${DRY:-0.8}"         # DRY sampler multiplier (loop insurance; 0 disables). penalizes repeated
-                          # token *sequences* (not single tokens) so it's safe for code. --dry <n>
+DRY="${DRY:-0}"           # DRY sampler multiplier (0 = off, the default). NOT safe for agentic
+                          # use: long verbatim literals (file paths, UUIDs) have no sequence
+                          # breakers, so DRY forces typos when the model retypes them. --dry <n>
 PARALLEL="${PARALLEL:-1}" # server slots. 1 = single-user (least VRAM). >1 multiplies buffers
 DRAFT="${DRAFT:-}"        # optional draft model (HF tag or path) for speculative decoding
 MTP="${MTP:-auto}"        # multi-token prediction: auto|on|off. auto enables it when a
@@ -88,6 +90,9 @@ ALLMODELS_EXTRA=()
 MODELS_DIR="${MODELS_DIR:-$HOME/.lmstudio/models}" # router-mode model root (one-level subdirs)
 MODELS_MAX="${MODELS_MAX:-2}"                      # router-mode: max models loaded c
 EMBED_MODEL="${EMBED_MODEL:-}"                     # embedding model (path/substring) for MTP+embeddings router; auto-discovered if empty
+HL_STATE="${HL_STATE:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/speed.tsv}" # measured-speed state (probe baselines + tuned configs)
+PROBE="${PROBE:-1}"       # startup decode-speed probe: 1 = on (--no-probe / PROBE=0 to skip)
+PROBE_REGRESS_PCT="${PROBE_REGRESS_PCT:-70}" # warn when measured decode falls below this % of best-known
 
 # Where local GGUFs live: LM Studio models + llama.cpp/HF download caches
 # + Unsloth Studio (legacy HF cache, fine-tune exports/outputs; its main
@@ -252,6 +257,457 @@ server_running() {
     [ -n "$pid" ] || pid="$(pgrep -f 'mlx_lm.server|mlx_lm server' 2>/dev/null | head -1 || true)"
     [ -n "$pid" ] || return 0
     ps -o args= -p "$pid" 2>/dev/null || true
+}
+
+# ---- speed state + probe helpers (F: guaranteed-fastest startup) ------------
+# Measured decode speeds live in $HL_STATE (TSV, human-editable). Two kinds:
+#   best  — fastest decode ever measured for (alias, gpu, ctx bucket); the
+#           startup probe warns when a launch falls below PROBE_REGRESS_PCT of it
+#   tune  — config winner persisted by `highllama tune`; `start` applies it
+#           unless the user passed an explicit flag for the same knob
+
+# KV bits-per-element for the chosen cache type (used to size the KV reserve).
+# K and V each hold half the cache, so average their per-side bits.
+kv_bits() {
+    case "$1" in
+    q4_0 | q4_1 | iq4_nl) echo 4.5 ;;
+    q5_0 | q5_1) echo 5.5 ;;
+    q8_0) echo 8.5 ;;
+    f16 | bf16) echo 16 ;;
+    *) echo 16 ;;
+    esac
+}
+
+# Does a GGUF carry an *embedded* MTP/nextn head? Models like unsloth Qwen3.6
+# advertise a `.nextn_predict_layers` key; most (incl. gemma-4 chat GGUFs,
+# whose MTP head ships as a separate 'mtp-*.gguf' sibling) do not. Requesting
+# draft-mtp against a model with no embedded head makes llama.cpp abort at
+# load ("context type MTP requested but model doesn't contain MTP layers").
+# Prints "1" only when an embedded head is present. Defaults to the resolved
+# -m model; `tune` passes an explicit path.
+model_has_embedded_mtp() { # [gguf-path]
+    local f="${1:-}"
+    if [ -z "$f" ]; then
+        [ "${MODEL_ARGS[0]:-}" = "-m" ] || return 0
+        f="${MODEL_ARGS[1]}"
+    fi
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$f" <<'PY' 2>/dev/null
+import sys,struct
+try:
+    f=open(sys.argv[1],'rb'); f.read(4); struct.unpack('<I',f.read(4)); struct.unpack('<Q',f.read(8))
+    n_kv=struct.unpack('<Q',f.read(8))[0]
+    def rs():
+        n=struct.unpack('<Q',f.read(8))[0]; return f.read(n).decode('utf-8','replace')
+    def rv(t):
+        if t==8: return rs()
+        if t==9:
+            et=struct.unpack('<I',f.read(4))[0]; ln=struct.unpack('<Q',f.read(8))[0]; return [rv(et) for _ in range(ln)]
+        fm={0:'B',1:'b',2:'H',3:'h',4:'I',5:'i',6:'f',7:'?',10:'Q',11:'q',12:'d'}[t]
+        return struct.unpack('<'+fm,f.read(struct.calcsize(fm)))[0]
+    for _ in range(n_kv):
+        k=rs(); t=struct.unpack('<I',f.read(4))[0]; v=rv(t)
+        if 'nextn' in k or k.endswith('.nextn_predict_layers'):
+            print(1); break
+        if k.startswith('tokenizer.'): break
+except Exception:
+    pass
+PY
+}
+
+gpu_name() { # stable hardware key for the state file (underscored, no tabs)
+    local n=""
+    case "$BACKEND" in
+    cuda) n="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)" ;;
+    rocm) n="$(rocm-smi --showproductname --csv 2>/dev/null | tail -1 | cut -d, -f2)" ;;
+    metal | mlx) n="$(sysctl -n machdep.cpu.brand_string 2>/dev/null)" ;;
+    esac
+    [ -n "$n" ] || n="$BACKEND"
+    printf '%s\n' "$n" | tr ' ,\t' '___'
+}
+
+ctx_bucket() { # token count -> canonical band, so 60k and 64k share one record
+    local c="$1" b
+    for b in 16384 32768 65536 131072 262144; do
+        [ "$c" -le "$b" ] && { echo "$b"; return; }
+    done
+    echo "$c"
+}
+
+state_get() { # <kind> <alias> <gpu> <bucket> -> "config<TAB>tps<TAB>date" or nothing
+    [ -f "$HL_STATE" ] || return 0
+    awk -F'\t' -v k="$1" -v a="$2" -v g="$3" -v b="$4" \
+        '$1==k && $2==a && $3==g && $4==b {print $5 "\t" $6 "\t" $7; exit}' "$HL_STATE"
+}
+
+state_put() { # <kind> <alias> <gpu> <bucket> <config> <tps> — replaces the key's line
+    local dir tmp
+    dir="$(dirname "$HL_STATE")"
+    mkdir -p "$dir"
+    [ -f "$HL_STATE" ] || printf '# highllama speed state v1\n# kind\talias\tgpu\tctx_bucket\tconfig\ttps\tdate\n' >"$HL_STATE"
+    tmp="$(mktemp "$dir/.speed.XXXXXX")"
+    awk -F'\t' -v k="$1" -v a="$2" -v g="$3" -v b="$4" \
+        '!($1==k && $2==a && $3==g && $4==b)' "$HL_STATE" >"$tmp"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$(date +%Y-%m-%d)" >>"$tmp"
+    mv "$tmp" "$HL_STATE"
+}
+
+state_del() { # <kind> <alias> <gpu> <bucket>
+    [ -f "$HL_STATE" ] || return 0
+    local tmp
+    tmp="$(mktemp "$(dirname "$HL_STATE")/.speed.XXXXXX")"
+    awk -F'\t' -v k="$1" -v a="$2" -v g="$3" -v b="$4" \
+        '!($1==k && $2==a && $3==g && $4==b)' "$HL_STATE" >"$tmp"
+    mv "$tmp" "$HL_STATE"
+}
+
+wait_api_ready() { # <port> [timeout_s] — /health 200s only once the model is loaded
+    local port="$1" t="${2:-300}" _
+    for _ in $(seq 1 $((t * 2))); do
+        curl -fsS --max-time 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+probe_decode_tps() { # <port> <alias> [n_predict] -> decode t/s, or nothing if unusable
+    # prose prompt on purpose: trivially-predictable output (number sequences)
+    # inflates speculative-decoding acceptance and reports a t/s no real
+    # workload sees
+    local port="$1" alias="$2" n="${3:-64}" resp
+    resp="$(curl -sS --max-time 180 "http://127.0.0.1:$port/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d '{"model":"'"$alias"'","messages":[{"role":"user","content":"Explain how a bicycle drivetrain transfers power from the pedals to the rear wheel."}],"temperature":0,"top_k":1,"max_tokens":'"$n"',"stream":false}' \
+        2>/dev/null)" || return 0
+    [ -n "$resp" ] || return 0
+    printf '%s' "$resp" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    t = d.get("timings") or {}
+    n = t.get("predicted_n") or (d.get("usage") or {}).get("completion_tokens") or 0
+    tps = t.get("predicted_per_second") or 0
+    if n < 2:
+        raise SystemExit
+    if not tps or tps > 5000:  # llama.cpp emits a bogus 1e6 rate on some paths
+        ms = t.get("predicted_ms") or 0
+        if not ms:
+            raise SystemExit
+        tps = n / ms * 1000.0
+    if not (0 < tps < 5000):
+        raise SystemExit
+    # degenerate-output check: a repetition loop generates FAST, so speed alone
+    # would record garbage as a best. Low distinct-4-gram ratio = looping.
+    flag = ""
+    try:
+        words = ((d.get("choices") or [{}])[0].get("message") or {}).get("content", "").split()
+        if len(words) >= 24:
+            grams = [tuple(words[i:i+4]) for i in range(len(words) - 3)]
+            if len(set(grams)) / len(grams) < 0.4:
+                flag = " loop"
+    except Exception:
+        pass
+    print(f"{tps:.1f}{flag}")
+except Exception:
+    pass
+' 2>/dev/null
+}
+
+max_full_fit_ctx() { # <model> <free_mib> <parallel> <kv_bits> <req_ctx> -> largest ctx that fully fits, or nothing
+    local m="$1" free="$2" par="$3" kvb="$4" hi="$5" lo=4096 mid out
+    out="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "$m" "$free" "$lo" "$par" "$kvb" 2>/dev/null || true)"
+    case "$out" in "moe 0 "*) ;; *) return 0 ;; esac # doesn't fit even at 4k
+    while [ $((hi - lo)) -gt 2048 ]; do
+        mid=$(((lo + hi) / 2 / 1024 * 1024))
+        [ "$mid" -le "$lo" ] && break
+        out="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "$m" "$free" "$mid" "$par" "$kvb" 2>/dev/null || true)"
+        case "$out" in "moe 0 "*) lo="$mid" ;; *) hi="$mid" ;; esac
+    done
+    echo "$lo"
+}
+
+warn_partial_offload() { # $1 = full-fit ctx tip ("" = nothing fits); uses MODE NCMOE NCMOE_CAP CONTEXT
+    local tip="$1" pct
+    {
+        echo "!! ------------------------------------------------------------------"
+        if [ "$MODE" = "dense" ]; then
+            # decode is memory-bound: speed tracks the GPU-resident weight
+            # fraction, roughly squared (measured 4070: 38/48->60%, 23/48->22%)
+            pct="$(awk -v n="$NCMOE" -v c="$NCMOE_CAP" 'BEGIN{f=n/(c+1); printf "%d", f*f*100}')"
+            echo "!! DEGRADED OFFLOAD: $NCMOE of $NCMOE_CAP layers on GPU (ctx=$CONTEXT)"
+            echo "!! rough decode estimate: ~${pct}% of full-offload speed"
+            if [ -n "$tip" ]; then
+                echo "!! tip: -c $tip keeps the whole model on GPU at full speed"
+            else
+                echo "!! even at 4k ctx the model does not fit — use a smaller quant or model"
+            fi
+        else
+            # MoE: CPU-side experts are sparsely activated, so the dense speed
+            # model doesn't apply — expert offload is the normal way to run a
+            # big MoE, just note the knob instead of crying wolf
+            echo "!! PARTIAL OFFLOAD: $NCMOE of $NCMOE_CAP MoE expert layers on CPU (ctx=$CONTEXT)"
+            if [ -n "$tip" ]; then
+                echo "!! tip: -c $tip keeps all experts on GPU at full speed"
+            else
+                echo "!! a smaller -c frees VRAM for more experts on GPU (faster decode)"
+            fi
+        fi
+        echo "!! ------------------------------------------------------------------"
+    } | tee -a "${HL_PROBEDUMP:-/dev/null}"
+    return 0
+}
+
+probe_say() { # echo + relay to the daemon parent's dump file when present
+    echo "$1"
+    [ -n "${HL_PROBEDUMP:-}" ] && echo "$1" >>"$HL_PROBEDUMP"
+    return 0
+}
+
+run_probe_and_guard() { # <port> <alias> — measure decode t/s, track best, warn on regression
+    local port="$1" alias="$2"
+    [ "$PROBE" = 1 ] || return 0
+    if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        probe_say ">> probe skipped (needs curl + python3)"
+        return 0
+    fi
+    if ! wait_api_ready "$port" 300; then
+        probe_say ">> probe skipped (API not ready after 300s)"
+        return 0
+    fi
+    local tps gpu bucket cfg rec best bcfg bdate
+    tps="$(probe_decode_tps "$port" "$alias" 64)"
+    if [ -z "$tps" ]; then
+        probe_say ">> probe skipped (no valid timing from server)"
+        return 0
+    fi
+    case "$tps" in
+    *" loop")
+        tps="${tps%% *}"
+        probe_say "!! ------------------------------------------------------------------"
+        probe_say "!! DEGENERATE OUTPUT: probe response is a repetition loop (${tps} t/s of garbage)"
+        probe_say "!! likely causes: KV cache quantized too hard (try --kv q8_0) or sampler settings"
+        probe_say "!! ------------------------------------------------------------------"
+        return 0 # do not record a looping run as a speed baseline
+        ;;
+    esac
+    probe_say ">> measured decode: ${tps} t/s"
+    gpu="$(gpu_name)"
+    bucket="$(ctx_bucket "$CONTEXT")"
+    cfg="mode=${MODE:-?};off=${NCMOE:-?};mtp=${MTP:-0};kv=${KVTYPE_K:-?};fa=$([ "${FA_ON:-1}" = 1 ] && echo on || echo off)"
+    rec="$(state_get best "$alias" "$gpu" "$bucket")"
+    if [ -z "$rec" ]; then
+        state_put best "$alias" "$gpu" "$bucket" "$cfg" "$tps"
+        probe_say ">> speed baseline recorded: ${tps} t/s ($HL_STATE)"
+        return 0
+    fi
+    best="$(printf '%s' "$rec" | cut -f2)"
+    bcfg="$(printf '%s' "$rec" | cut -f1)"
+    bdate="$(printf '%s' "$rec" | cut -f3)"
+    if awk -v a="$tps" -v b="$best" 'BEGIN{exit !(a > b)}'; then
+        state_put best "$alias" "$gpu" "$bucket" "$cfg" "$tps"
+        probe_say ">> new best decode for this model/GPU/ctx: ${tps} t/s (was ${best})"
+    elif awk -v a="$tps" -v b="$best" -v p="$PROBE_REGRESS_PCT" 'BEGIN{exit !(a < b * p / 100)}'; then
+        {
+            echo "!! ------------------------------------------------------------------"
+            echo "!! SPEED REGRESSION: ${tps} t/s vs best-known ${best} t/s ($bdate)"
+            echo "!! best config was: $bcfg"
+            echo "!! this run:        $cfg"
+            echo "!! (threshold ${PROBE_REGRESS_PCT}%; delete the 'best' line in $HL_STATE to reset)"
+            echo "!! ------------------------------------------------------------------"
+        } | tee -a "${HL_PROBEDUMP:-/dev/null}"
+    fi
+    return 0 # a probe is telemetry — never let it fail the launch (set -e)
+}
+
+# ---- `highllama tune`: measure candidate configs, persist the winner --------
+# Launches the real `start` path per candidate (same pattern as
+# speed_benchmark/bench.sh), probes decode t/s over 3 short generations, and
+# records the winner in $HL_STATE so future `start`s apply it automatically.
+cmd_tune() {
+    local model="${MODEL:-}" ctx="${CONTEXT:-64k}"
+    local fwd=("$@") args=("$@")
+    # light scan for -m/-c; the full arg list is still forwarded verbatim
+    local i=0
+    while [ "$i" -lt "$#" ]; do
+        case "${args[$i]}" in
+        -m | --model)
+            model="${args[$((i + 1))]}"
+            i=$((i + 2))
+            ;;
+        -c | --ctx)
+            ctx="${args[$((i + 1))]}"
+            i=$((i + 2))
+            ;;
+        *) i=$((i + 1)) ;;
+        esac
+    done
+    if [ -z "$model" ]; then
+        echo "!! tune needs -m <model> (no interactive picker here)" >&2
+        exit 1
+    fi
+    ctx="$(to_tokens "$ctx")"
+    if ! [[ "$ctx" =~ ^[0-9]+$ ]]; then
+        echo "!! invalid context size (use e.g. 32k, 64k, or a number)" >&2
+        exit 1
+    fi
+    local path=""
+    if [ -f "$model" ]; then path="$model"; else path="$(resolve_local_gguf "$model")"; fi
+    if [ -z "$path" ]; then
+        echo "!! tune needs a local GGUF — download it first: $0 pull" >&2
+        exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        echo "!! tune needs python3 + curl" >&2
+        exit 1
+    fi
+    BACKEND="${BACKEND:-$(detect_backend)}"
+
+    local alias gpu bucket
+    alias="$(basename "$path")"
+    alias="${alias%.gguf}"
+    gpu="$(gpu_name)"
+    bucket="$(ctx_bucket "$ctx")"
+
+    # MTP head available? (separate mtp-*.gguf sibling or embedded nextn head)
+    local has_head=""
+    if [ -n "$(command find -L "$(dirname "$path")" -maxdepth 1 -type f -iname '*mtp*.gguf' 2>/dev/null |
+        command grep -vF "$path" | head -1 || true)" ]; then
+        has_head=1
+    elif [ "$(model_has_embedded_mtp "$path")" = 1 ]; then
+        has_head=1
+    fi
+
+    # pre-estimate on a clean GPU to shape the candidate matrix: a running
+    # server (or LM Studio) would otherwise hold the VRAM and skew it
+    "$SCRIPT_PATH" stop >/dev/null 2>&1 || true
+    if command -v lms >/dev/null 2>&1; then
+        lms unload --all >/dev/null 2>&1 || true
+        sleep 1
+    fi
+    local free kvb est mode val rest
+    free="$(free_vram_mib "$BACKEND")"
+    kvb="$(kv_bits "${KVTYPE_K:-${KVTYPE:-q8_0}}")"
+    est=""
+    [ -n "$free" ] && est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "$path" "$free" "$ctx" "${PARALLEL:-1}" "$kvb" 2>/dev/null || true)"
+    if [ -z "$est" ]; then
+        echo "!! tune needs the VRAM estimator (local GGUF + measurable free VRAM)" >&2
+        exit 1
+    fi
+    mode="${est%% *}"
+    rest="${est#* }"
+    val="${rest%% *}"
+
+    # candidate matrix: label + NCMOE env value + extra start flag
+    local labels=() envs=() extras=()
+    if [ "$mode" = moe ] && [ "$val" = 0 ]; then
+        if [ -n "$has_head" ]; then
+            labels=("mtp=off" "mtp=on")
+            envs=("" "")
+            extras=("--no-mtp" "--mtp")
+        else
+            echo ">> model fully fits on GPU and has no MTP head — measuring baseline only"
+            labels=("baseline")
+            envs=("")
+            extras=("")
+        fi
+    elif [ "$mode" = dense ]; then
+        labels=("ngl=$val")
+        envs=("$val")
+        extras=("")
+        if [ "$((val - 4))" -gt 0 ]; then
+            labels+=("ngl=$((val - 4))")
+            envs+=("$((val - 4))")
+            extras+=("")
+        fi
+    else
+        labels=("ncmoe=$val" "ncmoe=$((val + 4))")
+        envs=("$val" "$((val + 4))")
+        extras=("" "")
+    fi
+
+    echo ">> tune: $alias on $gpu, ctx=$ctx — ${#labels[@]} candidate(s), ~1-2 min each"
+    local port="${PORT:-8089}" results=() best_tps="" best_i="" li log child
+    for li in "${!labels[@]}"; do
+        echo ">> [$((li + 1))/${#labels[@]}] candidate ${labels[$li]}: starting server..."
+        "$SCRIPT_PATH" stop >/dev/null 2>&1 || true
+        log="$(mktemp "${TMPDIR:-/tmp}/highllama-tune.XXXXXX")"
+        (
+            export PROBE=0
+            [ -n "${envs[$li]}" ] && export NCMOE="${envs[$li]}"
+            # shellcheck disable=SC2086
+            exec "$SCRIPT_PATH" start ${fwd[@]+"${fwd[@]}"} --no-embeddings ${extras[$li]:+${extras[$li]}}
+        ) >"$log" 2>&1 &
+        child=$!
+        if ! wait_api_ready "$port" 300; then
+            echo "!! candidate ${labels[$li]}: server not ready after 300s — skipped (log kept: $log)"
+            results+=("FAILED")
+            kill "$child" 2>/dev/null || true
+            "$SCRIPT_PATH" stop >/dev/null 2>&1 || true
+            continue
+        fi
+        # 3 probes of 128 tokens (the first doubles as warmup); take the median
+        local t1 t2 t3 med eff
+        t1="$(probe_decode_tps "$port" "$alias" 128)"
+        t2="$(probe_decode_tps "$port" "$alias" 128)"
+        t3="$(probe_decode_tps "$port" "$alias" 128)"
+        case "$t1 $t2 $t3" in
+        *loop*) # a looping candidate is fast garbage — never let it win
+            echo "!! candidate ${labels[$li]}: degenerate (looping) output — discarded"
+            t1="" t2="" t3=""
+            ;;
+        esac
+        med="$(printf '%s\n' "$t1" "$t2" "$t3" | sort -n |
+            awk 'NF{a[++n]=$1} END{if(n)print a[int((n+1)/2)]}')"
+        eff="$(command grep -oE 'launching with [^.]*' "$log" | tail -1 || true)"
+        kill "$child" 2>/dev/null || true
+        "$SCRIPT_PATH" stop >/dev/null 2>&1 || true
+        if [ -n "$med" ]; then
+            echo ">> [$((li + 1))/${#labels[@]}] ${labels[$li]}: ${med} t/s (${eff:-as requested})"
+            results+=("$med")
+            if [ -z "$best_tps" ] || awk -v a="$med" -v b="$best_tps" 'BEGIN{exit !(a > b)}'; then
+                best_tps="$med"
+                best_i="$li"
+            fi
+        else
+            echo "!! candidate ${labels[$li]}: no valid timing — skipped (log kept: $log)"
+            results+=("FAILED")
+            continue
+        fi
+        rm -f "$log"
+    done
+
+    if [ -z "$best_tps" ]; then
+        echo "!! tune: no candidate produced a valid measurement" >&2
+        exit 1
+    fi
+    # persist: MTP verdicts always; non-default offloads only when they beat
+    # the estimator default by >5% (avoid pinning noise)
+    local cfg=""
+    case "${labels[$best_i]}" in
+    mtp=on | mtp=off) cfg="${labels[$best_i]}" ;;
+    ngl=* | ncmoe=*)
+        if [ "$best_i" != 0 ] &&
+            { [ "${results[0]}" = FAILED ] ||
+                awk -v a="$best_tps" -v b="${results[0]}" 'BEGIN{exit !(a > b * 1.05)}'; }; then
+            cfg="${labels[$best_i]}"
+        fi
+        ;;
+    esac
+    if [ -n "$cfg" ]; then
+        state_put tune "$alias" "$gpu" "$bucket" "$cfg" "$best_tps"
+        echo ">> tune: winner '$cfg' (${best_tps} t/s) persisted to $HL_STATE"
+        echo ">> future 'start' applies it automatically (explicit flags still win)"
+    else
+        state_del tune "$alias" "$gpu" "$bucket"
+        echo ">> tune: default config is best (${best_tps} t/s) — no override recorded"
+    fi
+    # seed/refresh the best-known record used by the startup regression guard
+    local prev
+    prev="$(state_get best "$alias" "$gpu" "$bucket" | cut -f2)"
+    if [ -z "$prev" ] || awk -v a="$best_tps" -v b="$prev" 'BEGIN{exit !(a > b)}'; then
+        state_put best "$alias" "$gpu" "$bucket" "tuned:${labels[$best_i]}" "$best_tps"
+    fi
+    exit 0
 }
 
 # ---- build requirements per platform (deps subcommand) ---------------------
@@ -567,6 +1023,11 @@ COMMANDS:
   status             show whether a server is running
   stop               stop the running server (and systemd user unit)
   reload [options]   stop the server and restart with new options
+  restart [options]  stop + start with the same settings as the last start
+                     (picker choice included; no tty needed). extras win,
+                     e.g. `highllama restart --daemon`
+  tune [options]     measure the fastest config (MTP / offload) for a model on
+                     this hardware and persist it; 'start' applies it after
   logs [args]        stream daemon logs (journalctl -t highllama)
   deps [backend]     install build requirements (pacman/apt/dnf/zypper/brew)
   build [backend]    clone (if needed) + cmake-build llama.cpp
@@ -583,7 +1044,8 @@ START OPTIONS:
       --kv-v <type>        V-cache quant only (default q8_0; FA kernels need k==v)
       --fa <mode>          flash-attn: auto|on|off (default auto). auto keeps FA on; KV
                            defaults to symmetric q8_0 (mismatched k/v -> CPU). off=non-FA (f16)
-      --dry <mult>         DRY sampler multiplier, anti-loop insurance (default 0.8; 0 disables)
+      --dry <mult>         DRY sampler multiplier (default 0 = off). warning: breaks verbatim
+                           long literals (paths/UUIDs) in agent use; 0.8 was the old default
       --draft, -md <id>    draft model for speculative decoding
       --mtp                force multi-token prediction on (default: auto — on when
                            the model ships an MTP head: mtp- sibling or embedded nextn)
@@ -595,10 +1057,11 @@ START OPTIONS:
       --backend <b>        cuda|rocm|vulkan|metal|mlx|cpu (default: autodetect)
   -d, --daemon             run in background, logs -> journal
       --no-embeddings      don't also serve the embeddings model
+      --no-probe           skip the startup decode-speed probe / regression check
       -- <args>            pass remaining args straight to llama-server
 
 Every option is also settable via env var (flag wins):
-  MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+  MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND PROBE PROBE_REGRESS_PCT HL_STATE
 
 EXAMPLES:
   highllama start                                  interactive picker, 64k ctx
@@ -618,6 +1081,10 @@ case "${1:-}" in
     ;;
 start)
     shift # launch verb; remaining args fall through to arg parsing below
+    ;;
+tune)
+    shift
+    cmd_tune "$@"
     ;;
 ls)
     echo "Available local models:"
@@ -722,6 +1189,28 @@ reload)
     fi
     exec "$SCRIPT_PATH" start "$@"
     ;;
+restart)
+    # stop + start with the exact settings of the last `start` (recorded in
+    # $HL_LAST at launch, picker choice included — works without a tty).
+    # extra flags are appended and win, e.g.: highllama restart --daemon
+    shift
+    HL_LAST="${HL_LAST:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/last-start.env}"
+    if [ ! -f "$HL_LAST" ]; then
+        echo "!! no recorded launch ($HL_LAST not found)" >&2
+        echo "!! run 'highllama start ...' once — every start records itself for restart" >&2
+        exit 1
+    fi
+    HL_LAST_EXTRA=()
+    # shellcheck disable=SC1090
+    . "$HL_LAST"
+    echo ">> restarting last launch: $(basename "$MODEL") ctx=$CONTEXT${HL_LAST_EXTRA[0]+ extra:${HL_LAST_EXTRA[*]}}"
+    if ! "$SCRIPT_PATH" stop; then
+        echo "!! failed to stop the existing server" >&2
+        exit 1
+    fi
+    export MODEL CONTEXT NCMOE THREADS KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND PARALLEL
+    exec "$SCRIPT_PATH" start "$@" ${HL_LAST_EXTRA[@]+-- "${HL_LAST_EXTRA[@]}"}
+    ;;
 esac
 
 # ---- arg parsing ----------------------------------------------------------
@@ -803,6 +1292,10 @@ while [ $# -gt 0 ]; do
         ALLMODELS=""
         shift
         ;;
+    --no-probe)
+        PROBE=0
+        shift
+        ;;
     --)
         shift
         EXTRA+=("$@")
@@ -828,6 +1321,10 @@ done
 # slower prefill). q8_0 is near-lossless and half the VRAM of f16, which keeps
 # more layers/experts on GPU at long context. Resolve to concrete per-side types
 # so everything downstream (estimate, preset, launch) is explicit.
+KV_AUTO="${KV_AUTO:-}" # no explicit KV choice: the offload estimator may step
+# q8_0 down to q4_0 when that's what keeps the whole model (and MTP) on the GPU.
+# Inherited from the daemon parent (it passes resolved KVTYPE_K/V to the child).
+[ -z "${KVTYPE_K}${KVTYPE_V}${KVTYPE}" ] && KV_AUTO=1
 KVTYPE_K="${KVTYPE_K:-${KVTYPE:-q8_0}}"
 KVTYPE_V="${KVTYPE_V:-${KVTYPE:-q8_0}}"
 echo ">> backend=$BACKEND"
@@ -904,6 +1401,25 @@ if [ -z "$MODEL" ]; then
     echo ">> selected: $(basename "$MODEL")"
 fi
 
+# ---- record the resolved launch for `highllama restart` --------------------
+# Written after the picker so MODEL is final. The daemon child re-enters start
+# with HL_CMDDUMP set and identical env — skip there, the parent already saved.
+if [ -z "${HL_CMDDUMP:-}" ]; then
+    HL_LAST="${HL_LAST:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/last-start.env}"
+    mkdir -p "$(dirname "$HL_LAST")"
+    _last_tmp="$(mktemp "$(dirname "$HL_LAST")/.last-start.XXXXXX")"
+    {
+        echo "# resolved launch, written by 'highllama start' — replayed by 'highllama restart'"
+        for _v in MODEL CONTEXT NCMOE THREADS KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND PARALLEL; do
+            printf '%s=%q\n' "$_v" "${!_v}"
+        done
+        printf 'HL_LAST_EXTRA=('
+        printf ' %q' ${EXTRA[@]+"${EXTRA[@]}"}
+        printf ' )\n'
+    } >"$_last_tmp"
+    mv "$_last_tmp" "$HL_LAST"
+fi
+
 # ---- daemon mode: re-exec detached, output to the system journal -----------
 # Runs after the picker so `highllama --daemon` can still ask interactively;
 # the child gets every resolved setting via env vars (all env-overridable).
@@ -917,13 +1433,19 @@ if [ -n "$DAEMON" ]; then
     # goes to the journal; have it also drop the resolved line here so we can
     # show it on this terminal once the server is up.
     CMDDUMP="$(mktemp "${TMPDIR:-/tmp}/highllama-cmd.XXXXXX")"
+    # the probe runs in the child (it knows the final config after OOM retries);
+    # it drops its result here so this terminal can echo it once ready.
+    PROBEDUMP=""
+    [ "$PROBE" = 1 ] && PROBEDUMP="$(mktemp "${TMPDIR:-/tmp}/highllama-probe.XXXXXX")"
     setsid env MODEL="$MODEL" CONTEXT="$CONTEXT" NCMOE="$NCMOE" THREADS="$THREADS" \
-        KVTYPE="$KVTYPE" KVTYPE_K="$KVTYPE_K" KVTYPE_V="$KVTYPE_V" FA="$FA" DRY="$DRY" \
+        KVTYPE="$KVTYPE" KVTYPE_K="$KVTYPE_K" KVTYPE_V="$KVTYPE_V" KV_AUTO="$KV_AUTO" FA="$FA" DRY="$DRY" \
         DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
         TEMPLATE="$TEMPLATE" IGNORE_TEMPLATE="${IGNORE_TEMPLATE:-}" \
         EMBED_MODEL="$EMBED_MODEL" EMBED_POOLING="${EMBED_POOLING:-}" EMBED_CTX="${EMBED_CTX:-}" \
         HOST="$HOST" PORT="$PORT" \
         BACKEND="$BACKEND" PARALLEL="$PARALLEL" HL_CMDDUMP="$CMDDUMP" \
+        PROBE="$PROBE" PROBE_REGRESS_PCT="$PROBE_REGRESS_PCT" HL_STATE="$HL_STATE" \
+        HL_PROBEDUMP="$PROBEDUMP" \
         systemd-cat -t highllama "$SCRIPT_PATH" start ${EXTRA[@]+-- "${EXTRA[@]}"} \
         </dev/null >/dev/null 2>&1 &
     DPID=$!
@@ -931,13 +1453,29 @@ if [ -n "$DAEMON" ]; then
     for _ in $(seq 1 240); do
         if ! kill -0 "$DPID" 2>/dev/null && [ -z "$(server_running)" ]; then
             echo "!! exited before the server became ready — see: journalctl -t highllama -e" >&2
-            rm -f "$CMDDUMP"
+            rm -f "$CMDDUMP" "$PROBEDUMP"
             exit 1
         fi
         if port_busy "$PORT"; then
             if [ -s "$CMDDUMP" ]; then echo ">> llama-server:"; sed 's/^/   /' "$CMDDUMP"; fi
             rm -f "$CMDDUMP"
             echo ">> ready: http://${HOST}:${PORT}/v1"
+            # relay the child's decode probe (it needs a few seconds to generate).
+            # wait for the probe verdict itself — degradation banners land in the
+            # dump earlier, while the model is still loading.
+            if [ -n "$PROBEDUMP" ]; then
+                for _ in $(seq 1 180); do
+                    command grep -qE 'measured decode|probe skipped' "$PROBEDUMP" 2>/dev/null && break
+                    sleep 0.5
+                done
+                if [ -s "$PROBEDUMP" ]; then
+                    sleep 1 # the regression banner (if any) lands just after the measured line
+                    cat "$PROBEDUMP"
+                else
+                    echo ">> probe result not in yet — see: journalctl -t highllama -f"
+                fi
+                rm -f "$PROBEDUMP"
+            fi
             echo ">> logs:  journalctl -t highllama -f"
             echo ">> stop:  highllama stop"
             exit 0
@@ -945,7 +1483,7 @@ if [ -n "$DAEMON" ]; then
         sleep 0.5
     done
     if [ -s "$CMDDUMP" ]; then echo ">> llama-server:"; sed 's/^/   /' "$CMDDUMP"; fi
-    rm -f "$CMDDUMP"
+    rm -f "$CMDDUMP" "$PROBEDUMP"
     echo ">> not ready after 120s (large model / first download?)"
     echo ">> follow progress: journalctl -t highllama -f"
     exit 0
@@ -999,44 +1537,42 @@ case "${MODEL_ARGS[0]}" in
 *) ALIAS="model" ;;
 esac
 
+# ---- tuned overrides (from `highllama tune`) --------------------------------
+# Apply the measured winner for this (model, GPU, ctx band). Explicit user
+# knobs always win: MTP only applies while still 'auto', offload only while
+# NCMOE is unset.
+TUNED="$(state_get tune "$ALIAS" "$(gpu_name)" "$(ctx_bucket "$CONTEXT")" || true)"
+TUNED_APPLIED="" # suppresses the degraded-offload banner: tune already measured
+# this ctx band and picked the winner deliberately
+if [ -n "$TUNED" ]; then
+    TUNED_CFG="$(printf '%s' "$TUNED" | cut -f1)"
+    TUNED_DATE="$(printf '%s' "$TUNED" | cut -f3)"
+    for kvp in ${TUNED_CFG//;/ }; do
+        case "$kvp" in
+        mtp=on | mtp=off)
+            if [ "${MTP:-auto}" = "auto" ]; then
+                MTP="${kvp#mtp=}"
+                TUNED_APPLIED=1
+                echo ">> tuned: MTP ${MTP} for this model/GPU/ctx (measured $TUNED_DATE; --mtp/--no-mtp overrides, '$0 tune' re-measures)"
+            fi
+            ;;
+        ngl=* | ncmoe=*)
+            if [ -z "$NCMOE" ]; then
+                NCMOE="${kvp#*=}"
+                TUNED_APPLIED=1
+                echo ">> tuned: offload ${kvp} for this model/GPU/ctx (measured $TUNED_DATE; --ncmoe overrides, '$0 tune' re-measures)"
+            fi
+            ;;
+        esac
+    done
+fi
+
 # ---- optional speculative decoding ---------------------------------------
 # MTP (multi-token prediction) and --draft both configure a draft model, so they
 # are mutually exclusive. MTP runs the draft head against the target model via
 # llama.cpp's draft-mtp speculative type. MTP mode is auto|on|off (default auto):
 # 'auto' enables it whenever a LOCAL model actually ships an MTP head and stays
 # off otherwise; 'on' (--mtp) forces it; 'off' (--no-mtp) disables it.
-
-# Does the main GGUF carry an *embedded* MTP/nextn head? Models like unsloth
-# Qwen3.6 advertise a `.nextn_predict_layers` key; most (incl. gemma-4 chat
-# GGUFs, whose MTP head ships as a separate 'mtp-*.gguf' sibling) do not.
-# Requesting draft-mtp against a model with no embedded head makes llama.cpp
-# abort at load ("context type MTP requested but model doesn't contain MTP
-# layers"). Prints "1" only when an embedded head is present.
-model_has_embedded_mtp() {
-    [ "${MODEL_ARGS[0]}" = "-m" ] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
-    python3 - "${MODEL_ARGS[1]}" <<'PY' 2>/dev/null
-import sys,struct
-try:
-    f=open(sys.argv[1],'rb'); f.read(4); struct.unpack('<I',f.read(4)); struct.unpack('<Q',f.read(8))
-    n_kv=struct.unpack('<Q',f.read(8))[0]
-    def rs():
-        n=struct.unpack('<Q',f.read(8))[0]; return f.read(n).decode('utf-8','replace')
-    def rv(t):
-        if t==8: return rs()
-        if t==9:
-            et=struct.unpack('<I',f.read(4))[0]; ln=struct.unpack('<Q',f.read(8))[0]; return [rv(et) for _ in range(ln)]
-        fm={0:'B',1:'b',2:'H',3:'h',4:'I',5:'i',6:'f',7:'?',10:'Q',11:'q',12:'d'}[t]
-        return struct.unpack('<'+fm,f.read(struct.calcsize(fm)))[0]
-    for _ in range(n_kv):
-        k=rs(); t=struct.unpack('<I',f.read(4))[0]; v=rv(t)
-        if 'nextn' in k or k.endswith('.nextn_predict_layers'):
-            print(1); break
-        if k.startswith('tokenizer.'): break
-except Exception:
-    pass
-PY
-}
 
 # Normalize the MTP intent (accepts legacy MTP=1/0 too). MTP is rewritten below
 # to the resolved flag downstream code checks: "" = off, 1 = on.
@@ -1137,11 +1673,12 @@ elif [ "$FA_ON" = 1 ] && [ "$KVTYPE_K" != "$KVTYPE_V" ]; then
     KVTYPE_V=q8_0
 fi
 
-# ---- sampler defaults (loop insurance) ------------------------------------
-# DRY penalizes repeated token *sequences* (with default sequence breakers so
-# normal code structure isn't punished) — the right backstop against the
-# degenerate <think></think> / repeat loops. Set as server defaults; any client
-# request that specifies its own dry_multiplier overrides these.
+# ---- sampler defaults ------------------------------------------------------
+# DRY penalizes repeated token *sequences*. It looked like safe loop insurance,
+# but in agentic use it corrupts long verbatim literals: a file path or UUID has
+# no sequence breakers, so retyping it from context gets penalized into typos
+# (observed with Claude Code subagents). Off by default; --dry <n> re-enables
+# for chat/creative use. Any client dry_multiplier still overrides.
 SAMPLER_ARGS=()
 if [ -n "$DRY" ] && [ "$DRY" != 0 ] && [ "$DRY" != 0.0 ]; then
     SAMPLER_ARGS=(--dry-multiplier "$DRY" --dry-base 1.75 --dry-allowed-length 2)
@@ -1157,62 +1694,114 @@ echo ">> GPU before launch:"
 gpu_status "$BACKEND"
 
 # ---- smart expert-offload estimate (model + free-VRAM + context aware) ------
-# KV bits-per-element for the chosen cache type (used to size the KV reserve).
-# K and V each hold half the cache, so average their per-side bits.
-kv_bits() {
-    case "$1" in
-    q4_0 | q4_1 | iq4_nl) echo 4.5 ;;
-    q5_0 | q5_1) echo 5.5 ;;
-    q8_0) echo 8.5 ;;
-    f16 | bf16) echo 16 ;;
-    *) echo 16 ;;
-    esac
-}
 KVBITS="$(awk -v k="$(kv_bits "$KVTYPE_K")" -v v="$(kv_bits "$KVTYPE_V")" 'BEGIN{print (k+v)/2}')"
 
 NCMOE_CAP=64 # upper bound for auto-retry; refined to layer count if known
 MODE=moe     # "moe" (bump --n-cpu-moe up) or "dense" (bump -ngl down); set by estimator
-if [ -z "$NCMOE" ]; then
-    case "$BACKEND" in
-    metal | cpu)
-        # unified memory / no discrete VRAM: expert offload buys nothing by default
-        NCMOE=0
-        ;;
-    *)
-        FREE_MIB="$(free_vram_mib "$BACKEND")"
-        # MTP keeps an extra draft context resident (~2 GB); shave it off the
-        # free-VRAM figure so the offload estimate leaves headroom instead of
-        # OOM-ing straight into the retry loop.
-        if [ -n "$MTP" ] && [ -n "${FREE_MIB:-}" ]; then
-            FREE_MIB=$((FREE_MIB > 2048 ? FREE_MIB - 2048 : 0))
+NCMOE_PRESET="$NCMOE" # user/tune-pinned offload value ("" = auto). The estimator
+# still runs with a preset so MODE (dense-vs-moe) and the layer cap resolve
+# correctly — a preset used to leave dense models on the moe launch path.
+case "$BACKEND" in
+metal | cpu)
+    # unified memory / no discrete VRAM: expert offload buys nothing by default
+    [ -n "$NCMOE" ] || NCMOE=0
+    ;;
+*)
+    FREE_MIB="$(free_vram_mib "$BACKEND")"
+    # MTP keeps an extra draft context resident (~2 GB); shave it off the
+    # free-VRAM figure so the offload estimate leaves headroom instead of
+    # OOM-ing straight into the retry loop.
+    FREE_MIB_NO_MTP="${FREE_MIB:-}"
+    if [ -n "$MTP" ] && [ -n "${FREE_MIB:-}" ]; then
+        FREE_MIB=$((FREE_MIB > 2048 ? FREE_MIB - 2048 : 0))
+    fi
+    est=""
+    if [ "${MODEL_ARGS[0]}" = "-m" ] && [ -n "${FREE_MIB:-}" ] && command -v python3 >/dev/null 2>&1; then
+        est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
+        # KV auto-stepdown: with no explicit --kv, a leaner q4_0 cache beats a
+        # near-lossless q8_0 one that pushes weights (or MTP) off the GPU —
+        # gemma-4-12B on a 12GB 4070 @64k: q8_0 = 46/48 layers ≈ 74 t/s,
+        # q4_0 = 48/48 + MTP ≈ 102 t/s. Runs before the MTP demotion below so
+        # the draft head survives whenever a leaner cache makes room for it.
+        est_rest="${est#* }"
+        if [ -n "$KV_AUTO" ] && [ "$FORCE_F16" = 0 ] && [ "$KVTYPE_K" = "q8_0" ] &&
+            [ -n "$est" ] && [ "${est%% *} ${est_rest%% *}" != "moe 0" ]; then
+            est_q4="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" 4.5 2>/dev/null || true)"
+            est_q4_rest="${est_q4#* }"
+            KV_STEP=""
+            # ONLY when q4_0 restores FULL offload. Trading KV precision for a
+            # few extra layers on a still-partial config is a bad deal: it cost
+            # little speed but sent gemma-4-26B-A4B (QAT-Q4_0 weights) into
+            # degenerate repetition loops. Quality collapse generates fast —
+            # the probe can't catch it, so step down only for the big win.
+            [ -n "$est_q4" ] && [ "${est_q4%% *} ${est_q4_rest%% *}" = "moe 0" ] && KV_STEP=1
+            if [ -n "$KV_STEP" ]; then
+                echo ">> KV cache: auto-stepping q8_0 -> q4_0 — restores FULL GPU offload at ctx=$CONTEXT (--kv q8_0 to force)"
+                KVTYPE_K=q4_0
+                KVTYPE_V=q4_0
+                KVBITS=4.5
+                est="$est_q4"
+                est_rest="$est_q4_rest"
+            fi
         fi
-        est=""
-        if [ "${MODEL_ARGS[0]}" = "-m" ] && [ -n "${FREE_MIB:-}" ] && command -v python3 >/dev/null 2>&1; then
+        # Auto-MTP only pays for itself while the model sits fully on GPU:
+        # its ~2GB draft context otherwise displaces layers, and every layer
+        # pushed to CPU costs far more decode speed than MTP recovers
+        # (gemma-4-12B @256k: 23/48 layers, ~8 t/s). If the reserve breaks
+        # full offload, drop the head and re-estimate with the budget back.
+        if [ -n "$MTP" ] && [ "$MTP_MODE" = auto ] && [ -n "$est" ] &&
+            [ "${est%% *} ${est_rest%% *}" != "moe 0" ]; then
+            echo ">> MTP: auto-disabled — model doesn't fully fit on GPU at ctx=$CONTEXT, reclaiming ~2GB for layer offload (--mtp on to force)"
+            MTP=""
+            MTP_DRAFT=""
+            SPEC_ARGS=()
+            FREE_MIB="$FREE_MIB_NO_MTP"
             est="$(python3 "$SCRIPT_DIR/gguf-estimate.py" "${MODEL_ARGS[1]}" "$FREE_MIB" "$CONTEXT" "$PARALLEL" "$KVBITS" 2>/dev/null || true)"
         fi
-        if [ -n "$est" ]; then
-            MODE="${est%% *}" # "<mode> <value> <layers>"
-            rest="${est#* }"
-            NCMOE="${rest%% *}"
-            NCMOE_CAP="${rest##* }"
-            if [ "$MODE" = "dense" ]; then
-                echo ">> dense model: offloading via -ngl=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
-            else
-                echo ">> estimated n-cpu-moe=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
-            fi
-        else # fallback: context buckets
-            if [ "$CONTEXT" -le 16384 ]; then
-                NCMOE=28
-            elif [ "$CONTEXT" -le 65536 ]; then
-                NCMOE=32
-            else
-                NCMOE=40
-            fi
-            echo ">> estimate unavailable; using fallback n-cpu-moe=$NCMOE"
+    fi
+    if [ -n "$est" ]; then
+        MODE="${est%% *}" # "<mode> <value> <layers>"
+        rest="${est#* }"
+        NCMOE="${rest%% *}"
+        NCMOE_CAP="${rest##* }"
+        if [ -n "$NCMOE_PRESET" ]; then
+            # offload pinned by the user or a tune record; estimator ran only
+            # to resolve MODE and the cap
+            EST_VAL="$NCMOE"
+            NCMOE="$NCMOE_PRESET"
+            echo ">> preset offload: $([ "$MODE" = "dense" ] && echo "-ngl" || echo "n-cpu-moe")=$NCMOE (estimator suggested $EST_VAL of $NCMOE_CAP layers)"
+        elif [ "$MODE" = "dense" ]; then
+            echo ">> dense model: offloading via -ngl=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
+        else
+            echo ">> estimated n-cpu-moe=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
         fi
-        ;;
-    esac
-fi
+        # loud speed warning whenever the launch config leaves weights on the
+        # CPU, plus the largest context that would still fit fully on GPU
+        PARTIAL=""
+        [ "$MODE" = "dense" ] && [ "$NCMOE" -lt "$NCMOE_CAP" ] && PARTIAL=1
+        [ "$MODE" = "moe" ] && [ "$NCMOE" -gt 0 ] && PARTIAL=1
+        if [ -n "$PARTIAL" ]; then
+            if [ -n "${TUNED_APPLIED:-}" ]; then
+                probe_say ">> note: partial offload ($NCMOE of $NCMOE_CAP) is the measured-fastest config for this ctx (via '$0 tune')"
+            else
+                CTX_TIP="$(max_full_fit_ctx "${MODEL_ARGS[1]}" "$FREE_MIB" "$PARALLEL" "$KVBITS" "$CONTEXT")"
+                warn_partial_offload "$CTX_TIP"
+            fi
+        fi
+    elif [ -n "$NCMOE_PRESET" ]; then
+        NCMOE="$NCMOE_PRESET"
+    else # fallback: context buckets
+        if [ "$CONTEXT" -le 16384 ]; then
+            NCMOE=28
+        elif [ "$CONTEXT" -le 65536 ]; then
+            NCMOE=32
+        else
+            NCMOE=40
+        fi
+        echo ">> estimate unavailable; using fallback n-cpu-moe=$NCMOE"
+    fi
+    ;;
+esac
 
 # mmap is the right default on unified memory (Metal); --no-mmap elsewhere so
 # CPU-side expert weights land in real RAM instead of thrashing page cache.
@@ -1382,9 +1971,11 @@ if [ -n "$USE_ROUTER" ]; then
     tail -f -n +1 "$RLOG" & # stream router + child logs live
     RTAIL=$!
     # ready when both children report in, or bail on OOM / a bad preset key
+    ROUTER_READY=""
     while kill -0 "$RSRV" 2>/dev/null; do
         if [ "$(command grep -c 'cmd_child_to_router:ready' "$RLOG" 2>/dev/null || echo 0)" -ge 2 ]; then
             echo ">> router ready: chat + embeddings models loaded"
+            ROUTER_READY=1
             break
         fi
         if command grep -qiE "$OOM_RE|not recognized in preset|GGML_ASSERT" "$RLOG"; then
@@ -1393,6 +1984,7 @@ if [ -n "$USE_ROUTER" ]; then
         fi
         sleep 0.5
     done
+    [ -n "$ROUTER_READY" ] && run_probe_and_guard "$PORT" "$ALIAS"
     wait "$RSRV"
     exit $?
 fi
@@ -1460,6 +2052,7 @@ while :; do
     done
 
     if [ "$outcome" = "ok" ]; then
+        run_probe_and_guard "$PORT" "$ALIAS"
         wait "$SRV"
         exit $? # serve until stopped
     fi
