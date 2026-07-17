@@ -1267,6 +1267,10 @@ class Handler(BaseHTTPRequestHandler):
     def _passthrough(self, raw):
         """Relay an Anthropic-format request verbatim to api.anthropic.com and stream
         the response straight back. Used for every non-local model (e.g. Opus)."""
+        log("Proxy: passthrough %s %s" % (self.command, self.path))
+        if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            log("Proxy: WARNING WebSocket upgrade not supported, relaying as plain HTTP")
+
         headers = {
             k: v for k, v in self.headers.items() if k.lower() not in _DROP_HEADERS
         }
@@ -1294,14 +1298,27 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(r.status)
         ct = r.getheader("Content-Type", "application/json")
+        # Forward upstream response headers (request-id, anthropic-ratelimit-*,
+        # retry-after, location, ...) so /rc clients can correlate and back off.
+        # Hop-by-hop headers (incl. content-length/transfer-encoding) are dropped
+        # because we delimit the relayed response by connection close instead.
+        for k, v in r.getheaders():
+            if k.lower() in _DROP_HEADERS or k.lower() == "content-type":
+                continue
+            self.send_header(k, v)
         self.send_header("Content-Type", ct)
         # delimit by connection close so we don't have to re-chunk streamed SSE
         self.send_header("Connection", "close")
         self.end_headers()
 
-        capture_response = r.status == 200 and body is not None
+        is_sse_response = "text/event-stream" in (ct or "").lower()
+        path_only = self.path.split("?", 1)[0]
+        capture_response = (
+            r.status == 200 and body is not None
+            and path_only.startswith("/v1/messages")
+        )
 
-        if is_stream:
+        if is_stream or is_sse_response:
             response_buf = io.BytesIO()
             try:
                 while True:
@@ -1314,6 +1331,10 @@ class Handler(BaseHTTPRequestHandler):
                         response_buf.write(line)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except OSError as e:
+                # e.g. TimeoutError on an idle upstream SSE socket: tear down
+                # quietly instead of letting socketserver dump a traceback.
+                log("Proxy: passthrough stream aborted:", e)
             finally:
                 c.close()
 
@@ -1336,6 +1357,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except OSError as e:
+                log("Proxy: passthrough read aborted:", e)
             finally:
                 c.close()
 
@@ -1630,7 +1653,9 @@ class Handler(BaseHTTPRequestHandler):
                     "passthrough": ANTHROPIC_UP,
                 },
             )
-        if self.path.startswith("/v1/models"):
+        # Only the exact list endpoint gets the merged local+upstream response;
+        # GET /v1/models/{model_id} (Anthropic "Get a Model") relays verbatim below.
+        if self.path.split("?", 1)[0] == "/v1/models":
             is_anthropic = self._wants_anthropic_format()
             # Fetch upstream models so the proxy can be used as a full gateway.
             upstream_data = []
@@ -1705,19 +1730,51 @@ class Handler(BaseHTTPRequestHandler):
                     "last_id": data[-1]["id"] if data else LOCAL_ALIAS,
                 },
             )
+        if self.path.startswith("/v1/") or self.path.startswith("/api/"):
+            return self._passthrough(self._read_raw())
         self._json(404, {"error": "not found"})
+
+    def _route_other_method(self):
+        """Relay any Anthropic-API-surface request (required for Claude Code /rc)."""
+        path_only = self.path.split("?", 1)[0]
+        if path_only.startswith("/v1/") or path_only.startswith("/api/"):
+            return self._passthrough(self._read_raw())
+        return self._json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        return self._route_other_method()
+
+    def do_PUT(self):
+        return self._route_other_method()
+
+    def do_PATCH(self):
+        return self._route_other_method()
+
+    def do_OPTIONS(self):
+        return self._route_other_method()
+
+    def do_HEAD(self):
+        return self._route_other_method()
 
     def do_POST(self):
         raw = self._read_raw()
+        path_only = self.path.split("?", 1)[0]
         try:
             body = json.loads(raw) if raw else {}
-        except Exception as e:  # noqa
+            if not isinstance(body, dict):
+                # JSON that isn't an object (list/string/number/null) cannot carry
+                # a "model" key — treat it exactly like a non-JSON body below.
+                raise ValueError("non-object JSON body")
+        except Exception:
+            # Non-JSON (or non-object JSON) body: cannot be a local-model request.
+            # Relay verbatim if it targets the Anthropic API surface; otherwise
+            # reject as before.
+            if path_only.startswith("/v1/") or path_only.startswith("/api/"):
+                return self._passthrough(raw)
             return self._json(
                 400,
-                {
-                    "type": "error",
-                    "error": {"type": "invalid_request_error", "message": str(e)},
-                },
+                {"type": "error",
+                 "error": {"type": "invalid_request_error", "message": "invalid JSON body"}},
             )
 
         req_model = body.get("model", MODEL)
@@ -1736,11 +1793,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 return self._opencode_openai_messages(body, opencode_core_model)
 
-        # ROUTER: non-local models are relayed verbatim to Anthropic.
-        if self.path.startswith("/v1/") and not is_local_model(req_model):
+        # ROUTER: only the exact local surface with a local model stays local;
+        # everything else Anthropic-shaped relays verbatim (required for /rc).
+        is_local = is_local_model(req_model)
+        local_path = path_only in ("/v1/messages", "/v1/messages/count_tokens")
+        if (path_only.startswith("/v1/") or path_only.startswith("/api/")) and not (
+            is_local and local_path
+        ):
             return self._passthrough(raw)
 
-        if self.path.endswith("/count_tokens"):
+        if path_only.endswith("/count_tokens"):
             return self._json(200, {"input_tokens": estimate_tokens(body)})
 
         if not self.path.startswith("/v1/messages"):

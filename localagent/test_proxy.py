@@ -4,8 +4,10 @@
 Stdlib unittest only — no pytest, no extra deps. Run with:
     python3 -m unittest localagent.test_proxy -v
 """
+import http.client
 import json
 import os
+import queue
 import sqlite3
 import sys
 import tempfile
@@ -13,6 +15,8 @@ import threading
 import time
 import unittest
 from unittest import mock
+
+from http.server import ThreadingHTTPServer
 
 # Make the localagent package importable when run from the repo root or the
 # localagent dir.
@@ -724,6 +728,390 @@ class TestOpenCodeRouting(unittest.TestCase):
                 
             self.assertEqual(os.environ.get("TEST_ENV_VAR_X"), "val_x")
             self.assertEqual(os.environ.get("TEST_ENV_VAR_Y"), "val_y")
+
+
+# ---------------------------------------------------------------------------
+# Anthropic passthrough tests (live ephemeral server + patched upstreams)
+# ---------------------------------------------------------------------------
+
+class _FakeUpstreamResponse:
+    def __init__(self, status=200, body=b"{}", content_type="application/json",
+                 lines=None, headers=None):
+        self.status = status
+        self._body = body
+        self._lines = list(lines or [])
+        self._ct = content_type
+        self._headers = list(headers or [])
+
+    def getheader(self, name, default=None):
+        if name.lower() == "content-type":
+            return self._ct
+        for k, v in self._headers:
+            if k.lower() == name.lower():
+                return v
+        return default
+
+    def getheaders(self):
+        return [("Content-Type", self._ct)] + self._headers
+
+    def read(self):
+        return self._body
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+
+class _FakeUpstreamConn:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def request(self, method, path, body=None, headers=None):
+        self.requests.append({"method": method, "path": path,
+                              "body": body, "headers": dict(headers or {})})
+
+    def getresponse(self):
+        return self.response
+
+    def close(self):
+        pass
+
+
+class TestAnthropicPassthrough(unittest.TestCase):
+    """End-to-end proxy dispatch with faked upstream Anthropic/llama-server."""
+
+    def setUp(self):
+        self._saved_queue = ap._dataset_queue
+        self._saved_dropped = ap._dataset_dropped
+        ap._dataset_queue = queue.Queue(maxsize=1000)
+        ap._dataset_dropped = 0
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), ap.Handler)
+        self._port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+        self._patches = []
+        self._anthropic_conn_factory = lambda response: _FakeUpstreamConn(response)
+        self._upstream_conn_factory = lambda response: _FakeUpstreamConn(response)
+        self._patch_conn("anthropic_conn", self._anthropic_conn_factory)
+        self._patch_conn("upstream_conn", self._upstream_conn_factory)
+
+    def tearDown(self):
+        self._server.shutdown()
+        self._thread.join(timeout=5)
+        for p in self._patches:
+            p.stop()
+        ap._dataset_queue = self._saved_queue
+        ap._dataset_dropped = self._saved_dropped
+
+    def _patch_conn(self, name, factory):
+        """Patch ap.<name> so each call returns a new fake using factory(response)."""
+        calls = []
+
+        def _make_conn(response=None):
+            conn = factory(response)
+            calls.append(conn)
+            return conn
+
+        p = mock.patch.object(ap, name, _make_conn)
+        p.start()
+        self._patches.append(p)
+        attr_name = f"_{name}_calls"
+        setattr(self, attr_name, calls)
+        return _make_conn
+
+    def _set_anthropic_response(self, response):
+        def _factory(_response=None):
+            conn = self._anthropic_conn_factory(response)
+            self._anthropic_conn_calls.append(conn)
+            return conn
+        for p in self._patches:
+            if p.attribute == "anthropic_conn":
+                p.stop()
+                self._patches.remove(p)
+                break
+        p = mock.patch.object(ap, "anthropic_conn", _factory)
+        p.start()
+        self._patches.append(p)
+
+    def _set_upstream_response(self, response):
+        def _factory(_response=None):
+            conn = self._upstream_conn_factory(response)
+            self._upstream_conn_calls.append(conn)
+            return conn
+        for p in self._patches:
+            if p.attribute == "upstream_conn":
+                p.stop()
+                self._patches.remove(p)
+                break
+        p = mock.patch.object(ap, "upstream_conn", _factory)
+        p.start()
+        self._patches.append(p)
+
+    def _request(self, method, path, body=None, headers=None):
+        headers = dict(headers or {})
+        if body is not None and "Content-Length" not in headers:
+            if isinstance(body, bytes):
+                headers["Content-Length"] = str(len(body))
+            else:
+                body = body.encode("utf-8")
+                headers["Content-Length"] = str(len(body))
+        conn = http.client.HTTPConnection("127.0.0.1", self._port)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+            return resp.status, resp_headers, resp.read()
+        finally:
+            conn.close()
+
+    def _pop_anthropic_request(self):
+        self.assertTrue(self._anthropic_conn_calls, "no anthropic conn created")
+        return self._anthropic_conn_calls[-1].requests[-1]
+
+    def _pop_upstream_request(self):
+        self.assertTrue(self._upstream_conn_calls, "no upstream conn created")
+        return self._upstream_conn_calls[-1].requests[-1]
+
+    def test_post_v1_messages_passthrough_sync(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229", "max_tokens": 1024,
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"id":"msg_1"}'))
+        status, headers, body = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"x-api-key": "sk-test", "Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"id":"msg_1"}')
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "POST")
+        self.assertEqual(req["path"], "/v1/messages")
+        self.assertEqual(req["body"], payload)
+        forwarded = {k.lower(): v for k, v in req["headers"].items()}
+        self.assertEqual(forwarded.get("x-api-key"), "sk-test")
+        self.assertEqual(forwarded.get("host"), ap.AN_HOST)
+        for hop in ("connection", "transfer-encoding", "accept-encoding", "keep-alive", "proxy-connection"):
+            self.assertNotIn(hop, forwarded)
+
+        task = ap._dataset_queue.get(timeout=1)
+        self.assertEqual(task["type"], "passthrough_sync")
+        self.assertEqual(task["body_raw"], payload)
+        self.assertEqual(task["response_bytes"], b'{"id":"msg_1"}')
+
+    def test_post_v1_messages_passthrough_stream(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        lines = [b"event: ping\n", b"data: {}\n", b"\n"]
+        self._set_anthropic_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=list(lines)))
+        status, headers, body = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"x-api-key": "sk-test", "Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"".join(lines))
+
+        task = ap._dataset_queue.get(timeout=1)
+        self.assertEqual(task["type"], "passthrough_stream")
+        self.assertEqual(task["body_raw"], payload)
+        self.assertEqual(task["raw_bytes"], b"".join(lines))
+
+    def test_get_unknown_v1_path_passthrough(self):
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"data":[]}'))
+        status, headers, body = self._request("GET", "/v1/organizations")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"data":[]}')
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "GET")
+        self.assertEqual(req["path"], "/v1/organizations")
+
+    def test_get_sse_long_poll_streams(self):
+        lines = [b"event: rc-event\n", b"data: {\"x\":1}\n", b"\n", b"event: rc-event\n", b"data: {\"x\":2}\n", b"\n"]
+        self._set_anthropic_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=list(lines)))
+        status, headers, body = self._request("GET", "/v1/some-rc-stream")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"".join(lines))
+        self.assertIn("text/event-stream", headers.get("content-type", "").lower())
+
+    def test_delete_api_path_passthrough(self):
+        self._set_anthropic_response(_FakeUpstreamResponse(status=204, body=b""))
+        status, headers, body = self._request("DELETE", "/api/some-rc-resource")
+        self.assertEqual(status, 204)
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "DELETE")
+        self.assertEqual(req["path"], "/api/some-rc-resource")
+
+    def test_put_and_patch_dispatch(self):
+        for method in ("PUT", "PATCH"):
+            with self.subTest(method=method):
+                self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"ok":true}'))
+                status, headers, body = self._request(method, "/api/x", body=b'{"a":1}',
+                                                      headers={"Content-Type": "application/json"})
+                self.assertEqual(status, 200)
+                req = self._pop_anthropic_request()
+                self.assertEqual(req["method"], method)
+                self.assertEqual(req["path"], "/api/x")
+                self.assertEqual(req["body"], b'{"a":1}')
+
+    def test_non_api_path_still_404(self):
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"x":1}'))
+        status, headers, body = self._request("DELETE", "/notapi")
+        self.assertEqual(status, 404)
+        self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_post_non_json_body_api_passthrough(self):
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"received":true}'))
+        status, headers, body = self._request(
+            "POST", "/api/telemetry", body=b"\x00binary",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        self.assertEqual(status, 200)
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["body"], b"\x00binary")
+        self.assertEqual(req["headers"].get("Content-Type"), "application/octet-stream")
+        self.assertTrue(ap._dataset_queue.empty())
+
+    def test_drop_headers_not_forwarded(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229",
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{}'))
+        self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={
+                "x-api-key": "sk-test",
+                "connection": "keep-alive",
+                "transfer-encoding": "chunked",
+                "accept-encoding": "gzip",
+                "keep-alive": "timeout=5",
+                "proxy-connection": "keep-alive",
+                "Content-Type": "application/json",
+            },
+        )
+        req = self._pop_anthropic_request()
+        forwarded = {k.lower() for k in req["headers"].keys()}
+        for h in ("connection", "transfer-encoding", "accept-encoding", "keep-alive", "proxy-connection"):
+            self.assertNotIn(h, forwarded, f"hop-by-hop header {h!r} leaked")
+        self.assertEqual(req["headers"].get("Host"), ap.AN_HOST)
+
+    def test_local_model_still_routes_local(self):
+        payload = json.dumps({"model": "local-llama", "stream": False,
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        self._set_upstream_response(_FakeUpstreamResponse(body=json.dumps({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }).encode()))
+        status, headers, body = self._request("POST", "/v1/messages", body=payload,
+                                              headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["role"], "assistant")
+        self.assertEqual(data["content"], [{"type": "text", "text": "hi"}])
+        self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_local_count_tokens_still_local(self):
+        payload = json.dumps({"model": "local-llama",
+                              "messages": [{"role": "user", "content": "hello world"}]}).encode()
+        status, headers, body = self._request("POST", "/v1/messages/count_tokens", body=payload,
+                                              headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn("input_tokens", data)
+        self.assertGreater(data["input_tokens"], 0)
+        self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_api_post_not_captured_in_dataset(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229"}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{}'))
+        status, headers, body = self._request("POST", "/api/foo", body=payload,
+                                              headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        self.assertTrue(ap._dataset_queue.empty())
+
+    def test_post_json_array_body_api_passthrough(self):
+        """JSON bodies that are not objects (e.g. telemetry arrays) relay verbatim."""
+        payload = json.dumps([{"event": "x"}]).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"received":true}'))
+        status, headers, body = self._request(
+            "POST", "/api/telemetry", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"received":true}')
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "POST")
+        self.assertEqual(req["path"], "/api/telemetry")
+        self.assertEqual(req["body"], payload)
+        self.assertTrue(ap._dataset_queue.empty())
+
+    def test_post_non_dict_json_non_api_path_400(self):
+        payload = json.dumps(["not", "an", "object"]).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{}'))
+        status, headers, body = self._request(
+            "POST", "/notapi", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_get_model_by_id_passthrough(self):
+        """GET /v1/models/{id} (Anthropic 'Get a Model') relays verbatim, not the merged list."""
+        upstream = json.dumps({"id": "claude-3-opus-20240229", "type": "model"}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=upstream))
+        status, headers, body = self._request(
+            "GET", "/v1/models/claude-3-opus-20240229",
+            headers={"x-api-key": "sk-test"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, upstream)
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "GET")
+        self.assertEqual(req["path"], "/v1/models/claude-3-opus-20240229")
+
+    def test_get_models_list_still_merged(self):
+        """GET /v1/models (with or without query) keeps the merged local+upstream list."""
+        upstream = json.dumps({"data": [
+            {"id": "claude-3-opus-20240229", "type": "model"},
+        ]}).encode()
+        for path in ("/v1/models", "/v1/models?limit=5"):
+            with self.subTest(path=path):
+                self._set_anthropic_response(_FakeUpstreamResponse(body=upstream))
+                status, headers, body = self._request(
+                    "GET", path, headers={"x-api-key": "sk-test"})
+                self.assertEqual(status, 200)
+                data = json.loads(body)
+                self.assertEqual(data["object"], "list")
+                ids = [m["id"] for m in data["data"]]
+                self.assertEqual(ids[0], ap.LOCAL_ALIAS)
+                self.assertIn("claude-3-opus-20240229", ids)
+
+    def test_upstream_response_headers_forwarded(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229",
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(
+            body=b'{"id":"msg_1"}',
+            headers=[
+                ("request-id", "req_abc123"),
+                ("anthropic-ratelimit-requests-remaining", "42"),
+                ("retry-after", "7"),
+                ("Content-Length", "999"),        # hop-by-hop: must be dropped
+                ("Transfer-Encoding", "chunked"),  # hop-by-hop: must be dropped
+            ],
+        ))
+        status, headers, body = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"x-api-key": "sk-test", "Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"id":"msg_1"}')
+        self.assertEqual(headers.get("request-id"), "req_abc123")
+        self.assertEqual(headers.get("anthropic-ratelimit-requests-remaining"), "42")
+        self.assertEqual(headers.get("retry-after"), "7")
+        # Response is delimited by connection close, so length framing is dropped.
+        self.assertNotEqual(headers.get("content-length"), "999")
+        self.assertNotIn("transfer-encoding", headers)
+        self.assertEqual(headers.get("connection"), "close")
 
 
 if __name__ == "__main__":
