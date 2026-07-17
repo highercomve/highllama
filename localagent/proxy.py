@@ -115,7 +115,7 @@ OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "")
 
 OPENCODE_GO_PROVIDER = {  # model id -> wire protocol
     "glm-5.2": "openai", "glm-5.1": "openai", "glm-5": "openai",
-    "kimi-k2.7-code": "openai", "kimi-k2.6": "openai",
+    "kimi-k3": "openai", "kimi-k2.7-code": "openai", "kimi-k2.6": "openai",
     "deepseek-v4-pro": "openai", "deepseek-v4-flash": "openai",
     "mimo-v2.5": "openai", "mimo-v2.5-pro": "openai",
     "minimax-m3": "anthropic", "minimax-m2.7": "anthropic", "minimax-m2.5": "anthropic",

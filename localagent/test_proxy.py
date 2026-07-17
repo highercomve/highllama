@@ -684,6 +684,10 @@ class TestExporterHFRoundTrip(unittest.TestCase):
 class TestOpenCodeRouting(unittest.TestCase):
     def test_model_matching_with_prefix(self):
         # Known openai model in provider dict
+        model, proto = ap.get_opencode_model_and_protocol("opencode-go/kimi-k3")
+        self.assertEqual(model, "kimi-k3")
+        self.assertEqual(proto, "openai")
+
         model, proto = ap.get_opencode_model_and_protocol("opencode-go/kimi-k2.7-code")
         self.assertEqual(model, "kimi-k2.7-code")
         self.assertEqual(proto, "openai")
