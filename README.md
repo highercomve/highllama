@@ -137,13 +137,18 @@ highllama update                             # git pull llama.cpp + rebuild for 
   The embedding model is auto-discovered (embeddinggemma / bge / nomic / e5 / …)
   or set explicitly with `EMBED_MODEL=`; `--no-embeddings` opts out. Needs a
   local-file chat model.
-- **Chat template fixes:** some GGUFs ship a Jinja template llama.cpp's minja
-  engine can't render — Gemma 4's tool-use template uses `map('upper')`, so any
-  request carrying tools 500s with `NotImplemented: map: filter-mapping`, which
-  breaks agent clients (opencode, etc.). highllama auto-applies a bundled fix
-  (`templates/gemma-4-fixed.jinja`) for Gemma 4; override any model's template
-  with `--chat-template <file>` / `TEMPLATE=`, or disable the auto-fix with
-  `IGNORE_TEMPLATE=1`.
+- **Chat template fixes:** some GGUFs ship a Jinja template llama.cpp can't
+  render — Gemma 4's tool-use template upper-cases a union parameter type with
+  `map('upper')`, so a request carrying such a tool 500s with `NotImplemented:
+  map: filter-mapping`, which breaks agent clients (pi, opencode, etc.).
+  highllama auto-applies a bundled fix (`templates/gemma-4-fixed.jinja`) for
+  Gemma 4; override any model's template with `--chat-template <file>` /
+  `TEMPLATE=`, or disable the auto-fix with `IGNORE_TEMPLATE=1`.
+  Note that current llama.cpp renders most of this template with a specialized
+  native parser, which masks the bug for a *top-level* `"type":
+  ["integer","null"]` — but a union nested in an array's items still fails:
+  `{"type": "array", "items": {"type": ["string","null"]}}`. Use that shape when
+  re-testing whether the fix is still needed.
 - Everything is a flag or env var: `MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K
   KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
   PROBE PROBE_REGRESS_PCT HL_STATE`;
