@@ -115,9 +115,12 @@ OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "")
 
 OPENCODE_GO_PROVIDER = {  # model id -> wire protocol
     "glm-5.2": "openai", "glm-5.1": "openai", "glm-5": "openai",
+    "gpt-5.6-luna": "openai",
     "kimi-k3": "openai", "kimi-k2.7-code": "openai", "kimi-k2.6": "openai",
     "deepseek-v4-pro": "openai", "deepseek-v4-flash": "openai",
     "mimo-v2.5": "openai", "mimo-v2.5-pro": "openai",
+    "minimax-m3": "anthropic", "minimax-m2.7": "anthropic", "minimax-m2.5": "anthropic",
+    "qwen3.7-max": "anthropic",
     "minimax-m3": "anthropic", "minimax-m2.7": "anthropic", "minimax-m2.5": "anthropic",
     "qwen3.7-max": "anthropic", "qwen3.7-plus": "anthropic", "qwen3.6-plus": "anthropic",
 }
@@ -1585,15 +1588,68 @@ class Handler(BaseHTTPRequestHandler):
 
         if is_stream:
             response_buf = io.BytesIO()
+            saw_finish_reason = False
+            saw_tool_calls = False
+            terminal_emitted = False
+            stream_metadata = {}
+
+            def relay(line):
+                self.wfile.write(line)
+                self.wfile.flush()
+                if capture_response:
+                    response_buf.write(line)
+
+            def emit_terminal():
+                nonlocal terminal_emitted
+                if saw_finish_reason or terminal_emitted:
+                    return
+                finish_reason = "tool_calls" if saw_tool_calls else "stop"
+                terminal = dict(stream_metadata)
+                terminal["choices"] = [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason,
+                }]
+                relay(
+                    b"data: "
+                    + json.dumps(terminal, separators=(",", ":")).encode("utf-8")
+                    + b"\n\n"
+                )
+                terminal_emitted = True
+                log(
+                    "OpenCode stream ended without finish_reason; synthesized %s"
+                    % finish_reason
+                )
+
             try:
                 while True:
                     line = r.readline()
                     if not line:
                         break
-                    self.wfile.write(line)
-                    self.wfile.flush()
-                    if capture_response:
-                        response_buf.write(line)
+                    stripped = line.strip()
+                    if stripped.startswith(b"data:"):
+                        payload = stripped[5:].strip()
+                        if payload == b"[DONE]":
+                            emit_terminal()
+                        else:
+                            try:
+                                chunk = json.loads(payload)
+                            except json.JSONDecodeError:
+                                chunk = None
+                            if isinstance(chunk, dict):
+                                for key in (
+                                    "id", "object", "created", "model",
+                                    "system_fingerprint", "service_tier",
+                                ):
+                                    if chunk.get(key) not in (None, ""):
+                                        stream_metadata[key] = chunk[key]
+                                for choice in chunk.get("choices") or []:
+                                    if choice.get("finish_reason") is not None:
+                                        saw_finish_reason = True
+                                    if (choice.get("delta") or {}).get("tool_calls"):
+                                        saw_tool_calls = True
+                    relay(line)
+                emit_terminal()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:

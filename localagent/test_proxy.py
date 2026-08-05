@@ -688,6 +688,10 @@ class TestOpenCodeRouting(unittest.TestCase):
         self.assertEqual(model, "kimi-k3")
         self.assertEqual(proto, "openai")
 
+        model, proto = ap.get_opencode_model_and_protocol("opencode-go/gpt-5.6-luna")
+        self.assertEqual(model, "gpt-5.6-luna")
+        self.assertEqual(proto, "openai")
+
         model, proto = ap.get_opencode_model_and_protocol("opencode-go/kimi-k2.7-code")
         self.assertEqual(model, "kimi-k2.7-code")
         self.assertEqual(proto, "openai")
@@ -798,8 +802,10 @@ class TestAnthropicPassthrough(unittest.TestCase):
         self._patches = []
         self._anthropic_conn_factory = lambda response: _FakeUpstreamConn(response)
         self._upstream_conn_factory = lambda response: _FakeUpstreamConn(response)
+        self._opencode_conn_factory = lambda response: _FakeUpstreamConn(response)
         self._patch_conn("anthropic_conn", self._anthropic_conn_factory)
         self._patch_conn("upstream_conn", self._upstream_conn_factory)
+        self._patch_conn("opencode_conn", self._opencode_conn_factory)
 
     def tearDown(self):
         self._server.shutdown()
@@ -850,6 +856,20 @@ class TestAnthropicPassthrough(unittest.TestCase):
                 self._patches.remove(p)
                 break
         p = mock.patch.object(ap, "upstream_conn", _factory)
+        p.start()
+        self._patches.append(p)
+
+    def _set_opencode_response(self, response):
+        def _factory(_response=None):
+            conn = self._opencode_conn_factory(response)
+            self._opencode_conn_calls.append(conn)
+            return conn
+        for p in self._patches:
+            if p.attribute == "opencode_conn":
+                p.stop()
+                self._patches.remove(p)
+                break
+        p = mock.patch.object(ap, "opencode_conn", _factory)
         p.start()
         self._patches.append(p)
 
@@ -1024,6 +1044,88 @@ class TestAnthropicPassthrough(unittest.TestCase):
         self.assertIn("input_tokens", data)
         self.assertGreater(data["input_tokens"], 0)
         self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_opencode_stream_adds_missing_finish_reason(self):
+        payload = json.dumps({
+            "model": "opencode-go/gpt-5.6-luna",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"Ready."},"finish_reason":null}]}\n',
+            b'\n',
+            b'data: [DONE]\n',
+            b'\n',
+        ]
+        self._set_opencode_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=lines,
+        ))
+
+        status, headers, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", headers.get("content-type", ""))
+        data_lines = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+        self.assertEqual(json.loads(data_lines[0])["choices"][0]["delta"]["content"], "Ready.")
+        self.assertEqual(json.loads(data_lines[1])["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(data_lines[2], b"[DONE]")
+
+    def test_opencode_stream_preserves_finish_reason(self):
+        payload = json.dumps({
+            "model": "opencode-go/gpt-5.6-luna",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"length"}]}\n',
+            b'data: [DONE]\n',
+        ]
+        self._set_opencode_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=lines,
+        ))
+
+        status, _, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        data_lines = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+        self.assertEqual(len(data_lines), 2)
+        self.assertEqual(json.loads(data_lines[0])["choices"][0]["finish_reason"], "length")
+
+    def test_opencode_stream_adds_finish_reason_at_eof(self):
+        payload = json.dumps({
+            "model": "gpt-5.6-luna",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        lines = [
+            b'data: {"id":"gen-1","object":"chat.completion.chunk",'
+            b'"created":1,"model":"gpt-5.6-luna",'
+            b'"choices":[{"delta":{"content":"done"},"finish_reason":null}]}\n',
+            b'data: {"id":"gen-1","object":"chat.completion.chunk",'
+            b'"created":1,"model":"gpt-5.6-luna","choices":[],'
+            b'"usage":{"completion_tokens":1}}\n',
+        ]
+        self._set_opencode_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=lines,
+        ))
+
+        status, _, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        data_lines = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+        terminal = json.loads(data_lines[-1])
+        self.assertEqual(terminal["id"], "gen-1")
+        self.assertEqual(terminal["model"], "gpt-5.6-luna")
+        self.assertEqual(terminal["choices"][0]["finish_reason"], "stop")
 
     def test_api_post_not_captured_in_dataset(self):
         payload = json.dumps({"model": "claude-3-opus-20240229"}).encode()
