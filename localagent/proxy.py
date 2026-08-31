@@ -113,16 +113,33 @@ OPENCODE_UP = os.environ.get(
 ).rstrip("/")
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "")
 
+# Models OpenCode Go serves ONLY over the OpenAI Responses API (/v1/responses).
+# Sending them to /v1/chat/completions yields an opaque upstream 500, so the
+# proxy rejects that early with an actionable message instead.
+OPENCODE_RESPONSES_ONLY = {
+    m.strip() for m in os.environ.get(
+        "OPENCODE_RESPONSES_ONLY", "gpt-5.6-luna,grok-4.5,grok-4.6"
+    ).split(",") if m.strip()
+}
+
 OPENCODE_GO_PROVIDER = {  # model id -> wire protocol
-    "glm-5.2": "openai", "glm-5.1": "openai", "glm-5": "openai",
-    "gpt-5.6-luna": "openai",
-    "kimi-k3": "openai", "kimi-k2.7-code": "openai", "kimi-k2.6": "openai",
     "deepseek-v4-pro": "openai", "deepseek-v4-flash": "openai",
+    "deepseek-v4-flash-vision-exp": "openai",
+    "glm-5.3": "openai", "glm-5.3-flash": "openai",
+    "glm-5.2": "openai", "glm-5.1": "openai", "glm-5": "openai",
+    "gpt-5.6-luna": "openai",  # responses-only, see OPENCODE_RESPONSES_ONLY
+    "grok-4.6": "openai", "grok-4.5": "openai",  # responses-only
+    "hy4-preview": "openai", "hy3": "openai", "hy3-preview": "openai",
+    "kimi-k3": "openai", "kimi-k2.7-code": "openai",
+    "kimi-k2.6": "openai", "kimi-k2.5": "openai",
+    "longcat-2.0": "openai",
     "mimo-v2.5": "openai", "mimo-v2.5-pro": "openai",
+    "mimo-v2-pro": "openai", "mimo-v2-omni": "openai",
+    "muse-spark-1.2-contributor": "openai",
     "minimax-m3": "anthropic", "minimax-m2.7": "anthropic", "minimax-m2.5": "anthropic",
-    "qwen3.7-max": "anthropic",
-    "minimax-m3": "anthropic", "minimax-m2.7": "anthropic", "minimax-m2.5": "anthropic",
-    "qwen3.7-max": "anthropic", "qwen3.7-plus": "anthropic", "qwen3.6-plus": "anthropic",
+    "qwen3.8-max": "anthropic", "qwen3.8-flash": "anthropic",
+    "qwen3.7-max": "anthropic", "qwen3.7-plus": "anthropic",
+    "qwen3.6-plus": "anthropic", "qwen3.5-plus": "anthropic",
 }
 
 _up = urlparse(LLAMA_BASE)
@@ -1470,6 +1487,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _opencode_openai_messages(self, body, core_model):
         """Translate Anthropic /v1/messages -> OpenAI /v1/chat/completions for OpenCode Go."""
+        if core_model in OPENCODE_RESPONSES_ONLY:
+            log("opencode: %s is Responses-only; rejecting /v1/messages" % core_model)
+            return self._json(
+                400,
+                {"type": "error",
+                 "error": {
+                     "type": "invalid_request_error",
+                     "message": (
+                         "%s is only served by OpenCode Go over the OpenAI Responses API. "
+                         "Send it to /v1/responses (pi: api \"openai-responses\")." % core_model
+                     ),
+                 }},
+            )
         oai = anthropic_to_openai(body)
         oai["model"] = core_model
         if "chat_template_kwargs" in oai:
@@ -1552,6 +1582,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _opencode_openai_chat_completions(self, body, raw, core_model):
         """Relay an OpenAI completions request directly to OpenCode Go completions endpoint."""
+        if core_model in OPENCODE_RESPONSES_ONLY:
+            log("opencode: %s is Responses-only; rejecting /v1/chat/completions" % core_model)
+            return self._json(
+                400,
+                {"error": {
+                    "type": "invalid_request_error",
+                    "message": (
+                        "%s is only served by OpenCode Go over the OpenAI Responses API. "
+                        "Send it to /v1/responses (pi: api \"openai-responses\")." % core_model
+                    ),
+                }},
+            )
         body_original = json.loads(raw)
         body["model"] = core_model
         payload = json.dumps(body).encode("utf-8")
@@ -1585,6 +1627,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         capture_response = r.status == 200
+
+        if r.status != 200:
+            # Error bodies are plain JSON even when the client asked for a
+            # stream; pushing them through the SSE relay would append a
+            # synthesized finish_reason chunk to the error payload.
+            try:
+                err = r.read()
+                log("opencode upstream status", r.status, err[:300])
+                self.wfile.write(err)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                c.close()
+            return
 
         if is_stream:
             response_buf = io.BytesIO()
@@ -1682,6 +1739,67 @@ class Handler(BaseHTTPRequestHandler):
                 })
             else:
                 log("Proxy: skipping logging for sync passthrough (capture_response=%s, has_bytes=%s)" % (capture_response, response_bytes is not None))
+
+    def _opencode_openai_responses(self, raw, core_model):
+        """Relay an OpenAI Responses-API request verbatim to OpenCode Go's
+        /v1/responses. Some models (gpt-5.6-luna) are only served over the
+        Responses endpoint; pass through with the model id normalized and let
+        the upstream SSE stream straight back (no reconstruction needed — the
+        Responses protocol carries its own response.completed event)."""
+        try:
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            body = {}
+        body["model"] = core_model
+        payload = json.dumps(body).encode("utf-8")
+        log("→ /v1/responses (opencode) model=%s stream=%s keys=%s" % (
+            core_model, body.get("stream"), sorted(body.keys())))
+
+        headers = {
+            k: v for k, v in self.headers.items() if k.lower() not in _DROP_HEADERS
+        }
+        headers["Host"] = OC_HOST
+        headers["Content-Length"] = str(len(payload))
+        if OPENCODE_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENCODE_API_KEY}"
+
+        try:
+            c = opencode_conn()
+            req_path = _oc.path.rstrip('/') + "/v1/responses"
+            c.request("POST", req_path, body=payload, headers=headers)
+            r = c.getresponse()
+            log("opencode responses upstream status", r.status)
+        except Exception as e:
+            log("opencode responses upstream error:", e)
+            return self._json(
+                502,
+                {"type": "error", "error": {"type": "api_error", "message": str(e)}},
+            )
+
+        self.send_response(r.status)
+        ct = r.getheader("Content-Type", "application/json")
+        for k, v in r.getheaders():
+            if k.lower() in _DROP_HEADERS or k.lower() == "content-type":
+                continue
+            self.send_header(k, v)
+        self.send_header("Content-Type", ct)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            while True:
+                line = r.readline()
+                if not line:
+                    break
+                self.wfile.write(line)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except OSError as e:
+            log("opencode responses stream aborted:", e)
+        finally:
+            c.close()
+            log("opencode responses relay done")
 
     def _wants_anthropic_format(self):
         """Guess whether the client expects Anthropic-style /v1/models or OpenAI-style.
@@ -1840,6 +1958,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/chat/completions"):
             if opencode_core_model:
                 return self._opencode_openai_chat_completions(body, raw, opencode_core_model)
+            return self._openai_chat_completions(body, raw)
+
+        # OpenAI Responses API (used by pi for models flagged openai-responses,
+        # e.g. gpt-5.6-luna which opencode only serves over /v1/responses).
+        if self.path.startswith("/v1/responses"):
+            if opencode_core_model:
+                return self._opencode_openai_responses(raw, opencode_core_model)
             return self._openai_chat_completions(body, raw)
 
         # Intercept Anthropic messages requests for opencode models

@@ -149,9 +149,31 @@ highllama update                             # git pull llama.cpp + rebuild for 
   ["integer","null"]` — but a union nested in an array's items still fails:
   `{"type": "array", "items": {"type": ["string","null"]}}`. Use that shape when
   re-testing whether the fix is still needed.
+- **Offload as a share of the model:** `--ncmoe 73%` / `NCMOE=73%` pins that
+  fraction of the MoE expert layers to the CPU (for dense models: that fraction
+  of layers on the GPU), resolved against the GGUF's layer count at launch — so
+  one number carries across quants and sibling models of the same architecture
+  (Qwen3.6-35B-A3B and Ornith-1.5-35B-A3B both have 41 layers: `73%` = 30).
+- **Model presets:** per-model-family defaults that fill whatever flags, env and
+  `tune` records leave unset, so a plain `highllama start -m ornith-1.5` (and any
+  `reload`/`restart` of it) launches with the right offload. Built in: the
+  35B-A3B family (Qwen3.6, Qwen-AgentWorld, Ornith-1.x) → `NCMOE=73%
+  EXTRA="-ub 2048 -b 2048"`, the measured setup for the local Qwen agent. Add
+  or override in `~/.config/highllama/presets` (checked first; first match wins):
+  ```
+  # <glob>[|<glob>...]   KEY=VAL ...      (keys: NCMOE, KVTYPE, MTP, EXTRA)
+  *ornith-1.5*           NCMOE=50% MTP=off EXTRA="-b 1024"
+  ```
+  Globs are case-insensitive and match `<publisher>/<repo>/<file-stem>` of a
+  local model or the HF tag of a `-hf` launch. Preset `EXTRA` flags are skipped
+  when you already passed the same flag after `--`.
+- **`pull` fetches the vision projector too:** when a repo ships an
+  `mmproj-*.gguf`, `highllama pull <repo>:<quant>` downloads it next to the
+  weights so `start` auto-attaches it (`--mmproj`) — e.g.
+  `highllama pull ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M`.
 - Everything is a flag or env var: `MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K
   KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
-  PROBE PROBE_REGRESS_PCT HL_STATE`;
+  PROBE PROBE_REGRESS_PCT HL_STATE HL_PRESETS`;
   extra args after `--` go straight to `llama-server`.
 
 ## localagent

@@ -701,6 +701,27 @@ class TestOpenCodeRouting(unittest.TestCase):
         self.assertEqual(model, "qwen3.7-max")
         self.assertEqual(proto, "anthropic")
 
+        # Newer models in the provider dict
+        for name, expected_proto in [
+            ("glm-5.3", "openai"), ("glm-5.3-flash", "openai"),
+            ("grok-4.5", "openai"), ("grok-4.6", "openai"),
+            ("hy3", "openai"), ("hy3-preview", "openai"), ("hy4-preview", "openai"),
+            ("kimi-k2.5", "openai"), ("longcat-2.0", "openai"),
+            ("mimo-v2-omni", "openai"), ("mimo-v2-pro", "openai"),
+            ("muse-spark-1.2-contributor", "openai"),
+            ("deepseek-v4-flash-vision-exp", "openai"),
+            ("qwen3.5-plus", "anthropic"),
+            ("qwen3.8-flash", "anthropic"), ("qwen3.8-max", "anthropic"),
+        ]:
+            model, proto = ap.get_opencode_model_and_protocol(f"opencode-go/{name}")
+            self.assertEqual(model, name)
+            self.assertEqual(proto, expected_proto)
+
+        # Responses-only models are flagged as such
+        for name in ("gpt-5.6-luna", "grok-4.5", "grok-4.6"):
+            self.assertIn(name, ap.OPENCODE_RESPONSES_ONLY)
+            self.assertIn(name, ap.OPENCODE_GO_PROVIDER)
+
         # Unknown model starting with opencode- (should fallback to openai by default)
         model, proto = ap.get_opencode_model_and_protocol("opencode-go/new-unknown-model")
         self.assertEqual(model, "new-unknown-model")
@@ -1047,7 +1068,7 @@ class TestAnthropicPassthrough(unittest.TestCase):
 
     def test_opencode_stream_adds_missing_finish_reason(self):
         payload = json.dumps({
-            "model": "opencode-go/gpt-5.6-luna",
+            "model": "opencode-go/glm-5.2",
             "stream": True,
             "messages": [{"role": "user", "content": "test"}],
         }).encode()
@@ -1075,7 +1096,7 @@ class TestAnthropicPassthrough(unittest.TestCase):
 
     def test_opencode_stream_preserves_finish_reason(self):
         payload = json.dumps({
-            "model": "opencode-go/gpt-5.6-luna",
+            "model": "opencode-go/glm-5.2",
             "stream": True,
             "messages": [{"role": "user", "content": "test"}],
         }).encode()
@@ -1099,7 +1120,7 @@ class TestAnthropicPassthrough(unittest.TestCase):
 
     def test_opencode_stream_adds_finish_reason_at_eof(self):
         payload = json.dumps({
-            "model": "gpt-5.6-luna",
+            "model": "glm-5.2",
             "stream": True,
             "messages": [{"role": "user", "content": "test"}],
         }).encode()
@@ -1126,6 +1147,63 @@ class TestAnthropicPassthrough(unittest.TestCase):
         self.assertEqual(terminal["id"], "gen-1")
         self.assertEqual(terminal["model"], "gpt-5.6-luna")
         self.assertEqual(terminal["choices"][0]["finish_reason"], "stop")
+
+    def test_opencode_stream_error_relayed_verbatim(self):
+        # Upstream error bodies are plain JSON; no synthesized SSE chunk may be appended.
+        payload = json.dumps({
+            "model": "opencode-go/glm-5.2",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        err = b'{"type":"error","error":{"type":"error","message":"Internal server error"}}'
+        self._set_opencode_response(_FakeUpstreamResponse(status=500, body=err))
+
+        status, headers, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 500)
+        self.assertEqual(body, err)
+        self.assertNotIn(b"finish_reason", body)
+
+    def test_opencode_responses_only_model_rejected_on_chat_completions(self):
+        payload = json.dumps({
+            "model": "opencode-go/gpt-5.6-luna",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(status=500, body=b'{}'))
+
+        status, _, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 400)
+        data = json.loads(body)
+        self.assertIn("/v1/responses", data["error"]["message"])
+        self.assertEqual(self._opencode_conn_calls if hasattr(self, "_opencode_conn_calls") else [], [])
+
+    def test_opencode_responses_only_model_rejected_on_messages(self):
+        # grok-4.6 is Responses-only: /v1/messages must fail fast with an
+        # actionable error instead of an opaque upstream 500.
+        payload = json.dumps({
+            "model": "opencode-go/grok-4.6",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(status=500, body=b'{}'))
+
+        status, _, body = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 400)
+        data = json.loads(body)
+        self.assertIn("/v1/responses", data["error"]["message"])
+        self.assertEqual(self._opencode_conn_calls if hasattr(self, "_opencode_conn_calls") else [], [])
 
     def test_api_post_not_captured_in_dataset(self):
         payload = json.dumps({"model": "claude-3-opus-20240229"}).encode()

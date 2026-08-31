@@ -31,6 +31,8 @@
 #   highllama start -m unsloth/gpt-oss-20b-GGUF:Q8_0  # any HF repo:quant
 #   highllama start -m /path/to/model.gguf -c 32k     # any local GGUF
 #   highllama start -m <model> -c 128k --ncmoe 44     # 128k + manual offload
+#   highllama start -m <model> -c 128k --ncmoe 73%    # offload as a share of the layers
+#   highllama start -m ornith-1.5                       # model presets fill ncmoe/extras (see PRESETS)
 #   highllama start --backend mlx -m mlx-community/Qwen3-8B-4bit
 #   highllama start -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0   # spec-decoding
 #   highllama start -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL --mtp      # multi-token prediction
@@ -64,7 +66,8 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 LLAMA_DIR="${LLAMA_DIR:-$SCRIPT_DIR/llama.cpp}"
 MODEL="${MODEL:-}"        # empty => interactive picker (no-arg dynamic mode)
 CONTEXT="${CONTEXT:-64k}" # accepts 32k / 64k / 128k or a raw token count
-NCMOE="${NCMOE:-}"        # MoE layers pinned to CPU; empty = auto by free VRAM
+NCMOE="${NCMOE:-}"        # MoE layers pinned to CPU: a count, or "N%" of the layers;
+                          # empty = auto by free VRAM (or a model preset, see below)
 THREADS="${THREADS:-}"    # empty = physical cores. NEVER SMT count (gen collapses)
 KVTYPE="${KVTYPE:-}"      # KV cache quant shorthand: when set, overrides both sides (q4_0|q8_0|f16)
 KVTYPE_K="${KVTYPE_K:-}"  # K-cache quant; empty => q8_0, or KVTYPE if given. set via --kv-k
@@ -93,6 +96,26 @@ EMBED_MODEL="${EMBED_MODEL:-}"                     # embedding model (path/subst
 HL_STATE="${HL_STATE:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/speed.tsv}" # measured-speed state (probe baselines + tuned configs)
 PROBE="${PROBE:-1}"       # startup decode-speed probe: 1 = on (--no-probe / PROBE=0 to skip)
 PROBE_REGRESS_PCT="${PROBE_REGRESS_PCT:-70}" # warn when measured decode falls below this % of best-known
+HL_PRESETS="${HL_PRESETS:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/presets}" # user model presets (see MODEL_PRESETS)
+
+# ---- model presets ---------------------------------------------------------
+# Per-model-family launch defaults, applied by `start` (so `reload`/`restart`
+# inherit them) only where nothing else decided: explicit flags/env win, and so
+# does a measured `highllama tune` record. One preset per line:
+#   <glob>[|<glob>...]<space/tab>KEY=VAL [KEY=VAL ...]
+# Globs are case-insensitive and match "<publisher>/<repo>/<file-stem>" of a
+# local model (e.g. ornith-ai/Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-Q4_K_M) or
+# the HF tag of a -hf launch. Keys: NCMOE (count or N% of the layers), KVTYPE,
+# MTP (on|off), EXTRA="<llama-server flags>" (a flag already given after -- is
+# skipped). $HL_PRESETS lines are checked before these built-ins; first match wins.
+MODEL_PRESETS=(
+    # Qwen3.5-MoE 35B-A3B family — Qwen3.6-35B-A3B, Qwen-AgentWorld-35B-A3B,
+    # Ornith-1.x-35B-A3B (same architecture): 41 layers, ~21GB at Q4. On a 12GB
+    # card, 73% of the experts on CPU (30/41) is what kept 128k ctx resident and
+    # fast for the local Qwen agent (`--ncmoe 30 -- -ub 2048 -b 2048`); the 2k
+    # batches were part of that measured setup, so they travel with it.
+    '*35B-A3B*|*Ornith-*-35B*	NCMOE=73% EXTRA="-ub 2048 -b 2048"'
+)
 
 # Where local GGUFs live: LM Studio models + llama.cpp/HF download caches
 # + Unsloth Studio (legacy HF cache, fine-tune exports/outputs; its main
@@ -427,6 +450,33 @@ ctx_bucket() { # token count -> canonical band, so 60k and 64k share one record
         [ "$c" -le "$b" ] && { echo "$b"; return; }
     done
     echo "$c"
+}
+
+preset_lookup() { # <label> -> KEY=VAL tail of the first matching preset line, or nothing
+    local label="$1" line pats rest pat
+    {
+        [ -f "$HL_PRESETS" ] && cat "$HL_PRESETS"
+        printf '%s\n' "${MODEL_PRESETS[@]}"
+    } | while IFS= read -r line; do
+        case "$line" in '' | '#'*) continue ;; esac
+        pats="${line%%[[:space:]]*}"
+        rest="${line#"$pats"}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        local IFS='|'
+        for pat in $pats; do
+            # shellcheck disable=SC2254 # the preset IS a glob
+            case "${label,,}" in ${pat,,}) printf '%s\n' "$rest"; exit 0 ;; esac
+        done
+    done
+    return 0
+}
+
+resolve_ncmoe_pct() { # <count|N%> <layers> -> integer layer count (N% of <layers>, clamped)
+    local v="$1" cap="$2"
+    case "$v" in
+    *%) awk -v p="${v%\%}" -v c="$cap" 'BEGIN{n=int(p*c/100+0.5); if(n<0)n=0; if(n>c)n=c; print n}' ;;
+    *) printf '%s\n' "$v" ;;
+    esac
 }
 
 state_get() { # <kind> <alias> <gpu> <bucket> -> "config<TAB>tps<TAB>date" or nothing
@@ -967,6 +1017,25 @@ for base, g in sorted(groups.items(), key=lambda kv: kv[1]["size"]):
 PY
 }
 
+# a repo's vision projector -> one "rfilename:MiB" entry (smallest mmproj), or nothing
+hf_mmproj() {
+    python3 - "$1" <<'PY'
+import json, sys, urllib.request
+repo = sys.argv[1]
+url = f"https://huggingface.co/api/models/{repo}?blobs=true"
+req = urllib.request.Request(url, headers={"User-Agent": "highllama"})
+d = json.load(urllib.request.urlopen(req, timeout=30))
+files = []
+for s in d.get("siblings", []):
+    f = s.get("rfilename", "")
+    if f.lower().endswith(".gguf") and "mmproj" in f.lower():
+        files.append((f, (s.get("size") or 0) // (1024 * 1024)))
+if files:
+    files.sort(key=lambda t: t[1])  # f16/bf16 projectors are interchangeable: take the smallest
+    print(f"{files[0][0]}:{files[0][1]}")
+PY
+}
+
 pull_files() { # $1 = repo, $2 = comma-separated "rfilename:MiB" entries
     local repo="$1" entry f mib url dest pid rc cur last speed pct
     mkdir -p "$PULL_DIR/$repo" # publisher/repo subdirs, LM Studio layout
@@ -1099,6 +1168,14 @@ cmd_pull() {
         pick=$((choice - 1))
     fi
     pull_files "$repo" "${FILESL[$pick]}"
+    # vision models ship the projector as a separate file; grab it too so `start`
+    # can auto-attach it (--mmproj). Small next to the weights, skipped if present.
+    local mmproj
+    mmproj="$(hf_mmproj "$repo" 2>/dev/null || true)"
+    if [ -n "$mmproj" ]; then
+        echo ">> vision projector in $repo — fetching it as well"
+        pull_files "$repo" "$mmproj"
+    fi
 }
 
 # ---- help -------------------------------------------------------------------
@@ -1132,7 +1209,8 @@ COMMANDS:
 START OPTIONS:
   -m, --model <id>         local GGUF path, local substring, or HF repo:quant
   -c, --ctx <size>         context: 32k / 64k / 128k or raw tokens (default 64k)
-      --ncmoe <n>          MoE expert layers pinned to CPU (default: auto by VRAM)
+      --ncmoe <n|N%>       MoE expert layers pinned to CPU, as a count or a share of
+                           the model's layers (default: auto by VRAM, or a model preset)
   -t, --threads <n>        CPU threads (default: physical cores)
       --kv <type>          KV cache quant, both sides: q8_0 (default) | q4_0 | f16
       --kv-k <type>        K-cache quant only (default q8_0; keep symmetric with -v)
@@ -1156,7 +1234,14 @@ START OPTIONS:
       -- <args>            pass remaining args straight to llama-server
 
 Every option is also settable via env var (flag wins):
-  MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND PROBE PROBE_REGRESS_PCT HL_STATE
+  MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND PROBE PROBE_REGRESS_PCT HL_STATE HL_PRESETS
+
+PRESETS:
+  Per-model-family defaults (NCMOE, KVTYPE, MTP, EXTRA) fill whatever flags, env
+  and 'tune' records leave unset — so plain 'start'/'reload'/'restart' get the
+  right offload for a known model. Built in: the 35B-A3B family (Qwen3.6,
+  AgentWorld, Ornith-1.x) -> NCMOE=73% EXTRA="-ub 2048 -b 2048". Add your own in
+  ~/.config/highllama/presets, one per line:  <glob>[|<glob>]  KEY=VAL ...
 
 EXAMPLES:
   highllama start                                  interactive picker, 64k ctx
@@ -1164,6 +1249,8 @@ EXAMPLES:
   highllama start -m /path/to/model.gguf -c 128k
   highllama start -m <model> --draft unsloth/Qwen3-0.6B-GGUF:Q8_0
   highllama pull qwen3 coder
+  highllama pull ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M   (fetches the mmproj too)
+  highllama start -m ornith-1.5 -c 128k            preset -> n-cpu-moe=73%, -ub/-b 2048
   highllama reload -c 128k --mtp
 EOF
 }
@@ -1681,6 +1768,68 @@ if [ -n "$TUNED" ]; then
     done
 fi
 
+# ---- model presets (see MODEL_PRESETS): fill what flags/env/tune left unset ---
+if [ "${MODEL_ARGS[0]}" = "-m" ]; then
+    PRESET_LABEL="$(model_repo_label "${MODEL_ARGS[1]}")/$ALIAS"
+else
+    PRESET_LABEL="$MODEL"
+fi
+PRESET_LINE="$(preset_lookup "$PRESET_LABEL")"
+if [ -n "$PRESET_LINE" ]; then
+    PRESET_APPLIED=()
+    eval "declare -a _pkv=($PRESET_LINE)" # split like a shell line, so EXTRA="a b" stays one value
+    # shellcheck disable=SC2154 # _pkv is assigned by the eval above
+    for _kv in "${_pkv[@]}"; do
+        case "$_kv" in
+        NCMOE=*)
+            if [ -z "$NCMOE" ]; then
+                NCMOE="${_kv#*=}"
+                PRESET_APPLIED+=("$_kv")
+            fi
+            ;;
+        KVTYPE=*)
+            if [ -n "$KV_AUTO" ]; then
+                KVTYPE_K="${_kv#*=}"
+                KVTYPE_V="${_kv#*=}"
+                KV_AUTO=""
+                PRESET_APPLIED+=("$_kv")
+            fi
+            ;;
+        MTP=*)
+            if [ "${MTP:-auto}" = auto ]; then
+                MTP="${_kv#*=}"
+                PRESET_APPLIED+=("$_kv")
+            fi
+            ;;
+        EXTRA=*)
+            read -ra _pextra <<<"${_kv#*=}"
+            _padd=()
+            _i=0
+            while [ "$_i" -lt "${#_pextra[@]}" ]; do
+                _flag="${_pextra[$_i]}"
+                _val=""
+                _i=$((_i + 1))
+                # a flag consumes the next word as its value unless that is another flag
+                if [ "$_i" -lt "${#_pextra[@]}" ] && [[ "${_pextra[$_i]}" != -* ]]; then
+                    _val="${_pextra[$_i]}"
+                    _i=$((_i + 1))
+                fi
+                case " ${EXTRA[*]-} " in *" $_flag "*) continue ;; esac # user passed it: theirs wins
+                _padd+=("$_flag")
+                [ -n "$_val" ] && _padd+=("$_val")
+            done
+            if [ "${#_padd[@]}" -gt 0 ]; then
+                EXTRA=("${_padd[@]}" ${EXTRA[@]+"${EXTRA[@]}"}) # user's flags come last -> win
+                PRESET_APPLIED+=("EXTRA=\"${_padd[*]}\"")
+            fi
+            ;;
+        esac
+    done
+    if [ "${#PRESET_APPLIED[@]}" -gt 0 ]; then
+        echo ">> preset: ${PRESET_APPLIED[*]}  (model preset matched '$PRESET_LABEL'; flags/env/tune override, edit $HL_PRESETS)"
+    fi
+fi
+
 # ---- optional speculative decoding ---------------------------------------
 # MTP (multi-token prediction) and --draft both configure a draft model, so they
 # are mutually exclusive. MTP runs the draft head against the target model via
@@ -1818,7 +1967,8 @@ NCMOE_PRESET="$NCMOE" # user/tune-pinned offload value ("" = auto). The estimato
 case "$BACKEND" in
 metal | cpu)
     # unified memory / no discrete VRAM: expert offload buys nothing by default
-    [ -n "$NCMOE" ] || NCMOE=0
+    # (a percentage preset from a shared model table means nothing here either)
+    case "$NCMOE" in '' | *%) NCMOE=0 ;; esac
     ;;
 *)
     FREE_MIB="$(free_vram_mib "$BACKEND")"
@@ -1882,8 +2032,11 @@ metal | cpu)
             # offload pinned by the user or a tune record; estimator ran only
             # to resolve MODE and the cap
             EST_VAL="$NCMOE"
-            NCMOE="$NCMOE_PRESET"
-            echo ">> preset offload: $([ "$MODE" = "dense" ] && echo "-ngl" || echo "n-cpu-moe")=$NCMOE (estimator suggested $EST_VAL of $NCMOE_CAP layers)"
+            NCMOE="$(resolve_ncmoe_pct "$NCMOE_PRESET" "$NCMOE_CAP")"
+            case "$NCMOE_PRESET" in
+            *%) echo ">> preset offload: $([ "$MODE" = "dense" ] && echo "-ngl" || echo "n-cpu-moe")=$NCMOE ($NCMOE_PRESET of $NCMOE_CAP layers; estimator suggested $EST_VAL)" ;;
+            *) echo ">> preset offload: $([ "$MODE" = "dense" ] && echo "-ngl" || echo "n-cpu-moe")=$NCMOE (estimator suggested $EST_VAL of $NCMOE_CAP layers)" ;;
+            esac
         elif [ "$MODE" = "dense" ]; then
             echo ">> dense model: offloading via -ngl=$NCMOE (of $NCMOE_CAP layers) for ${FREE_MIB}MiB free, ctx=$CONTEXT"
         else
@@ -1903,7 +2056,10 @@ metal | cpu)
             fi
         fi
     elif [ -n "$NCMOE_PRESET" ]; then
-        NCMOE="$NCMOE_PRESET"
+        case "$NCMOE_PRESET" in
+        *%) echo ">> layer count unknown (no local GGUF header): resolving $NCMOE_PRESET against $NCMOE_CAP layers" ;;
+        esac
+        NCMOE="$(resolve_ncmoe_pct "$NCMOE_PRESET" "$NCMOE_CAP")"
     else # fallback: context buckets
         if [ "$CONTEXT" -le 16384 ]; then
             NCMOE=28
