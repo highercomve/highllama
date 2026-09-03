@@ -17,10 +17,23 @@ set -euo pipefail
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 HERE="$(cd "$(dirname "$SELF")" && pwd)"
 PORT="${LLAMA_PROXY_PORT:-8090}"
-PROXY_URL="http://127.0.0.1:$PORT"
+HOST="${LLAMA_PROXY_HOST:-127.0.0.1}"
+PROXY_URL="http://$HOST:$PORT"
 
-# make sure the proxy is up (also warns if llama-server is down)
-"$HERE/localagent.sh" proxy start >&2 || true
+# Is the proxy host this machine? Only then does starting the proxy locally make sense.
+is_local_host() {
+  case "$HOST" in
+    127.*|localhost|::1) return 0 ;;
+  esac
+  hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF "$HOST"
+}
+
+if is_local_host; then
+  # make sure the proxy is up (also warns if llama-server is down)
+  "$HERE/localagent.sh" proxy start >&2 || true
+else
+  echo "agent-local: proxy host $HOST is remote; not starting a local proxy" >&2
+fi
 
 AGENT="${1:-}"
 shift || true
