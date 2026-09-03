@@ -174,6 +174,14 @@ All of the environment variables below can optionally be loaded from a `.env` fi
 | `OPENCODE_API_KEY` | empty | API key / subscription token for OpenCode Go frontier models |
 | `OPENCODE_PASSTHROUGH_BASE` | `https://opencode.ai/zen/go` | upstream base endpoint URL for OpenCode Go models |
 
+OpenCode Go requires one stable `x-opencode-session` id per conversation. The
+proxy sets it on every upstream request, resolving it from (in order): a client
+header (`x-opencode-session`, Codex's `session_id`, `x-session-id`), the session
+id Claude Code embeds in `metadata.user_id`, `metadata.session_id`, and finally
+a deterministic fingerprint of the conversation opener (system + first user
+message) for anonymous clients such as curl. `x-opencode-client` is passed
+through or derived from the User-Agent.
+
 ## Choosing a local model — findings
 
 Tested gemma-4-26B-A4B vs Qwen3-Coder-30B-A3B as the agent brain, same harness/task/context:

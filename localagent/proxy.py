@@ -228,6 +228,128 @@ def get_opencode_model_and_protocol(model_name):
     return core_name, protocol
 
 
+# --- OpenCode Go session attribution -------------------------------------
+# OpenCode Go requires one stable `x-opencode-session` id per conversation
+# (requests without it may be rejected from 2026-09-06). Resolve it from, in
+# order: an explicit header the client already sends (pi/opencode send
+# x-opencode-session, Codex sends session_id), the session id Claude Code
+# embeds in Anthropic `metadata.user_id`, generic body fields, and finally a
+# deterministic fingerprint of the conversation opener so anonymous clients
+# (curl, scripts) still get a stable id across turns.
+_OC_SESSION_HEADER_NAMES = (
+    "x-opencode-session",
+    "session_id",
+    "x-session-id",
+    "conversation_id",
+    "x-conversation-id",
+)
+_SESSION_ID_RE = re.compile(r"session_?(?:id)?[\"'\s:=_]*([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})")
+_OC_SESSION_NS = uuid.UUID("6f0a7a5e-2f2b-4b4a-9c1e-5a1a5b0c0d0e")
+
+
+def _session_from_metadata_user_id(user_id):
+    """Claude Code sends metadata.user_id as a JSON string
+    {"device_id":..,"account_uuid":..,"session_id":..}; older builds used
+    user_<hash>_account_<uuid>_session_<uuid>."""
+    if not isinstance(user_id, str) or not user_id:
+        return None
+    try:
+        d = json.loads(user_id)
+        if isinstance(d, dict) and d.get("session_id"):
+            return str(d["session_id"])
+    except Exception:
+        pass
+    m = _SESSION_ID_RE.search(user_id)
+    return m.group(1) if m else None
+
+
+def _first_user_text(msgs):
+    if not isinstance(msgs, list):
+        return None
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "user":
+            return json.dumps(m.get("content"), sort_keys=True, ensure_ascii=False)
+    return None
+
+
+def _conversation_fingerprint(body):
+    """Deterministic id from the conversation opener (system/instructions + the
+    first user message). Later turns append messages, so the opener — and thus
+    the id — stays the same for the whole conversation."""
+    parts = []
+    for key in ("system", "instructions"):
+        if body.get(key):
+            parts.append(json.dumps(body[key], sort_keys=True, ensure_ascii=False))
+    inp = body.get("input")
+    if isinstance(inp, str):
+        parts.append(inp)
+    else:
+        parts.append(_first_user_text(body.get("messages")) or _first_user_text(inp) or "")
+    seed = "\x00".join(parts)
+    if not seed.strip("\x00"):
+        return str(uuid.uuid4())
+    return str(uuid.uuid5(_OC_SESSION_NS, seed))
+
+
+def opencode_session_id(headers, body):
+    """Return the x-opencode-session value for this request (see module note)."""
+    for name in _OC_SESSION_HEADER_NAMES:
+        v = headers.get(name) if headers is not None else None
+        if v and v.strip():
+            return v.strip()
+    if isinstance(body, dict):
+        md = body.get("metadata")
+        if isinstance(md, dict):
+            for k in ("session_id", "conversation_id"):
+                if md.get(k):
+                    return str(md[k])
+            sid = _session_from_metadata_user_id(md.get("user_id"))
+            if sid:
+                return sid
+        for k in ("session_id", "conversation_id"):
+            if isinstance(body.get(k), str) and body[k]:
+                return body[k]
+        return _conversation_fingerprint(body)
+    return str(uuid.uuid4())
+
+
+def opencode_client_name(headers):
+    """x-opencode-client: pass the client's own value through, else derive a
+    family name from its User-Agent."""
+    v = headers.get("x-opencode-client") if headers is not None else None
+    if v and v.strip():
+        return v.strip()
+    ua = ((headers.get("User-Agent") if headers is not None else "") or "").lower()
+    for needle, name in (("claude-cli", "claude-code"), ("codex", "codex"),
+                         ("opencode", "opencode"), ("pi-coding-agent", "pi"), ("pi/", "pi")):
+        if needle in ua:
+            return name
+    return "highllama"
+
+
+_REDACT_HEADERS = {"authorization", "x-api-key", "cookie"}
+
+
+def _redact_headers(headers):
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in _REDACT_HEADERS and v:
+            v = str(v)
+            out[k] = v[:10] + "…" + v[-4:] if len(v) > 18 else "***"
+        else:
+            out[k] = v
+    return out
+
+
+def add_opencode_session_headers(headers, req_headers, body):
+    """Set x-opencode-session / x-opencode-client on an upstream header dict and
+    log the full (secret-redacted) header set that goes to OpenCode Go."""
+    headers["x-opencode-session"] = opencode_session_id(req_headers, body)
+    headers["x-opencode-client"] = opencode_client_name(req_headers)
+    log("opencode upstream headers:", json.dumps(_redact_headers(headers), ensure_ascii=False))
+    return headers
+
+
 def _is_openai_format(body):
     """Heuristic: OpenAI chat bodies have messages whose content is typically a string
     (or array of {type:text/image_url}) and system is inside messages[]. Anthropic bodies
@@ -1415,6 +1537,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         headers["Content-Length"] = str(len(payload))
+        add_opencode_session_headers(headers, self.headers, body)
         is_stream = body.get("stream", False)
 
         try:
@@ -1522,6 +1645,8 @@ class Handler(BaseHTTPRequestHandler):
         if OPENCODE_API_KEY:
             headers["Authorization"] = f"Bearer {OPENCODE_API_KEY}"
 
+        add_opencode_session_headers(headers, self.headers, body)
+
         try:
             c = opencode_conn()
             req_path = _oc.path.rstrip('/') + "/v1/chat/completions"
@@ -1607,6 +1732,8 @@ class Handler(BaseHTTPRequestHandler):
         headers["Content-Length"] = str(len(payload))
         if OPENCODE_API_KEY:
             headers["Authorization"] = f"Bearer {OPENCODE_API_KEY}"
+
+        add_opencode_session_headers(headers, self.headers, body_original)
 
         try:
             c = opencode_conn()
@@ -1762,6 +1889,8 @@ class Handler(BaseHTTPRequestHandler):
         headers["Content-Length"] = str(len(payload))
         if OPENCODE_API_KEY:
             headers["Authorization"] = f"Bearer {OPENCODE_API_KEY}"
+
+        add_opencode_session_headers(headers, self.headers, body)
 
         try:
             c = opencode_conn()

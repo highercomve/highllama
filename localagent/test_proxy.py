@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from unittest import mock
 
 from http.server import ThreadingHTTPServer
@@ -1296,6 +1297,89 @@ class TestAnthropicPassthrough(unittest.TestCase):
         self.assertNotEqual(headers.get("content-length"), "999")
         self.assertNotIn("transfer-encoding", headers)
         self.assertEqual(headers.get("connection"), "close")
+
+    # --- x-opencode-session attribution -------------------------------------
+
+    def _oc_headers(self):
+        self.assertTrue(self._opencode_conn_calls, "no opencode conn created")
+        return self._opencode_conn_calls[-1].requests[-1]["headers"]
+
+    def test_opencode_session_from_claude_code_metadata(self):
+        sid = "77222f22-4593-4400-9b09-a080028c5fe5"
+        payload = json.dumps({
+            "model": "opencode-go/glm-5.2", "max_tokens": 64,
+            "metadata": {"user_id": json.dumps({"device_id": "d", "account_uuid": "a", "session_id": sid})},
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(
+            body=b'{"choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}]}'))
+        status, _, _ = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "claude-cli/2.1.259 (external, cli)"},
+        )
+        self.assertEqual(status, 200)
+        h = self._oc_headers()
+        self.assertEqual(h.get("x-opencode-session"), sid)
+        self.assertEqual(h.get("x-opencode-client"), "claude-code")
+
+    def test_opencode_session_anthropic_passthrough(self):
+        sid = "11111111-2222-4333-8444-555555555555"
+        payload = json.dumps({
+            "model": "opencode-qwen3.7-max", "max_tokens": 64,
+            "metadata": {"user_id": "user_abc_account_9f0e_session_%s" % sid},
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(body=b'{"id":"msg_1"}'))
+        status, _, _ = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"Content-Type": "application/json", "x-api-key": "k"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self._oc_headers().get("x-opencode-session"), sid)
+
+    def test_opencode_session_passes_through_client_header(self):
+        payload = json.dumps({
+            "model": "opencode-go/glm-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(body=b'{"choices":[]}'))
+        self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json",
+                     "x-opencode-session": "pi-sess-1", "x-opencode-client": "pi"},
+        )
+        h = self._oc_headers()
+        self.assertEqual(h.get("x-opencode-session"), "pi-sess-1")
+        self.assertEqual(h.get("x-opencode-client"), "pi")
+
+    def test_opencode_session_from_codex_session_id_header(self):
+        payload = json.dumps({"model": "opencode-go/gpt-5.6-luna", "input": "hi"}).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(body=b'{"id":"resp_1"}'))
+        self._request(
+            "POST", "/v1/responses", body=payload,
+            headers={"Content-Type": "application/json", "session_id": "codex-42",
+                     "User-Agent": "codex_cli_rs/0.149.1"},
+        )
+        h = self._oc_headers()
+        self.assertEqual(h.get("x-opencode-session"), "codex-42")
+        self.assertEqual(h.get("x-opencode-client"), "codex")
+
+    def test_opencode_session_fingerprint_stable_across_turns(self):
+        def _send(messages):
+            payload = json.dumps({"model": "opencode-go/glm-5.2", "messages": messages}).encode()
+            self._set_opencode_response(_FakeUpstreamResponse(body=b'{"choices":[]}'))
+            self._request("POST", "/v1/chat/completions", body=payload,
+                          headers={"Content-Type": "application/json", "User-Agent": "curl/8.7"})
+            return self._oc_headers()
+
+        first = [{"role": "system", "content": "s"}, {"role": "user", "content": "open"}]
+        h1 = _send(first)
+        h2 = _send(first + [{"role": "assistant", "content": "a"}, {"role": "user", "content": "more"}])
+        h3 = _send([{"role": "user", "content": "different opener"}])
+        self.assertEqual(h1["x-opencode-session"], h2["x-opencode-session"])
+        self.assertNotEqual(h1["x-opencode-session"], h3["x-opencode-session"])
+        self.assertEqual(h1["x-opencode-client"], "highllama")
+        uuid.UUID(h1["x-opencode-session"])  # well-formed
 
 
 if __name__ == "__main__":
