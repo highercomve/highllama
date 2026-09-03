@@ -113,13 +113,33 @@ OPENCODE_UP = os.environ.get(
 ).rstrip("/")
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "")
 
+# Models OpenCode Go serves ONLY over the OpenAI Responses API (/v1/responses).
+# Sending them to /v1/chat/completions yields an opaque upstream 500, so the
+# proxy rejects that early with an actionable message instead.
+OPENCODE_RESPONSES_ONLY = {
+    m.strip() for m in os.environ.get(
+        "OPENCODE_RESPONSES_ONLY", "gpt-5.6-luna,grok-4.5,grok-4.6"
+    ).split(",") if m.strip()
+}
+
 OPENCODE_GO_PROVIDER = {  # model id -> wire protocol
-    "glm-5.2": "openai", "glm-5.1": "openai", "glm-5": "openai",
-    "kimi-k2.7-code": "openai", "kimi-k2.6": "openai",
     "deepseek-v4-pro": "openai", "deepseek-v4-flash": "openai",
+    "deepseek-v4-flash-vision-exp": "openai",
+    "glm-5.3": "openai", "glm-5.3-flash": "openai",
+    "glm-5.2": "openai", "glm-5.1": "openai", "glm-5": "openai",
+    "gpt-5.6-luna": "openai",  # responses-only, see OPENCODE_RESPONSES_ONLY
+    "grok-4.6": "openai", "grok-4.5": "openai",  # responses-only
+    "hy4-preview": "openai", "hy3": "openai", "hy3-preview": "openai",
+    "kimi-k3": "openai", "kimi-k2.7-code": "openai",
+    "kimi-k2.6": "openai", "kimi-k2.5": "openai",
+    "longcat-2.0": "openai",
     "mimo-v2.5": "openai", "mimo-v2.5-pro": "openai",
+    "mimo-v2-pro": "openai", "mimo-v2-omni": "openai",
+    "muse-spark-1.2-contributor": "openai",
     "minimax-m3": "anthropic", "minimax-m2.7": "anthropic", "minimax-m2.5": "anthropic",
-    "qwen3.7-max": "anthropic", "qwen3.7-plus": "anthropic", "qwen3.6-plus": "anthropic",
+    "qwen3.8-max": "anthropic", "qwen3.8-flash": "anthropic",
+    "qwen3.7-max": "anthropic", "qwen3.7-plus": "anthropic",
+    "qwen3.6-plus": "anthropic", "qwen3.5-plus": "anthropic",
 }
 
 _up = urlparse(LLAMA_BASE)
@@ -206,6 +226,128 @@ def get_opencode_model_and_protocol(model_name):
             protocol = "openai"
             
     return core_name, protocol
+
+
+# --- OpenCode Go session attribution -------------------------------------
+# OpenCode Go requires one stable `x-opencode-session` id per conversation
+# (requests without it may be rejected from 2026-09-06). Resolve it from, in
+# order: an explicit header the client already sends (pi/opencode send
+# x-opencode-session, Codex sends session_id), the session id Claude Code
+# embeds in Anthropic `metadata.user_id`, generic body fields, and finally a
+# deterministic fingerprint of the conversation opener so anonymous clients
+# (curl, scripts) still get a stable id across turns.
+_OC_SESSION_HEADER_NAMES = (
+    "x-opencode-session",
+    "session_id",
+    "x-session-id",
+    "conversation_id",
+    "x-conversation-id",
+)
+_SESSION_ID_RE = re.compile(r"session_?(?:id)?[\"'\s:=_]*([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})")
+_OC_SESSION_NS = uuid.UUID("6f0a7a5e-2f2b-4b4a-9c1e-5a1a5b0c0d0e")
+
+
+def _session_from_metadata_user_id(user_id):
+    """Claude Code sends metadata.user_id as a JSON string
+    {"device_id":..,"account_uuid":..,"session_id":..}; older builds used
+    user_<hash>_account_<uuid>_session_<uuid>."""
+    if not isinstance(user_id, str) or not user_id:
+        return None
+    try:
+        d = json.loads(user_id)
+        if isinstance(d, dict) and d.get("session_id"):
+            return str(d["session_id"])
+    except Exception:
+        pass
+    m = _SESSION_ID_RE.search(user_id)
+    return m.group(1) if m else None
+
+
+def _first_user_text(msgs):
+    if not isinstance(msgs, list):
+        return None
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "user":
+            return json.dumps(m.get("content"), sort_keys=True, ensure_ascii=False)
+    return None
+
+
+def _conversation_fingerprint(body):
+    """Deterministic id from the conversation opener (system/instructions + the
+    first user message). Later turns append messages, so the opener — and thus
+    the id — stays the same for the whole conversation."""
+    parts = []
+    for key in ("system", "instructions"):
+        if body.get(key):
+            parts.append(json.dumps(body[key], sort_keys=True, ensure_ascii=False))
+    inp = body.get("input")
+    if isinstance(inp, str):
+        parts.append(inp)
+    else:
+        parts.append(_first_user_text(body.get("messages")) or _first_user_text(inp) or "")
+    seed = "\x00".join(parts)
+    if not seed.strip("\x00"):
+        return str(uuid.uuid4())
+    return str(uuid.uuid5(_OC_SESSION_NS, seed))
+
+
+def opencode_session_id(headers, body):
+    """Return the x-opencode-session value for this request (see module note)."""
+    for name in _OC_SESSION_HEADER_NAMES:
+        v = headers.get(name) if headers is not None else None
+        if v and v.strip():
+            return v.strip()
+    if isinstance(body, dict):
+        md = body.get("metadata")
+        if isinstance(md, dict):
+            for k in ("session_id", "conversation_id"):
+                if md.get(k):
+                    return str(md[k])
+            sid = _session_from_metadata_user_id(md.get("user_id"))
+            if sid:
+                return sid
+        for k in ("session_id", "conversation_id"):
+            if isinstance(body.get(k), str) and body[k]:
+                return body[k]
+        return _conversation_fingerprint(body)
+    return str(uuid.uuid4())
+
+
+def opencode_client_name(headers):
+    """x-opencode-client: pass the client's own value through, else derive a
+    family name from its User-Agent."""
+    v = headers.get("x-opencode-client") if headers is not None else None
+    if v and v.strip():
+        return v.strip()
+    ua = ((headers.get("User-Agent") if headers is not None else "") or "").lower()
+    for needle, name in (("claude-cli", "claude-code"), ("codex", "codex"),
+                         ("opencode", "opencode"), ("pi-coding-agent", "pi"), ("pi/", "pi")):
+        if needle in ua:
+            return name
+    return "highllama"
+
+
+_REDACT_HEADERS = {"authorization", "x-api-key", "cookie"}
+
+
+def _redact_headers(headers):
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in _REDACT_HEADERS and v:
+            v = str(v)
+            out[k] = v[:10] + "…" + v[-4:] if len(v) > 18 else "***"
+        else:
+            out[k] = v
+    return out
+
+
+def add_opencode_session_headers(headers, req_headers, body):
+    """Set x-opencode-session / x-opencode-client on an upstream header dict and
+    log the full (secret-redacted) header set that goes to OpenCode Go."""
+    headers["x-opencode-session"] = opencode_session_id(req_headers, body)
+    headers["x-opencode-client"] = opencode_client_name(req_headers)
+    log("opencode upstream headers:", json.dumps(_redact_headers(headers), ensure_ascii=False))
+    return headers
 
 
 def _is_openai_format(body):
@@ -1267,6 +1409,10 @@ class Handler(BaseHTTPRequestHandler):
     def _passthrough(self, raw):
         """Relay an Anthropic-format request verbatim to api.anthropic.com and stream
         the response straight back. Used for every non-local model (e.g. Opus)."""
+        log("Proxy: passthrough %s %s" % (self.command, self.path))
+        if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            log("Proxy: WARNING WebSocket upgrade not supported, relaying as plain HTTP")
+
         headers = {
             k: v for k, v in self.headers.items() if k.lower() not in _DROP_HEADERS
         }
@@ -1294,14 +1440,27 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(r.status)
         ct = r.getheader("Content-Type", "application/json")
+        # Forward upstream response headers (request-id, anthropic-ratelimit-*,
+        # retry-after, location, ...) so /rc clients can correlate and back off.
+        # Hop-by-hop headers (incl. content-length/transfer-encoding) are dropped
+        # because we delimit the relayed response by connection close instead.
+        for k, v in r.getheaders():
+            if k.lower() in _DROP_HEADERS or k.lower() == "content-type":
+                continue
+            self.send_header(k, v)
         self.send_header("Content-Type", ct)
         # delimit by connection close so we don't have to re-chunk streamed SSE
         self.send_header("Connection", "close")
         self.end_headers()
 
-        capture_response = r.status == 200 and body is not None
+        is_sse_response = "text/event-stream" in (ct or "").lower()
+        path_only = self.path.split("?", 1)[0]
+        capture_response = (
+            r.status == 200 and body is not None
+            and path_only.startswith("/v1/messages")
+        )
 
-        if is_stream:
+        if is_stream or is_sse_response:
             response_buf = io.BytesIO()
             try:
                 while True:
@@ -1314,6 +1473,10 @@ class Handler(BaseHTTPRequestHandler):
                         response_buf.write(line)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except OSError as e:
+                # e.g. TimeoutError on an idle upstream SSE socket: tear down
+                # quietly instead of letting socketserver dump a traceback.
+                log("Proxy: passthrough stream aborted:", e)
             finally:
                 c.close()
 
@@ -1336,6 +1499,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except OSError as e:
+                log("Proxy: passthrough read aborted:", e)
             finally:
                 c.close()
 
@@ -1372,6 +1537,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         headers["Content-Length"] = str(len(payload))
+        add_opencode_session_headers(headers, self.headers, body)
         is_stream = body.get("stream", False)
 
         try:
@@ -1444,6 +1610,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _opencode_openai_messages(self, body, core_model):
         """Translate Anthropic /v1/messages -> OpenAI /v1/chat/completions for OpenCode Go."""
+        if core_model in OPENCODE_RESPONSES_ONLY:
+            log("opencode: %s is Responses-only; rejecting /v1/messages" % core_model)
+            return self._json(
+                400,
+                {"type": "error",
+                 "error": {
+                     "type": "invalid_request_error",
+                     "message": (
+                         "%s is only served by OpenCode Go over the OpenAI Responses API. "
+                         "Send it to /v1/responses (pi: api \"openai-responses\")." % core_model
+                     ),
+                 }},
+            )
         oai = anthropic_to_openai(body)
         oai["model"] = core_model
         if "chat_template_kwargs" in oai:
@@ -1465,6 +1644,8 @@ class Handler(BaseHTTPRequestHandler):
         }
         if OPENCODE_API_KEY:
             headers["Authorization"] = f"Bearer {OPENCODE_API_KEY}"
+
+        add_opencode_session_headers(headers, self.headers, body)
 
         try:
             c = opencode_conn()
@@ -1526,6 +1707,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _opencode_openai_chat_completions(self, body, raw, core_model):
         """Relay an OpenAI completions request directly to OpenCode Go completions endpoint."""
+        if core_model in OPENCODE_RESPONSES_ONLY:
+            log("opencode: %s is Responses-only; rejecting /v1/chat/completions" % core_model)
+            return self._json(
+                400,
+                {"error": {
+                    "type": "invalid_request_error",
+                    "message": (
+                        "%s is only served by OpenCode Go over the OpenAI Responses API. "
+                        "Send it to /v1/responses (pi: api \"openai-responses\")." % core_model
+                    ),
+                }},
+            )
         body_original = json.loads(raw)
         body["model"] = core_model
         payload = json.dumps(body).encode("utf-8")
@@ -1539,6 +1732,8 @@ class Handler(BaseHTTPRequestHandler):
         headers["Content-Length"] = str(len(payload))
         if OPENCODE_API_KEY:
             headers["Authorization"] = f"Bearer {OPENCODE_API_KEY}"
+
+        add_opencode_session_headers(headers, self.headers, body_original)
 
         try:
             c = opencode_conn()
@@ -1560,17 +1755,85 @@ class Handler(BaseHTTPRequestHandler):
 
         capture_response = r.status == 200
 
+        if r.status != 200:
+            # Error bodies are plain JSON even when the client asked for a
+            # stream; pushing them through the SSE relay would append a
+            # synthesized finish_reason chunk to the error payload.
+            try:
+                err = r.read()
+                log("opencode upstream status", r.status, err[:300])
+                self.wfile.write(err)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                c.close()
+            return
+
         if is_stream:
             response_buf = io.BytesIO()
+            saw_finish_reason = False
+            saw_tool_calls = False
+            terminal_emitted = False
+            stream_metadata = {}
+
+            def relay(line):
+                self.wfile.write(line)
+                self.wfile.flush()
+                if capture_response:
+                    response_buf.write(line)
+
+            def emit_terminal():
+                nonlocal terminal_emitted
+                if saw_finish_reason or terminal_emitted:
+                    return
+                finish_reason = "tool_calls" if saw_tool_calls else "stop"
+                terminal = dict(stream_metadata)
+                terminal["choices"] = [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason,
+                }]
+                relay(
+                    b"data: "
+                    + json.dumps(terminal, separators=(",", ":")).encode("utf-8")
+                    + b"\n\n"
+                )
+                terminal_emitted = True
+                log(
+                    "OpenCode stream ended without finish_reason; synthesized %s"
+                    % finish_reason
+                )
+
             try:
                 while True:
                     line = r.readline()
                     if not line:
                         break
-                    self.wfile.write(line)
-                    self.wfile.flush()
-                    if capture_response:
-                        response_buf.write(line)
+                    stripped = line.strip()
+                    if stripped.startswith(b"data:"):
+                        payload = stripped[5:].strip()
+                        if payload == b"[DONE]":
+                            emit_terminal()
+                        else:
+                            try:
+                                chunk = json.loads(payload)
+                            except json.JSONDecodeError:
+                                chunk = None
+                            if isinstance(chunk, dict):
+                                for key in (
+                                    "id", "object", "created", "model",
+                                    "system_fingerprint", "service_tier",
+                                ):
+                                    if chunk.get(key) not in (None, ""):
+                                        stream_metadata[key] = chunk[key]
+                                for choice in chunk.get("choices") or []:
+                                    if choice.get("finish_reason") is not None:
+                                        saw_finish_reason = True
+                                    if (choice.get("delta") or {}).get("tool_calls"):
+                                        saw_tool_calls = True
+                    relay(line)
+                emit_terminal()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
@@ -1604,6 +1867,69 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 log("Proxy: skipping logging for sync passthrough (capture_response=%s, has_bytes=%s)" % (capture_response, response_bytes is not None))
 
+    def _opencode_openai_responses(self, raw, core_model):
+        """Relay an OpenAI Responses-API request verbatim to OpenCode Go's
+        /v1/responses. Some models (gpt-5.6-luna) are only served over the
+        Responses endpoint; pass through with the model id normalized and let
+        the upstream SSE stream straight back (no reconstruction needed — the
+        Responses protocol carries its own response.completed event)."""
+        try:
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            body = {}
+        body["model"] = core_model
+        payload = json.dumps(body).encode("utf-8")
+        log("→ /v1/responses (opencode) model=%s stream=%s keys=%s" % (
+            core_model, body.get("stream"), sorted(body.keys())))
+
+        headers = {
+            k: v for k, v in self.headers.items() if k.lower() not in _DROP_HEADERS
+        }
+        headers["Host"] = OC_HOST
+        headers["Content-Length"] = str(len(payload))
+        if OPENCODE_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENCODE_API_KEY}"
+
+        add_opencode_session_headers(headers, self.headers, body)
+
+        try:
+            c = opencode_conn()
+            req_path = _oc.path.rstrip('/') + "/v1/responses"
+            c.request("POST", req_path, body=payload, headers=headers)
+            r = c.getresponse()
+            log("opencode responses upstream status", r.status)
+        except Exception as e:
+            log("opencode responses upstream error:", e)
+            return self._json(
+                502,
+                {"type": "error", "error": {"type": "api_error", "message": str(e)}},
+            )
+
+        self.send_response(r.status)
+        ct = r.getheader("Content-Type", "application/json")
+        for k, v in r.getheaders():
+            if k.lower() in _DROP_HEADERS or k.lower() == "content-type":
+                continue
+            self.send_header(k, v)
+        self.send_header("Content-Type", ct)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            while True:
+                line = r.readline()
+                if not line:
+                    break
+                self.wfile.write(line)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except OSError as e:
+            log("opencode responses stream aborted:", e)
+        finally:
+            c.close()
+            log("opencode responses relay done")
+
     def _wants_anthropic_format(self):
         """Guess whether the client expects Anthropic-style /v1/models or OpenAI-style.
         Default to Anthropic to preserve existing Claude Code gateway behavior."""
@@ -1630,7 +1956,9 @@ class Handler(BaseHTTPRequestHandler):
                     "passthrough": ANTHROPIC_UP,
                 },
             )
-        if self.path.startswith("/v1/models"):
+        # Only the exact list endpoint gets the merged local+upstream response;
+        # GET /v1/models/{model_id} (Anthropic "Get a Model") relays verbatim below.
+        if self.path.split("?", 1)[0] == "/v1/models":
             is_anthropic = self._wants_anthropic_format()
             # Fetch upstream models so the proxy can be used as a full gateway.
             upstream_data = []
@@ -1705,19 +2033,51 @@ class Handler(BaseHTTPRequestHandler):
                     "last_id": data[-1]["id"] if data else LOCAL_ALIAS,
                 },
             )
+        if self.path.startswith("/v1/") or self.path.startswith("/api/"):
+            return self._passthrough(self._read_raw())
         self._json(404, {"error": "not found"})
+
+    def _route_other_method(self):
+        """Relay any Anthropic-API-surface request (required for Claude Code /rc)."""
+        path_only = self.path.split("?", 1)[0]
+        if path_only.startswith("/v1/") or path_only.startswith("/api/"):
+            return self._passthrough(self._read_raw())
+        return self._json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        return self._route_other_method()
+
+    def do_PUT(self):
+        return self._route_other_method()
+
+    def do_PATCH(self):
+        return self._route_other_method()
+
+    def do_OPTIONS(self):
+        return self._route_other_method()
+
+    def do_HEAD(self):
+        return self._route_other_method()
 
     def do_POST(self):
         raw = self._read_raw()
+        path_only = self.path.split("?", 1)[0]
         try:
             body = json.loads(raw) if raw else {}
-        except Exception as e:  # noqa
+            if not isinstance(body, dict):
+                # JSON that isn't an object (list/string/number/null) cannot carry
+                # a "model" key — treat it exactly like a non-JSON body below.
+                raise ValueError("non-object JSON body")
+        except Exception:
+            # Non-JSON (or non-object JSON) body: cannot be a local-model request.
+            # Relay verbatim if it targets the Anthropic API surface; otherwise
+            # reject as before.
+            if path_only.startswith("/v1/") or path_only.startswith("/api/"):
+                return self._passthrough(raw)
             return self._json(
                 400,
-                {
-                    "type": "error",
-                    "error": {"type": "invalid_request_error", "message": str(e)},
-                },
+                {"type": "error",
+                 "error": {"type": "invalid_request_error", "message": "invalid JSON body"}},
             )
 
         req_model = body.get("model", MODEL)
@@ -1729,6 +2089,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._opencode_openai_chat_completions(body, raw, opencode_core_model)
             return self._openai_chat_completions(body, raw)
 
+        # OpenAI Responses API (used by pi for models flagged openai-responses,
+        # e.g. gpt-5.6-luna which opencode only serves over /v1/responses).
+        if self.path.startswith("/v1/responses"):
+            if opencode_core_model:
+                return self._opencode_openai_responses(raw, opencode_core_model)
+            return self._openai_chat_completions(body, raw)
+
         # Intercept Anthropic messages requests for opencode models
         if self.path.startswith("/v1/messages") and opencode_core_model:
             if opencode_proto == "anthropic":
@@ -1736,11 +2103,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 return self._opencode_openai_messages(body, opencode_core_model)
 
-        # ROUTER: non-local models are relayed verbatim to Anthropic.
-        if self.path.startswith("/v1/") and not is_local_model(req_model):
+        # ROUTER: only the exact local surface with a local model stays local;
+        # everything else Anthropic-shaped relays verbatim (required for /rc).
+        is_local = is_local_model(req_model)
+        local_path = path_only in ("/v1/messages", "/v1/messages/count_tokens")
+        if (path_only.startswith("/v1/") or path_only.startswith("/api/")) and not (
+            is_local and local_path
+        ):
             return self._passthrough(raw)
 
-        if self.path.endswith("/count_tokens"):
+        if path_only.endswith("/count_tokens"):
             return self._json(200, {"input_tokens": estimate_tokens(body)})
 
         if not self.path.startswith("/v1/messages"):

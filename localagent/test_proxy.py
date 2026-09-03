@@ -4,15 +4,20 @@
 Stdlib unittest only — no pytest, no extra deps. Run with:
     python3 -m unittest localagent.test_proxy -v
 """
+import http.client
 import json
 import os
+import queue
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import uuid
 from unittest import mock
+
+from http.server import ThreadingHTTPServer
 
 # Make the localagent package importable when run from the repo root or the
 # localagent dir.
@@ -680,6 +685,14 @@ class TestExporterHFRoundTrip(unittest.TestCase):
 class TestOpenCodeRouting(unittest.TestCase):
     def test_model_matching_with_prefix(self):
         # Known openai model in provider dict
+        model, proto = ap.get_opencode_model_and_protocol("opencode-go/kimi-k3")
+        self.assertEqual(model, "kimi-k3")
+        self.assertEqual(proto, "openai")
+
+        model, proto = ap.get_opencode_model_and_protocol("opencode-go/gpt-5.6-luna")
+        self.assertEqual(model, "gpt-5.6-luna")
+        self.assertEqual(proto, "openai")
+
         model, proto = ap.get_opencode_model_and_protocol("opencode-go/kimi-k2.7-code")
         self.assertEqual(model, "kimi-k2.7-code")
         self.assertEqual(proto, "openai")
@@ -688,6 +701,27 @@ class TestOpenCodeRouting(unittest.TestCase):
         model, proto = ap.get_opencode_model_and_protocol("opencode-qwen3.7-max")
         self.assertEqual(model, "qwen3.7-max")
         self.assertEqual(proto, "anthropic")
+
+        # Newer models in the provider dict
+        for name, expected_proto in [
+            ("glm-5.3", "openai"), ("glm-5.3-flash", "openai"),
+            ("grok-4.5", "openai"), ("grok-4.6", "openai"),
+            ("hy3", "openai"), ("hy3-preview", "openai"), ("hy4-preview", "openai"),
+            ("kimi-k2.5", "openai"), ("longcat-2.0", "openai"),
+            ("mimo-v2-omni", "openai"), ("mimo-v2-pro", "openai"),
+            ("muse-spark-1.2-contributor", "openai"),
+            ("deepseek-v4-flash-vision-exp", "openai"),
+            ("qwen3.5-plus", "anthropic"),
+            ("qwen3.8-flash", "anthropic"), ("qwen3.8-max", "anthropic"),
+        ]:
+            model, proto = ap.get_opencode_model_and_protocol(f"opencode-go/{name}")
+            self.assertEqual(model, name)
+            self.assertEqual(proto, expected_proto)
+
+        # Responses-only models are flagged as such
+        for name in ("gpt-5.6-luna", "grok-4.5", "grok-4.6"):
+            self.assertIn(name, ap.OPENCODE_RESPONSES_ONLY)
+            self.assertIn(name, ap.OPENCODE_GO_PROVIDER)
 
         # Unknown model starting with opencode- (should fallback to openai by default)
         model, proto = ap.get_opencode_model_and_protocol("opencode-go/new-unknown-model")
@@ -724,6 +758,628 @@ class TestOpenCodeRouting(unittest.TestCase):
                 
             self.assertEqual(os.environ.get("TEST_ENV_VAR_X"), "val_x")
             self.assertEqual(os.environ.get("TEST_ENV_VAR_Y"), "val_y")
+
+
+# ---------------------------------------------------------------------------
+# Anthropic passthrough tests (live ephemeral server + patched upstreams)
+# ---------------------------------------------------------------------------
+
+class _FakeUpstreamResponse:
+    def __init__(self, status=200, body=b"{}", content_type="application/json",
+                 lines=None, headers=None):
+        self.status = status
+        self._body = body
+        self._lines = list(lines or [])
+        self._ct = content_type
+        self._headers = list(headers or [])
+
+    def getheader(self, name, default=None):
+        if name.lower() == "content-type":
+            return self._ct
+        for k, v in self._headers:
+            if k.lower() == name.lower():
+                return v
+        return default
+
+    def getheaders(self):
+        return [("Content-Type", self._ct)] + self._headers
+
+    def read(self):
+        return self._body
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+
+class _FakeUpstreamConn:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def request(self, method, path, body=None, headers=None):
+        self.requests.append({"method": method, "path": path,
+                              "body": body, "headers": dict(headers or {})})
+
+    def getresponse(self):
+        return self.response
+
+    def close(self):
+        pass
+
+
+class TestAnthropicPassthrough(unittest.TestCase):
+    """End-to-end proxy dispatch with faked upstream Anthropic/llama-server."""
+
+    def setUp(self):
+        self._saved_queue = ap._dataset_queue
+        self._saved_dropped = ap._dataset_dropped
+        ap._dataset_queue = queue.Queue(maxsize=1000)
+        ap._dataset_dropped = 0
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), ap.Handler)
+        self._port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+        self._patches = []
+        self._anthropic_conn_factory = lambda response: _FakeUpstreamConn(response)
+        self._upstream_conn_factory = lambda response: _FakeUpstreamConn(response)
+        self._opencode_conn_factory = lambda response: _FakeUpstreamConn(response)
+        self._patch_conn("anthropic_conn", self._anthropic_conn_factory)
+        self._patch_conn("upstream_conn", self._upstream_conn_factory)
+        self._patch_conn("opencode_conn", self._opencode_conn_factory)
+
+    def tearDown(self):
+        self._server.shutdown()
+        self._thread.join(timeout=5)
+        for p in self._patches:
+            p.stop()
+        ap._dataset_queue = self._saved_queue
+        ap._dataset_dropped = self._saved_dropped
+
+    def _patch_conn(self, name, factory):
+        """Patch ap.<name> so each call returns a new fake using factory(response)."""
+        calls = []
+
+        def _make_conn(response=None):
+            conn = factory(response)
+            calls.append(conn)
+            return conn
+
+        p = mock.patch.object(ap, name, _make_conn)
+        p.start()
+        self._patches.append(p)
+        attr_name = f"_{name}_calls"
+        setattr(self, attr_name, calls)
+        return _make_conn
+
+    def _set_anthropic_response(self, response):
+        def _factory(_response=None):
+            conn = self._anthropic_conn_factory(response)
+            self._anthropic_conn_calls.append(conn)
+            return conn
+        for p in self._patches:
+            if p.attribute == "anthropic_conn":
+                p.stop()
+                self._patches.remove(p)
+                break
+        p = mock.patch.object(ap, "anthropic_conn", _factory)
+        p.start()
+        self._patches.append(p)
+
+    def _set_upstream_response(self, response):
+        def _factory(_response=None):
+            conn = self._upstream_conn_factory(response)
+            self._upstream_conn_calls.append(conn)
+            return conn
+        for p in self._patches:
+            if p.attribute == "upstream_conn":
+                p.stop()
+                self._patches.remove(p)
+                break
+        p = mock.patch.object(ap, "upstream_conn", _factory)
+        p.start()
+        self._patches.append(p)
+
+    def _set_opencode_response(self, response):
+        def _factory(_response=None):
+            conn = self._opencode_conn_factory(response)
+            self._opencode_conn_calls.append(conn)
+            return conn
+        for p in self._patches:
+            if p.attribute == "opencode_conn":
+                p.stop()
+                self._patches.remove(p)
+                break
+        p = mock.patch.object(ap, "opencode_conn", _factory)
+        p.start()
+        self._patches.append(p)
+
+    def _request(self, method, path, body=None, headers=None):
+        headers = dict(headers or {})
+        if body is not None and "Content-Length" not in headers:
+            if isinstance(body, bytes):
+                headers["Content-Length"] = str(len(body))
+            else:
+                body = body.encode("utf-8")
+                headers["Content-Length"] = str(len(body))
+        conn = http.client.HTTPConnection("127.0.0.1", self._port)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+            return resp.status, resp_headers, resp.read()
+        finally:
+            conn.close()
+
+    def _pop_anthropic_request(self):
+        self.assertTrue(self._anthropic_conn_calls, "no anthropic conn created")
+        return self._anthropic_conn_calls[-1].requests[-1]
+
+    def _pop_upstream_request(self):
+        self.assertTrue(self._upstream_conn_calls, "no upstream conn created")
+        return self._upstream_conn_calls[-1].requests[-1]
+
+    def test_post_v1_messages_passthrough_sync(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229", "max_tokens": 1024,
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"id":"msg_1"}'))
+        status, headers, body = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"x-api-key": "sk-test", "Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"id":"msg_1"}')
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "POST")
+        self.assertEqual(req["path"], "/v1/messages")
+        self.assertEqual(req["body"], payload)
+        forwarded = {k.lower(): v for k, v in req["headers"].items()}
+        self.assertEqual(forwarded.get("x-api-key"), "sk-test")
+        self.assertEqual(forwarded.get("host"), ap.AN_HOST)
+        for hop in ("connection", "transfer-encoding", "accept-encoding", "keep-alive", "proxy-connection"):
+            self.assertNotIn(hop, forwarded)
+
+        task = ap._dataset_queue.get(timeout=1)
+        self.assertEqual(task["type"], "passthrough_sync")
+        self.assertEqual(task["body_raw"], payload)
+        self.assertEqual(task["response_bytes"], b'{"id":"msg_1"}')
+
+    def test_post_v1_messages_passthrough_stream(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        lines = [b"event: ping\n", b"data: {}\n", b"\n"]
+        self._set_anthropic_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=list(lines)))
+        status, headers, body = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"x-api-key": "sk-test", "Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"".join(lines))
+
+        task = ap._dataset_queue.get(timeout=1)
+        self.assertEqual(task["type"], "passthrough_stream")
+        self.assertEqual(task["body_raw"], payload)
+        self.assertEqual(task["raw_bytes"], b"".join(lines))
+
+    def test_get_unknown_v1_path_passthrough(self):
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"data":[]}'))
+        status, headers, body = self._request("GET", "/v1/organizations")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"data":[]}')
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "GET")
+        self.assertEqual(req["path"], "/v1/organizations")
+
+    def test_get_sse_long_poll_streams(self):
+        lines = [b"event: rc-event\n", b"data: {\"x\":1}\n", b"\n", b"event: rc-event\n", b"data: {\"x\":2}\n", b"\n"]
+        self._set_anthropic_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=list(lines)))
+        status, headers, body = self._request("GET", "/v1/some-rc-stream")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"".join(lines))
+        self.assertIn("text/event-stream", headers.get("content-type", "").lower())
+
+    def test_delete_api_path_passthrough(self):
+        self._set_anthropic_response(_FakeUpstreamResponse(status=204, body=b""))
+        status, headers, body = self._request("DELETE", "/api/some-rc-resource")
+        self.assertEqual(status, 204)
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "DELETE")
+        self.assertEqual(req["path"], "/api/some-rc-resource")
+
+    def test_put_and_patch_dispatch(self):
+        for method in ("PUT", "PATCH"):
+            with self.subTest(method=method):
+                self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"ok":true}'))
+                status, headers, body = self._request(method, "/api/x", body=b'{"a":1}',
+                                                      headers={"Content-Type": "application/json"})
+                self.assertEqual(status, 200)
+                req = self._pop_anthropic_request()
+                self.assertEqual(req["method"], method)
+                self.assertEqual(req["path"], "/api/x")
+                self.assertEqual(req["body"], b'{"a":1}')
+
+    def test_non_api_path_still_404(self):
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"x":1}'))
+        status, headers, body = self._request("DELETE", "/notapi")
+        self.assertEqual(status, 404)
+        self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_post_non_json_body_api_passthrough(self):
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"received":true}'))
+        status, headers, body = self._request(
+            "POST", "/api/telemetry", body=b"\x00binary",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        self.assertEqual(status, 200)
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["body"], b"\x00binary")
+        self.assertEqual(req["headers"].get("Content-Type"), "application/octet-stream")
+        self.assertTrue(ap._dataset_queue.empty())
+
+    def test_drop_headers_not_forwarded(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229",
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{}'))
+        self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={
+                "x-api-key": "sk-test",
+                "connection": "keep-alive",
+                "transfer-encoding": "chunked",
+                "accept-encoding": "gzip",
+                "keep-alive": "timeout=5",
+                "proxy-connection": "keep-alive",
+                "Content-Type": "application/json",
+            },
+        )
+        req = self._pop_anthropic_request()
+        forwarded = {k.lower() for k in req["headers"].keys()}
+        for h in ("connection", "transfer-encoding", "accept-encoding", "keep-alive", "proxy-connection"):
+            self.assertNotIn(h, forwarded, f"hop-by-hop header {h!r} leaked")
+        self.assertEqual(req["headers"].get("Host"), ap.AN_HOST)
+
+    def test_local_model_still_routes_local(self):
+        payload = json.dumps({"model": "local-llama", "stream": False,
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        self._set_upstream_response(_FakeUpstreamResponse(body=json.dumps({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }).encode()))
+        status, headers, body = self._request("POST", "/v1/messages", body=payload,
+                                              headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["role"], "assistant")
+        self.assertEqual(data["content"], [{"type": "text", "text": "hi"}])
+        self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_local_count_tokens_still_local(self):
+        payload = json.dumps({"model": "local-llama",
+                              "messages": [{"role": "user", "content": "hello world"}]}).encode()
+        status, headers, body = self._request("POST", "/v1/messages/count_tokens", body=payload,
+                                              headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn("input_tokens", data)
+        self.assertGreater(data["input_tokens"], 0)
+        self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_opencode_stream_adds_missing_finish_reason(self):
+        payload = json.dumps({
+            "model": "opencode-go/glm-5.2",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"Ready."},"finish_reason":null}]}\n',
+            b'\n',
+            b'data: [DONE]\n',
+            b'\n',
+        ]
+        self._set_opencode_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=lines,
+        ))
+
+        status, headers, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", headers.get("content-type", ""))
+        data_lines = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+        self.assertEqual(json.loads(data_lines[0])["choices"][0]["delta"]["content"], "Ready.")
+        self.assertEqual(json.loads(data_lines[1])["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(data_lines[2], b"[DONE]")
+
+    def test_opencode_stream_preserves_finish_reason(self):
+        payload = json.dumps({
+            "model": "opencode-go/glm-5.2",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"length"}]}\n',
+            b'data: [DONE]\n',
+        ]
+        self._set_opencode_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=lines,
+        ))
+
+        status, _, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        data_lines = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+        self.assertEqual(len(data_lines), 2)
+        self.assertEqual(json.loads(data_lines[0])["choices"][0]["finish_reason"], "length")
+
+    def test_opencode_stream_adds_finish_reason_at_eof(self):
+        payload = json.dumps({
+            "model": "glm-5.2",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        lines = [
+            b'data: {"id":"gen-1","object":"chat.completion.chunk",'
+            b'"created":1,"model":"gpt-5.6-luna",'
+            b'"choices":[{"delta":{"content":"done"},"finish_reason":null}]}\n',
+            b'data: {"id":"gen-1","object":"chat.completion.chunk",'
+            b'"created":1,"model":"gpt-5.6-luna","choices":[],'
+            b'"usage":{"completion_tokens":1}}\n',
+        ]
+        self._set_opencode_response(_FakeUpstreamResponse(
+            content_type="text/event-stream", lines=lines,
+        ))
+
+        status, _, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        data_lines = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+        terminal = json.loads(data_lines[-1])
+        self.assertEqual(terminal["id"], "gen-1")
+        self.assertEqual(terminal["model"], "gpt-5.6-luna")
+        self.assertEqual(terminal["choices"][0]["finish_reason"], "stop")
+
+    def test_opencode_stream_error_relayed_verbatim(self):
+        # Upstream error bodies are plain JSON; no synthesized SSE chunk may be appended.
+        payload = json.dumps({
+            "model": "opencode-go/glm-5.2",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        err = b'{"type":"error","error":{"type":"error","message":"Internal server error"}}'
+        self._set_opencode_response(_FakeUpstreamResponse(status=500, body=err))
+
+        status, headers, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 500)
+        self.assertEqual(body, err)
+        self.assertNotIn(b"finish_reason", body)
+
+    def test_opencode_responses_only_model_rejected_on_chat_completions(self):
+        payload = json.dumps({
+            "model": "opencode-go/gpt-5.6-luna",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(status=500, body=b'{}'))
+
+        status, _, body = self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 400)
+        data = json.loads(body)
+        self.assertIn("/v1/responses", data["error"]["message"])
+        self.assertEqual(self._opencode_conn_calls if hasattr(self, "_opencode_conn_calls") else [], [])
+
+    def test_opencode_responses_only_model_rejected_on_messages(self):
+        # grok-4.6 is Responses-only: /v1/messages must fail fast with an
+        # actionable error instead of an opaque upstream 500.
+        payload = json.dumps({
+            "model": "opencode-go/grok-4.6",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "test"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(status=500, body=b'{}'))
+
+        status, _, body = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 400)
+        data = json.loads(body)
+        self.assertIn("/v1/responses", data["error"]["message"])
+        self.assertEqual(self._opencode_conn_calls if hasattr(self, "_opencode_conn_calls") else [], [])
+
+    def test_api_post_not_captured_in_dataset(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229"}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{}'))
+        status, headers, body = self._request("POST", "/api/foo", body=payload,
+                                              headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        self.assertTrue(ap._dataset_queue.empty())
+
+    def test_post_json_array_body_api_passthrough(self):
+        """JSON bodies that are not objects (e.g. telemetry arrays) relay verbatim."""
+        payload = json.dumps([{"event": "x"}]).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{"received":true}'))
+        status, headers, body = self._request(
+            "POST", "/api/telemetry", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"received":true}')
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "POST")
+        self.assertEqual(req["path"], "/api/telemetry")
+        self.assertEqual(req["body"], payload)
+        self.assertTrue(ap._dataset_queue.empty())
+
+    def test_post_non_dict_json_non_api_path_400(self):
+        payload = json.dumps(["not", "an", "object"]).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=b'{}'))
+        status, headers, body = self._request(
+            "POST", "/notapi", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(self._anthropic_conn_calls, [])
+
+    def test_get_model_by_id_passthrough(self):
+        """GET /v1/models/{id} (Anthropic 'Get a Model') relays verbatim, not the merged list."""
+        upstream = json.dumps({"id": "claude-3-opus-20240229", "type": "model"}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(body=upstream))
+        status, headers, body = self._request(
+            "GET", "/v1/models/claude-3-opus-20240229",
+            headers={"x-api-key": "sk-test"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, upstream)
+        req = self._pop_anthropic_request()
+        self.assertEqual(req["method"], "GET")
+        self.assertEqual(req["path"], "/v1/models/claude-3-opus-20240229")
+
+    def test_get_models_list_still_merged(self):
+        """GET /v1/models (with or without query) keeps the merged local+upstream list."""
+        upstream = json.dumps({"data": [
+            {"id": "claude-3-opus-20240229", "type": "model"},
+        ]}).encode()
+        for path in ("/v1/models", "/v1/models?limit=5"):
+            with self.subTest(path=path):
+                self._set_anthropic_response(_FakeUpstreamResponse(body=upstream))
+                status, headers, body = self._request(
+                    "GET", path, headers={"x-api-key": "sk-test"})
+                self.assertEqual(status, 200)
+                data = json.loads(body)
+                self.assertEqual(data["object"], "list")
+                ids = [m["id"] for m in data["data"]]
+                self.assertEqual(ids[0], ap.LOCAL_ALIAS)
+                self.assertIn("claude-3-opus-20240229", ids)
+
+    def test_upstream_response_headers_forwarded(self):
+        payload = json.dumps({"model": "claude-3-opus-20240229",
+                              "messages": [{"role": "user", "content": "hi"}]}).encode()
+        self._set_anthropic_response(_FakeUpstreamResponse(
+            body=b'{"id":"msg_1"}',
+            headers=[
+                ("request-id", "req_abc123"),
+                ("anthropic-ratelimit-requests-remaining", "42"),
+                ("retry-after", "7"),
+                ("Content-Length", "999"),        # hop-by-hop: must be dropped
+                ("Transfer-Encoding", "chunked"),  # hop-by-hop: must be dropped
+            ],
+        ))
+        status, headers, body = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"x-api-key": "sk-test", "Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"id":"msg_1"}')
+        self.assertEqual(headers.get("request-id"), "req_abc123")
+        self.assertEqual(headers.get("anthropic-ratelimit-requests-remaining"), "42")
+        self.assertEqual(headers.get("retry-after"), "7")
+        # Response is delimited by connection close, so length framing is dropped.
+        self.assertNotEqual(headers.get("content-length"), "999")
+        self.assertNotIn("transfer-encoding", headers)
+        self.assertEqual(headers.get("connection"), "close")
+
+    # --- x-opencode-session attribution -------------------------------------
+
+    def _oc_headers(self):
+        self.assertTrue(self._opencode_conn_calls, "no opencode conn created")
+        return self._opencode_conn_calls[-1].requests[-1]["headers"]
+
+    def test_opencode_session_from_claude_code_metadata(self):
+        sid = "77222f22-4593-4400-9b09-a080028c5fe5"
+        payload = json.dumps({
+            "model": "opencode-go/glm-5.2", "max_tokens": 64,
+            "metadata": {"user_id": json.dumps({"device_id": "d", "account_uuid": "a", "session_id": sid})},
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(
+            body=b'{"choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}]}'))
+        status, _, _ = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "claude-cli/2.1.259 (external, cli)"},
+        )
+        self.assertEqual(status, 200)
+        h = self._oc_headers()
+        self.assertEqual(h.get("x-opencode-session"), sid)
+        self.assertEqual(h.get("x-opencode-client"), "claude-code")
+
+    def test_opencode_session_anthropic_passthrough(self):
+        sid = "11111111-2222-4333-8444-555555555555"
+        payload = json.dumps({
+            "model": "opencode-qwen3.7-max", "max_tokens": 64,
+            "metadata": {"user_id": "user_abc_account_9f0e_session_%s" % sid},
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(body=b'{"id":"msg_1"}'))
+        status, _, _ = self._request(
+            "POST", "/v1/messages", body=payload,
+            headers={"Content-Type": "application/json", "x-api-key": "k"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self._oc_headers().get("x-opencode-session"), sid)
+
+    def test_opencode_session_passes_through_client_header(self):
+        payload = json.dumps({
+            "model": "opencode-go/glm-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(body=b'{"choices":[]}'))
+        self._request(
+            "POST", "/v1/chat/completions", body=payload,
+            headers={"Content-Type": "application/json",
+                     "x-opencode-session": "pi-sess-1", "x-opencode-client": "pi"},
+        )
+        h = self._oc_headers()
+        self.assertEqual(h.get("x-opencode-session"), "pi-sess-1")
+        self.assertEqual(h.get("x-opencode-client"), "pi")
+
+    def test_opencode_session_from_codex_session_id_header(self):
+        payload = json.dumps({"model": "opencode-go/gpt-5.6-luna", "input": "hi"}).encode()
+        self._set_opencode_response(_FakeUpstreamResponse(body=b'{"id":"resp_1"}'))
+        self._request(
+            "POST", "/v1/responses", body=payload,
+            headers={"Content-Type": "application/json", "session_id": "codex-42",
+                     "User-Agent": "codex_cli_rs/0.149.1"},
+        )
+        h = self._oc_headers()
+        self.assertEqual(h.get("x-opencode-session"), "codex-42")
+        self.assertEqual(h.get("x-opencode-client"), "codex")
+
+    def test_opencode_session_fingerprint_stable_across_turns(self):
+        def _send(messages):
+            payload = json.dumps({"model": "opencode-go/glm-5.2", "messages": messages}).encode()
+            self._set_opencode_response(_FakeUpstreamResponse(body=b'{"choices":[]}'))
+            self._request("POST", "/v1/chat/completions", body=payload,
+                          headers={"Content-Type": "application/json", "User-Agent": "curl/8.7"})
+            return self._oc_headers()
+
+        first = [{"role": "system", "content": "s"}, {"role": "user", "content": "open"}]
+        h1 = _send(first)
+        h2 = _send(first + [{"role": "assistant", "content": "a"}, {"role": "user", "content": "more"}])
+        h3 = _send([{"role": "user", "content": "different opener"}])
+        self.assertEqual(h1["x-opencode-session"], h2["x-opencode-session"])
+        self.assertNotEqual(h1["x-opencode-session"], h3["x-opencode-session"])
+        self.assertEqual(h1["x-opencode-client"], "highllama")
+        uuid.UUID(h1["x-opencode-session"])  # well-formed
 
 
 if __name__ == "__main__":

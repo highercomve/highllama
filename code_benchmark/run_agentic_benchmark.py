@@ -91,7 +91,11 @@ def run_agent(agent, model, workdir, prompt, timeout, logpath):
     )
     cmd = shlex.split(agent_cmd)
     with open(logpath, "w") as log:
-        p = subprocess.Popen(cmd, cwd=workdir, stdout=log, stderr=subprocess.STDOUT,
+        # stdin must be /dev/null: headless agents (pi --print, opencode run) block
+        # in epoll on an inherited pipe/socket stdin that never sends EOF, hanging
+        # every task until the timeout instead of ever calling the model.
+        p = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=subprocess.STDOUT,
                              text=True, start_new_session=True)
         try:
             p.communicate(timeout=timeout)
