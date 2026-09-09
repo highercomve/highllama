@@ -11,10 +11,10 @@ the backend is autodetected.
 
 | path | what |
 |---|---|
-| `highllama` | launch `llama-server` for any GGUF — backend autodetect, smart MoE offload, OOM auto-retry |
+| `highllama` | launch `llama-server` for any GGUF — backend autodetect, smart MoE offload, embeddings server, OOM auto-retry |
 | `install.sh` | symlink `highllama` into `~/.local/bin` (`--systemd` adds a user service) |
 | `gguf-estimate.py` | reads a GGUF header and estimates `--n-cpu-moe` for the free VRAM + context (SWA-aware) |
-| `localagent/` | run headless `claude` sub-agents on the local llama-server, validated by Opus — see [its README](localagent/README.md) |
+| `localagent/` | sub-agents on local llama-server + context compression proxy with semantic chunk pruning & token savings dashboard — see [its README](localagent/README.md) |
 | `code_benchmark/` | private code-quality benchmark for highllama models — see [its README](code_benchmark/README.md) |
 | `speed_benchmark/` | token-generation speed benchmark — see [its README](speed_benchmark/README.md) |
 | `llama.cpp/` | upstream clone + build (not tracked; `highllama build` / `update` creates/updates it) |
@@ -59,6 +59,7 @@ highllama -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL -c 160k    # head_dim=512: symm
 highllama -m <model> --kv q4_0 --dry 0                      # leaner symmetric KV; disable the DRY sampler
 highllama -m <model> --chat-template ./fixed.jinja          # override a broken GGUF template
 highllama --backend mlx -m mlx-community/Qwen3-8B-4bit      # MLX on macOS
+highllama embeddings start | status | stop   # run background embeddings server (auto-picks local embedding model)
 highllama ls                                 # list local models (picker view)
 highllama list | stop | status | logs        # full paths | kill | status | view logs
 highllama update                             # git pull llama.cpp + rebuild for the backend

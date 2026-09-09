@@ -1178,6 +1178,103 @@ cmd_pull() {
     fi
 }
 
+# ---- embeddings ---------------------------------------------------------------
+cmd_embeddings() {
+    local action="${1:-start}"
+    shift || true
+    local port="${EMBED_PORT:-${PORT:-8089}}"
+    local host="${HOST:-127.0.0.1}"
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/highllama"
+    mkdir -p "$state_dir"
+    local pidfile="$state_dir/embeddings.pid"
+    local logfile="$state_dir/embeddings.log"
+
+    case "$action" in
+    status)
+        if curl -s --max-time 2 -X POST "http://${host}:${port}/v1/embeddings" \
+            -H "Content-Type: application/json" -d '{"input":"test"}' 2>/dev/null | command grep -q '"data"'; then
+            echo ">> embeddings UP on http://${host}:${port}/v1"
+            return 0
+        else
+            echo ">> embeddings DOWN on http://${host}:${port}/v1"
+            return 1
+        fi
+        ;;
+    stop)
+        if [ -f "$pidfile" ]; then
+            local pid
+            pid="$(cat "$pidfile" 2>/dev/null || true)"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                echo ">> embeddings server stopped (pid $pid)."
+            fi
+            rm -f "$pidfile"
+        else
+            echo ">> no separate embeddings pid found."
+        fi
+        return 0
+        ;;
+    start)
+        if curl -s --max-time 2 -X POST "http://${host}:${port}/v1/embeddings" \
+            -H "Content-Type: application/json" -d '{"input":"test"}' 2>/dev/null | command grep -q '"data"'; then
+            echo ">> embeddings server already running on http://${host}:${port}/v1"
+            return 0
+        fi
+
+        local model
+        model="$(resolve_embed_model)"
+        if [ -z "$model" ]; then
+            echo "!! no local embedding model found (download one with: $0 pull embeddinggemma)" >&2
+            return 1
+        fi
+
+        local llama_bin="${LLAMA_BIN:-$LLAMA_DIR/build/bin/llama-server}"
+        if [ ! -x "$llama_bin" ]; then
+            echo "!! $llama_bin not found. Build llama.cpp first: $0 build" >&2
+            return 1
+        fi
+
+        local orig_port="$port"
+        while port_busy "$port"; do
+            port=$((port + 1))
+            if [ "$port" -gt $((orig_port + 10)) ]; then
+                echo "!! no free port found for embeddings near $orig_port" >&2
+                return 1
+            fi
+        done
+        [ "$port" != "$orig_port" ] && echo ">> port $orig_port busy -> using $port for embeddings"
+
+        local llama_libdir
+        llama_libdir="$(cd "$(dirname "$llama_bin")" && pwd)"
+        if ls "$llama_libdir"/*.so >/dev/null 2>&1; then
+            export LD_LIBRARY_PATH="${llama_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        fi
+
+        echo ">> starting highllama embeddings: $(basename "$model") on http://${host}:${port}/v1"
+        setsid nohup "$llama_bin" -m "$model" --embeddings --host "$host" --port "$port" \
+            >"$logfile" 2>&1 </dev/null &
+        echo $! > "$pidfile"
+        echo "http://${host}:${port}" > "$state_dir/embeddings.url"
+
+        for _ in $(seq 1 30); do
+            if curl -s --max-time 2 -X POST "http://${host}:${port}/v1/embeddings" \
+                -H "Content-Type: application/json" -d '{"input":"test"}' 2>/dev/null | command grep -q '"data"'; then
+                echo ">> embeddings server ready on http://${host}:${port}/v1 (pid $(cat "$pidfile"))"
+                return 0
+            fi
+            sleep 0.3
+        done
+
+        echo "!! embeddings server failed to become ready; see $logfile" >&2
+        return 1
+        ;;
+    *)
+        echo "usage: $0 embeddings [start|stop|status]" >&2
+        return 1
+        ;;
+    esac
+}
+
 # ---- help -------------------------------------------------------------------
 usage() {
     cat <<'EOF'
@@ -1192,6 +1289,7 @@ COMMANDS:
   pull [term|repo]   browse/search Hugging Face and download a GGUF
   ls                 list local models (numbered picker view)
   list               list local models with sizes + full paths
+  embeddings [cmd]   start/stop/status dedicated embeddings server (for context compression)
   status             show whether a server is running
   stop               stop the running server (and systemd user unit)
   reload [options]   stop the server and restart with new options
@@ -1267,6 +1365,11 @@ start)
 tune)
     shift
     cmd_tune "$@"
+    ;;
+embeddings)
+    shift
+    cmd_embeddings "$@"
+    exit 0
     ;;
 ls)
     echo "Available local models:"

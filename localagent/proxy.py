@@ -44,6 +44,9 @@ Env:
 import datetime
 import http.client
 import io
+import tempfile
+import subprocess
+import shutil
 import json
 import os
 import queue
@@ -76,6 +79,14 @@ def load_dotenv():
             print(f"[proxy] failed to load .env: {e}", file=sys.stderr)
 
 load_dotenv()
+
+try:
+    import compressor
+except ImportError:
+    try:
+        from localagent import compressor
+    except ImportError:
+        compressor = None
 
 PORT = int(os.environ.get("LLAMA_PROXY_PORT", "8090"))
 HOST = os.environ.get("LLAMA_PROXY_HOST", "127.0.0.1")
@@ -162,6 +173,30 @@ OC_HOST = _oc.hostname
 OC_PORT = _oc.port or (443 if _oc.scheme == "https" else 80)
 OC_HTTPS = _oc.scheme == "https"
 
+# Google Cloud Code Assist backend used by agy (Antigravity CLI) / gemini-cli.
+# Point the CLI here with CLOUD_CODE_URL=http://127.0.0.1:<PORT>; requests to
+# /v1internal:* are relayed verbatim (OAuth header included) and the
+# generateContent bodies go through the Gemini compressor first.
+CLOUDCODE_UP = os.environ.get("CLOUDCODE_UPSTREAM", "https://daily-cloudcode-pa.googleapis.com").rstrip("/")
+_cc = urlparse(CLOUDCODE_UP)
+CC_HOST = _cc.hostname
+CC_PORT = _cc.port or (443 if _cc.scheme == "https" else 80)
+CC_HTTPS = _cc.scheme == "https"
+# "curl" relays over HTTP/2 with a real client's TLS/header profile (closest to
+# agy's own Go client); "python" uses http.client (HTTP/1.1).
+CLOUDCODE_TRANSPORT = os.environ.get("CLOUDCODE_TRANSPORT", "curl" if shutil.which("curl") else "python")
+# Optional split: agy (consumer) sends everything, generation included, to the
+# same host, but a business tier may use a separate generation host. Override
+# CLOUDCODE_GEN_UPSTREAM to send generateContent/countTokens elsewhere.
+CLOUDCODE_GEN_UP = os.environ.get("CLOUDCODE_GEN_UPSTREAM", CLOUDCODE_UP).rstrip("/")
+CLOUDCODE_GEN_RPCS = {"generateContent", "streamGenerateContent", "countTokens"}
+
+
+def cloudcode_upstream_for(rpc):
+    base = CLOUDCODE_GEN_UP if rpc in CLOUDCODE_GEN_RPCS else CLOUDCODE_UP
+    u = urlparse(base)
+    return base, u.hostname, u.port or (443 if u.scheme == "https" else 80), u.scheme == "https"
+
 # hop-by-hop headers we must not forward when relaying to Anthropic
 _DROP_HEADERS = {
     "host",
@@ -197,6 +232,15 @@ def opencode_conn():
     if OC_HTTPS:
         return http.client.HTTPSConnection(OC_HOST, OC_PORT, timeout=600)
     return http.client.HTTPConnection(OC_HOST, OC_PORT, timeout=600)
+
+
+def cloudcode_conn(host=None, port=None, https=None):
+    host = host or CC_HOST
+    port = port or CC_PORT
+    https = CC_HTTPS if https is None else https
+    if https:
+        return http.client.HTTPSConnection(host, port, timeout=600)
+    return http.client.HTTPConnection(host, port, timeout=600)
 
 
 def get_opencode_model_and_protocol(model_name):
@@ -475,10 +519,23 @@ def anthropic_conn():
     return http.client.HTTPConnection(AN_HOST, AN_PORT, timeout=600)
 
 
+def _stderr_is_log_file():
+    if not LOG_PATH:
+        return False
+    try:
+        a, b = os.fstat(sys.stderr.fileno()), os.stat(LOG_PATH)
+        return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    except OSError:
+        return False
+
+
+_STDERR_IS_LOG = _stderr_is_log_file()
+
+
 def log(*a):
     msg = "[proxy %s] %s" % (time.strftime("%H:%M:%S"), " ".join(str(x) for x in a))
     print(msg, file=sys.stderr, flush=True)
-    if LOG_PATH:
+    if LOG_PATH and not _STDERR_IS_LOG:
         try:
             with open(LOG_PATH, "a") as f:
                 f.write(msg + "\n")
@@ -1395,6 +1452,29 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _read_raw(self):
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        cl = self.headers.get("Content-Length")
+        if "chunked" in te and cl is None:
+            # Go clients (agy) stream large JSON bodies as chunked requests without Content-Length.
+            out = io.BytesIO()
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:
+                    break
+                try:
+                    size = int(size_line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    # consume optional trailers up to the terminating CRLF
+                    while True:
+                        t = self.rfile.readline()
+                        if not t or t in (b"\r\n", b"\n"):
+                            break
+                    break
+                out.write(self.rfile.read(size))
+                self.rfile.readline()  # CRLF after each chunk
+            return out.getvalue()
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
 
@@ -1405,6 +1485,189 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _cloudcode_curl(self, rpc, path_only, headers, raw, base):
+        """Relay via curl (HTTP/2). Returns True when handled."""
+        url = f"{base}{self.path}"
+        hdr_fd, hdr_path = tempfile.mkstemp(prefix="cc-hdr-", suffix=".txt")
+        try:
+            with os.fdopen(hdr_fd, "w") as f:
+                for k, v in headers.items():
+                    if k.lower() in ("host", "content-length"):
+                        continue
+                    f.write(f"{k}: {v}\n")
+            cmd = ["curl", "-sS", "-N", "--http2", "-i", "-X", self.command, "-H", f"@{hdr_path}",
+                   "--max-time", "600", url]
+            if raw:
+                cmd += ["--data-binary", "@-"]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if raw else subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if raw:
+                try:
+                    proc.stdin.write(raw)
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+            # parse status line + headers (skip interim 1xx blocks)
+            status, resp_headers = None, []
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("latin-1").rstrip("\r\n")
+                if text.startswith("HTTP/"):
+                    parts = text.split(" ", 2)
+                    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 502
+                    resp_headers = []
+                    continue
+                if text == "":
+                    if status is not None and status >= 200:
+                        break
+                    continue
+                if ":" in text:
+                    k, v = text.split(":", 1)
+                    resp_headers.append((k.strip(), v.strip()))
+            if status is None:
+                err = proc.stderr.read().decode("utf-8", "replace")
+                log("Proxy: cloudcode curl failed:", err.strip()[:300])
+                self._json(502, {"error": {"code": 502, "message": f"cloudcode curl: {err.strip()[:200]}"}})
+                return True
+            ct = next((v for k, v in resp_headers if k.lower() == "content-type"), "application/json")
+            log(f"Proxy: cloudcode {rpc or path_only} <- {status} {ct} via curl "
+                f"enc={next((v for k, v in resp_headers if k.lower() == 'content-encoding'), '-')}")
+            if status >= 400:
+                err = proc.stdout.read()
+                log("Proxy: cloudcode upstream error body:", err[:600].decode("utf-8", "replace"))
+                self.send_response(status)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(err)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    self.wfile.write(err)
+                except OSError:
+                    pass
+                return True
+            self.send_response(status)
+            for k, v in resp_headers:
+                if k.lower() in _DROP_HEADERS or k.lower() == "content-type":
+                    continue
+                self.send_header(k, v)
+            self.send_header("Content-Type", ct)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    chunk = proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            return True
+        finally:
+            try:
+                os.unlink(hdr_path)
+            except OSError:
+                pass
+
+    def _cloudcode_passthrough(self, raw):
+        """Relay a Cloud Code Assist (/v1internal:*) request from agy or
+        gemini-cli to Google, compressing generateContent bodies on the way."""
+        path_only = self.path.split("?", 1)[0]
+        rpc = path_only.rsplit(":", 1)[-1] if ":" in path_only else ""
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in _DROP_HEADERS}
+        up_base, up_host, up_port, up_https = cloudcode_upstream_for(rpc)
+        headers["Host"] = up_host
+
+        if raw and rpc in ("generateContent", "streamGenerateContent") \
+                and compressor and compressor.is_compression_enabled():
+            try:
+                body = json.loads(raw)
+                if isinstance(body, dict):
+                    body, stats = compressor.compress_gemini_payload(body, provider="antigravity")
+                    if stats.get("modified"):
+                        raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
+                        log(f"Proxy: compressed Gemini payload: {stats.get('chars_saved', 0)} chars saved, "
+                            f"{stats.get('pruned_blocks', 0)} blocks pruned")
+            except Exception as e:
+                log("Proxy: cloudcode compression error:", e)
+        if raw:
+            headers["Content-Length"] = str(len(raw))
+
+        # keep the client's own Accept-Encoding (Go sends gzip); the response
+        # is relayed byte-for-byte with its Content-Encoding header intact.
+        ae = self.headers.get("Accept-Encoding")
+        if ae:
+            headers["Accept-Encoding"] = ae
+        log(f"Proxy: cloudcode {self.command} {path_only} -> {up_host} [{CLOUDCODE_TRANSPORT}]")
+        if rpc == "streamGenerateContent":
+            try:
+                parsed = json.loads(raw) if raw else {}
+                n = len((parsed.get("request") or {}).get("contents") or [])
+            except Exception:
+                n = "?"
+            log(f"Proxy: cloudcode {rpc} model={self.headers.get('x-goog-request-params', '-')} "
+                f"body_bytes={len(raw)} contents={n} in_te={self.headers.get('Transfer-Encoding') or '-'}")
+        if CLOUDCODE_TRANSPORT == "curl":
+            return self._cloudcode_curl(rpc, path_only, headers, raw, up_base)
+        try:
+            conn = cloudcode_conn(up_host, up_port, up_https)
+            conn.request(self.command, self.path, body=raw or None, headers=headers)
+            r = conn.getresponse()
+        except Exception as e:
+            log("Proxy: cloudcode upstream error:", e)
+            return self._json(502, {"error": {"code": 502, "message": f"cloudcode upstream: {e}"}})
+
+        ct = r.getheader("Content-Type", "application/json")
+        log(f"Proxy: cloudcode {rpc or path_only} <- {r.status} {ct} "
+            f"enc={r.getheader('Content-Encoding') or '-'}")
+        if r.status >= 400:
+            err = r.read()
+            log("Proxy: cloudcode upstream error body:", err[:600].decode("utf-8", "replace"))
+            self.send_response(r.status)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(err)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(err)
+            except OSError:
+                pass
+            conn.close()
+            return
+        self.send_response(r.status)
+        for k, v in r.getheaders():
+            if k.lower() in _DROP_HEADERS or k.lower() == "content-type":
+                continue
+            self.send_header(k, v)
+        self.send_header("Content-Type", ct)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            if "text/event-stream" in (ct or "").lower():
+                while True:
+                    line = r.readline()
+                    if not line:
+                        break
+                    self.wfile.write(line)
+                    self.wfile.flush()
+            else:
+                self.wfile.write(r.read())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _passthrough(self, raw):
         """Relay an Anthropic-format request verbatim to api.anthropic.com and stream
@@ -1426,6 +1689,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             body = None
             is_stream = False
+
+        if body and compressor and compressor.is_compression_enabled() and self.path.startswith("/v1/messages"):
+            try:
+                body, stats = compressor.compress_anthropic_payload(body, provider="anthropic")
+                if stats.get("modified"):
+                    raw = json.dumps(body).encode("utf-8")
+                    headers["Content-Length"] = str(len(raw))
+                    log(f"Proxy: compressed Anthropic payload: {stats.get('chars_saved', 0)} chars saved, {stats.get('pruned_blocks', 0)} blocks pruned")
+            except Exception as e:
+                log("Proxy: compression error in passthrough:", e)
 
         try:
             c = anthropic_conn()
@@ -1529,6 +1802,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(raw)
             body["model"] = core_model
+            if compressor and compressor.is_compression_enabled():
+                try:
+                    body, stats = compressor.compress_anthropic_payload(body, provider="opencode")
+                    if stats.get("modified"):
+                        log(f"Proxy: compressed OpenCode Anthropic payload: {stats.get('chars_saved', 0)} chars saved, {stats.get('pruned_blocks', 0)} blocks pruned")
+                except Exception as ce:
+                    log("Proxy: compression error in opencode passthrough:", ce)
             payload = json.dumps(body).encode("utf-8")
         except Exception as e:
             return self._json(
@@ -1627,6 +1907,15 @@ class Handler(BaseHTTPRequestHandler):
         oai["model"] = core_model
         if "chat_template_kwargs" in oai:
             oai.pop("chat_template_kwargs")
+
+        if compressor and compressor.is_compression_enabled():
+            try:
+                oai, stats = compressor.compress_openai_payload(oai, provider="opencode")
+                if stats.get("modified"):
+                    log(f"Proxy: compressed OpenCode messages payload: {stats.get('chars_saved', 0)} chars saved, {stats.get('pruned_blocks', 0)} blocks pruned")
+            except Exception as e:
+                log("Proxy: compression error in opencode messages:", e)
+
         stream = oai["stream"]
         payload = json.dumps(oai).encode("utf-8")
 
@@ -1721,6 +2010,15 @@ class Handler(BaseHTTPRequestHandler):
             )
         body_original = json.loads(raw)
         body["model"] = core_model
+
+        if compressor and compressor.is_compression_enabled():
+            try:
+                body, stats = compressor.compress_openai_payload(body, provider="opencode")
+                if stats.get("modified"):
+                    log(f"Proxy: compressed OpenCode completions payload: {stats.get('chars_saved', 0)} chars saved, {stats.get('pruned_blocks', 0)} blocks pruned")
+            except Exception as e:
+                log("Proxy: compression error in opencode completions:", e)
+
         payload = json.dumps(body).encode("utf-8")
         is_stream = body.get("stream", False)
 
@@ -1878,6 +2176,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             body = {}
         body["model"] = core_model
+
+        if compressor and compressor.is_compression_enabled():
+            try:
+                body, stats = compressor.compress_openai_payload(body, provider="opencode")
+                if stats.get("modified"):
+                    log(f"Proxy: compressed OpenCode responses payload: {stats.get('chars_saved', 0)} chars saved, {stats.get('pruned_blocks', 0)} blocks pruned")
+            except Exception as e:
+                log("Proxy: compression error in opencode responses:", e)
+
         payload = json.dumps(body).encode("utf-8")
         log("→ /v1/responses (opencode) model=%s stream=%s keys=%s" % (
             core_model, body.get("stream"), sorted(body.keys())))
@@ -1946,6 +2253,8 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        if self.path.startswith("/v1internal"):
+            return self._cloudcode_passthrough(b"")
         if self.path == "/health":
             return self._json(
                 200,
@@ -1956,6 +2265,18 @@ class Handler(BaseHTTPRequestHandler):
                     "passthrough": ANTHROPIC_UP,
                 },
             )
+        if self.path in ("/gain", "/stats"):
+            report = compressor.generate_gain_report() if compressor else "Compressor not loaded."
+            data = report.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path.split("?", 1)[0] == "/v1/compression/stats":
+            stats = compressor.get_compression_stats_json() if compressor else {}
+            return self._json(200, stats)
         # Only the exact list endpoint gets the merged local+upstream response;
         # GET /v1/models/{model_id} (Anthropic "Get a Model") relays verbatim below.
         if self.path.split("?", 1)[0] == "/v1/models":
@@ -2061,6 +2382,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         raw = self._read_raw()
+        if self.path.startswith("/v1internal"):
+            return self._cloudcode_passthrough(raw)
         path_only = self.path.split("?", 1)[0]
         try:
             body = json.loads(raw) if raw else {}
@@ -2306,6 +2629,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             body = None
             is_stream = False
+
+        if body and compressor and compressor.is_compression_enabled():
+            try:
+                body, stats = compressor.compress_openai_payload(body, provider="openai")
+                if stats.get("modified"):
+                    raw = json.dumps(body).encode("utf-8")
+                    headers["Content-Length"] = str(len(raw))
+                    log(f"Proxy: compressed OpenAI payload: {stats.get('chars_saved', 0)} chars saved, {stats.get('pruned_blocks', 0)} blocks pruned")
+            except Exception as e:
+                log("Proxy: compression error in openai passthrough:", e)
 
         try:
             c = openai_conn()

@@ -90,6 +90,61 @@ API**. `proxy.py` translates between them, including:
 
 Zero dependencies — Python stdlib only.
 
+## Context Compression & Token Savings
+
+In multi-turn agent sessions (Claude Code, Codex, pi), 70%+ of prompt tokens come from historical tool outputs (`Read`, `Bash`, `Grep`) and verbose JSON responses. The proxy includes a **native context compression layer** (`compressor.py`) that prunes and shapes requests before forwarding them to cloud providers (Anthropic, OpenAI, OpenCode), slashing token consumption by 50%–85% while preserving 100% KV-cache prefix stability.
+
+### The 5 Compression Mechanics
+
+1. **Semantic Chunk Pruning (`embeddinggemma-300M`):**
+   When a tool output exceeds thresholds (>50 lines / 1,500 chars), the compressor splits the text into line-window chunks and queries the local embeddings endpoint (`http://127.0.0.1:8089/v1/embeddings`). Chunks are scored by cosine similarity against the user's latest query, and only the top 3 most relevant sections are sent to the cloud model.
+2. **Deterministic Fallback (Head/Tail):**
+   If the embeddings endpoint is unavailable or times out, the compressor gracefully falls back to retaining the first 15 lines and last 15 lines with a clear truncation notice.
+3. **Lossless Spillover (CCR - Context-Compressed Retrieval):**
+   Full raw uncompressed outputs are always saved to `~/.local/state/localagent/spill/<sha256>.txt`. The truncated block in the prompt includes the exact path, allowing the agent to inspect specific lines via its native `Read` or `Bash` tools if needed.
+4. **Preserves Thinking Effort & Budget 100%:**
+   Your thinking effort and budget settings configured in Claude Code (or OpenAI / localagent) are strictly preserved and never dampened or overridden. Full thinking depth is respected across all turns. (An optional clamp `LOCALAGENT_THINKING_DAMPEN=1` exists if explicitly desired, but defaults to off).
+5. **JSON Crushing & Terminal Noise Cleaning:**
+   Minifies repetitive JSON structures (stripping whitespace) and cleans ANSI terminal escape sequences, carriage returns, and consecutive blank lines.
+
+### Auto-Startup & Embedding Server
+
+Whenever you launch an agent session via `cc` (`claude-local`) or run `localagent proxy start`:
+* It automatically checks if an embeddings service is responding on `:8089`.
+* If not, it auto-discovers your local embedding model (`embeddinggemma-300M-Q8_0.gguf`) and starts `highllama embeddings` in the background before launching the proxy.
+
+### Token Savings Dashboard (`localagent gain`)
+
+Modelled after `rtk gain`, every compression event is recorded into a local SQLite database (`~/.local/state/localagent/compression.db`).
+
+```bash
+localagent gain            # live ASCII dashboard of token savings
+localagent gain --json     # export metrics as JSON
+localagent gain --reset    # clear compression metrics history
+```
+
+Example report:
+```text
+LocalAgent Token Savings (Global Scope)
+════════════════════════════════════════════════════════════
+
+Total events:      12
+Input tokens:      16.6K
+Output tokens:     7.8K
+Tokens saved:      9.0K (54.1%)
+Total exec time:   167ms (avg 13ms)
+Efficiency meter:  █████████████░░░░░░░░░░░ 54.1%
+
+By Tool / Source
+────────────────────────────────────────────────────────────────────────
+  #  Source / Tool             Count     Saved     Avg%     Time  Impact    
+────────────────────────────────────────────────────────────────────────
+  1.  Bash                         10      7.5K    52.0%    79ms  ██████████
+  2.  Read                          1      1.2K    45.0%    87ms  ██░░░░░░░░
+  3.  Grep                          1       300    35.0%     1ms  ░░░░░░░░░░
+────────────────────────────────────────────────────────────────────────
+```
+
 ## Install
 
 ```bash
@@ -130,6 +185,11 @@ localagent list                               # active worktrees awaiting valida
 # export logged dataset calls:
 localagent export --format sharegpt -o exported_dataset.json  # export all calls
 localagent export --latest 10 --has-tools                    # view latest 10 tool calls on stdout
+
+# token compression report (like rtk gain):
+localagent gain                                              # view token savings dashboard
+localagent gain --json                                       # export metrics as JSON
+localagent gain --reset                                      # clear compression history
 ```
 
 ### Flags for `run`
@@ -173,6 +233,11 @@ All of the environment variables below can optionally be loaded from a `.env` fi
 | `LLAMA_PROXY_LOG` | `~/.local/state/localagent/proxy.log` | proxy debug log |
 | `OPENCODE_API_KEY` | empty | API key / subscription token for OpenCode Go frontier models |
 | `OPENCODE_PASSTHROUGH_BASE` | `https://opencode.ai/zen/go` | upstream base endpoint URL for OpenCode Go models |
+| `CLOUDCODE_UPSTREAM` | `https://daily-cloudcode-pa.googleapis.com` | Google Cloud Code Assist backend for `/v1internal:*` (agy / gemini-cli); point the CLI here with `CLOUD_CODE_URL=http://127.0.0.1:8090` to get the same context compression |
+| `LOCALAGENT_COMPRESS` | `1` | `1` enables native context compression & semantic chunk pruning before cloud APIs |
+| `LOCALAGENT_EMBED_BASE` | `http://127.0.0.1:8089` | embeddings endpoint URL used for semantic chunk ranking |
+| `LOCALAGENT_THINKING_DAMPEN` | `0` | Optional thinking clamp on routine tool returns (`0` preserves user effort 100%) |
+| `LOCALAGENT_SPILL_DIR` | `~/.local/state/localagent/spill` | storage for full uncompressed originals (lossless CCR) |
 
 OpenCode Go requires one stable `x-opencode-session` id per conversation. The
 proxy sets it on every upstream request, resolving it from (in order): a client

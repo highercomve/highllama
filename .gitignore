@@ -2,6 +2,7 @@ llama.cpp/
 __pycache__/
 *.log
 .claude/settings.local.json
+.agents/
 
 # code benchmark: keep the PRIVATE problems + results out of git so they don't
 # leak into public training data (that is the point of a private benchmark).

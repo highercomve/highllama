@@ -47,7 +47,30 @@ die()    { echo "$(c_red error:) $*" >&2; exit 1; }
 # ---------------------------------------------------------------- proxy mgmt
 proxy_healthy() { curl -s --max-time 3 "$PROXY_URL/health" 2>/dev/null | grep -q '"ok": true'; }
 
+embeddings_healthy() {
+  local embed_url="${LOCALAGENT_EMBED_BASE:-${EMBED_BASE:-$LLAMA_BASE}}"
+  curl -s --max-time 2 -X POST "$embed_url/v1/embeddings" \
+    -H "Content-Type: application/json" -d '{"input":"test"}' 2>/dev/null | grep -q '"data"'
+}
+
+ensure_embeddings() {
+  local embed_url="${LOCALAGENT_EMBED_BASE:-${EMBED_BASE:-$LLAMA_BASE}}"
+  if embeddings_healthy; then
+    echo "embeddings service active at $embed_url"
+    return 0
+  fi
+  echo "embeddings not active at $embed_url; starting highllama embeddings..."
+  if [ -x "$HERE/../highllama" ]; then
+    "$HERE/../highllama" embeddings start || echo "$(c_red warn:) failed to start highllama embeddings" >&2
+  elif command -v highllama >/dev/null 2>&1; then
+    highllama embeddings start || echo "$(c_red warn:) failed to start highllama embeddings" >&2
+  fi
+}
+
 proxy_start() {
+  if [[ "${LOCALAGENT_COMPRESS:-1}" != "0" ]]; then
+    ensure_embeddings
+  fi
   if proxy_healthy; then echo "proxy already up at $PROXY_URL"; return 0; fi
   command -v python3 >/dev/null || die "python3 not found"
   curl -s --max-time 3 "$LLAMA_BASE/v1/models" >/dev/null 2>&1 \
@@ -55,6 +78,9 @@ proxy_start() {
   echo "starting proxy: $PROXY_URL (bind $LISTEN_HOST:$PROXY_PORT) -> $LLAMA_BASE"
   LLAMA_PROXY_HOST="$LISTEN_HOST" LLAMA_PROXY_PORT="$PROXY_PORT" \
   LLAMA_BASE="$LLAMA_BASE" LLAMA_PROXY_LOG="$PROXY_LOG" \
+  LOCALAGENT_COMPRESS="${LOCALAGENT_COMPRESS:-1}" \
+  LOCALAGENT_EMBED_BASE="${LOCALAGENT_EMBED_BASE:-$LLAMA_BASE}" \
+  LOCALAGENT_THINKING_DAMPEN="${LOCALAGENT_THINKING_DAMPEN:-0}" \
     setsid nohup python3 "$PROXY_PY" >>"$PROXY_LOG" 2>&1 < /dev/null &
   echo $! > "$PIDFILE"
   for _ in $(seq 1 30); do proxy_healthy && { echo "proxy ready (pid $(cat "$PIDFILE"))"; return 0; }; sleep 0.3; done
@@ -293,12 +319,32 @@ cmd_info() {
   else
     echo "  DB Size    : 0B (not created yet)"
   fi
-  
-  # Raw jsonl if it exists
-  local jsonl_file="${db_file%.db}.jsonl"
-  if [[ -f "$jsonl_file" ]]; then
-    echo "Legacy JSONL : $jsonl_file"
-    echo "  File Size  : $(du -sh "$jsonl_file" | awk '{print $1}')"
+
+  # Compression & Token Savings
+  echo "Compression  : $(c_grn "ACTIVE") (embeddings @ ${LOCALAGENT_EMBED_BASE:-$LLAMA_BASE})"
+  local comp_summary
+  comp_summary=$(PYTHONPATH="$HERE" python3 -c "
+import compressor
+conn = compressor._get_db()
+row = conn.execute('SELECT COUNT(*), SUM(saved_tokens), SUM(orig_tokens) FROM compression_events').fetchone()
+if row and row[0]:
+    saved = compressor._fmt_tokens(row[1] or 0)
+    pct = (row[1] / row[2] * 100) if row[2] else 0.0
+    print(f'{saved} ({pct:.1f}%) across {row[0]} events')
+else:
+    print('0 tokens (no events recorded yet)')
+" 2>/dev/null || echo "not available")
+  echo "  Tokens Saved: $comp_summary  (run: localagent gain)"
+}
+
+cmd_gain() {
+  command -v python3 >/dev/null || die "python3 not found"
+  if [[ "${1:-}" == "--reset" ]]; then
+    PYTHONPATH="$HERE" python3 -c "import compressor; compressor.reset_compression_stats(); print('Compression stats reset.')"
+  elif [[ "${1:-}" == "--json" ]]; then
+    PYTHONPATH="$HERE" python3 -c "import compressor, json; print(json.dumps(compressor.get_compression_stats_json(), indent=2))"
+  else
+    PYTHONPATH="$HERE" python3 -c "import compressor; print(compressor.generate_gain_report())"
   fi
 }
 
@@ -319,7 +365,8 @@ case "$cmd" in
   apply)   cmd_apply "$@";;
   discard) cmd_discard "$@";;
   export)  python3 "$HERE/export_dataset.py" "$@";;
+  gain|stats) cmd_gain "$@";;
   info)    cmd_info;;
   ""|-h|--help|help) usage;;
-  *) die "unknown command: $cmd (try: proxy|run|list|diff|apply|discard|export|info)";;
+  *) die "unknown command: $cmd (try: proxy|run|list|diff|apply|discard|export|gain|info)";;
 esac

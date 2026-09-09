@@ -20,6 +20,9 @@ PORT="${LLAMA_PROXY_PORT:-8090}"
 HOST="${LLAMA_PROXY_HOST:-127.0.0.1}"
 PROXY_URL="http://$HOST:$PORT"
 
+# Context compression is enabled by default for agent sessions
+export LOCALAGENT_COMPRESS="${LOCALAGENT_COMPRESS:-1}"
+
 # Is the proxy host this machine? Only then does starting the proxy locally make sense.
 is_local_host() {
   case "$HOST" in
