@@ -612,6 +612,18 @@ EOF
         "${HL_BUDGET_OUT:-${bout:-$BUDGET_OUT_DEFAULT}}"
 }
 
+usage_model() { # -> alias of the loaded chat model, or empty when none is up
+    local ids
+    command -v curl >/dev/null 2>&1 || return 0
+    ids="$(curl -sf --max-time 3 "http://127.0.0.1:${PORT}/v1/models" 2>/dev/null)" || return 0
+    # In router mode this lists the embeddings model too; the chat model is
+    # first. Keep it dependency-free -- jq is not required elsewhere here.
+    # grep -o, not sed: the payload is one line and a greedy .* would return
+    # the LAST id rather than the first.
+    printf '%s' "$ids" | command grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]*"' |
+        head -1 | cut -d'"' -f4
+}
+
 usage_pct() { # <used> <budget> -> 0-100, or empty when the budget is 0/unset
     [ "${2:-0}" -gt 0 ] 2>/dev/null || return 0
     awk -v u="$1" -v b="$2" 'BEGIN{p=u*100/b; if(p>100)p=100; printf "%.0f", p}'
@@ -629,8 +641,9 @@ cmd_usage() { # [--json]
     local json=0
     [ "${1:-}" = "--json" ] && json=1
     usage_fold "$PORT"
-    local today in out total b_in b_out b_total p_in p_out p_total
+    local today in out total b_in b_out b_total p_in p_out p_total model
     today="$(date +%Y-%m-%d)"
+    model="$(usage_model)"
     IFS=$'\t' read -r in out <<<"$(usage_read_day "$today")"
     total=$((in + out))
     IFS=$'\t' read -r b_in b_out <<<"$(usage_budget)"
@@ -640,6 +653,7 @@ cmd_usage() { # [--json]
     p_total="$(usage_pct "$total" "$b_total")"
     if [ "$json" = 0 ]; then
         printf 'token usage for %s (%s)\n' "$today" "$HL_USAGE"
+        printf '  model   %s\n' "${model:-(no server running)}"
         printf '  input   %8s / %-8s %s\n' "$(fmt_tokens "$in")" "$(fmt_tokens "$b_in")" "${p_in:+($p_in%)}"
         printf '  output  %8s / %-8s %s\n' "$(fmt_tokens "$out")" "$(fmt_tokens "$b_out")" "${p_out:+($p_out%)}"
         printf '  total   %8s / %-8s %s\n' "$(fmt_tokens "$total")" "$(fmt_tokens "$b_total")" "${p_total:+($p_total%)}"
@@ -669,7 +683,13 @@ cmd_usage() { # [--json]
     l_in="Input $(fmt_tokens "$in")${p_in:+ / $(fmt_tokens "$b_in")}"
     l_out="Output $(fmt_tokens "$out")${p_out:+ / $(fmt_tokens "$b_out")}"
     l_total="Total $(fmt_tokens "$total")${p_total:+ / $(fmt_tokens "$b_total")}"
-    printf '{"id":"highllama","name":"Highllama","plan":"local","ok":true,"stale":false,"error":null,"limits":['
+    # plan carries the loaded model, which is what the card's badge shows --
+    # the same slot the other providers use for their tier. "metered":false is
+    # what keeps this provider out of the bar's headline percentage; the guard
+    # cannot key on plan any more now that plan varies with the model.
+    printf '{"id":"highllama","name":"Highllama","plan":"%s","metered":false,' \
+        "${model:-local}"
+    printf '"ok":true,"stale":false,"error":null,"limits":['
     printf '{"label":"%s","percent":%s,"resetsAt":"%s"},' "$l_in" "${p_in:-null}" "$midnight"
     printf '{"label":"%s","percent":%s,"resetsAt":"%s"},' "$l_out" "${p_out:-null}" "$midnight"
     printf '{"label":"%s","percent":%s,"resetsAt":"%s"}' "$l_total" "${p_total:-null}" "$midnight"
