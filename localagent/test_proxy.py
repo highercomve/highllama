@@ -807,6 +807,74 @@ class _FakeUpstreamConn:
         pass
 
 
+class TestEmbeddingsRoute(unittest.TestCase):
+    """POST /v1/embeddings goes to the local embeddings server, never the Anthropic passthrough."""
+
+    def setUp(self):
+        from http.server import BaseHTTPRequestHandler
+
+        self.seen = []
+        seen = self.seen
+
+        class _Embed(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                seen.append((self.path, json.loads(body)))
+                data = json.dumps({"model": "embeddinggemma-300M-Q8_0",
+                                   "data": [{"index": 0, "embedding": [0.6, 0.8]}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self._embed = ThreadingHTTPServer(("127.0.0.1", 0), _Embed)
+        embed_port = self._embed.server_address[1]
+        self._proxy = ThreadingHTTPServer(("127.0.0.1", 0), ap.Handler)
+        for srv in (self._embed, self._proxy):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self._patches = [
+            mock.patch.object(ap, "embed_conn",
+                              lambda: http.client.HTTPConnection("127.0.0.1", embed_port, timeout=5)),
+            mock.patch.object(ap, "anthropic_conn",
+                              mock.Mock(side_effect=AssertionError("must not reach Anthropic"))),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        for srv in (self._embed, self._proxy):
+            srv.shutdown()
+
+    def _post(self, body):
+        conn = http.client.HTTPConnection("127.0.0.1", self._proxy.server_address[1], timeout=5)
+        conn.request("POST", "/v1/embeddings", body=json.dumps(body),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read())
+
+    def test_relays_to_embeddings_server(self):
+        status, data = self._post({"input": ["hello"], "model": "embeddinggemma-300M-Q8_0"})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["data"][0]["embedding"], [0.6, 0.8])
+        self.assertEqual(self.seen, [("/v1/embeddings", {"input": ["hello"], "model": "embeddinggemma-300M-Q8_0"})])
+
+    def test_unreachable_embeddings_server_is_502_not_passthrough(self):
+        self._patches[0].stop()
+        p = mock.patch.object(ap, "embed_conn",
+                              lambda: http.client.HTTPConnection("127.0.0.1", 9, timeout=1))
+        p.start()
+        self._patches[0] = p
+        status, data = self._post({"input": "x"})
+        self.assertEqual(status, 502)
+        self.assertEqual(data["error"]["type"], "embeddings_unavailable")
+
+
 class TestAnthropicPassthrough(unittest.TestCase):
     """End-to-end proxy dispatch with faked upstream Anthropic/llama-server."""
 

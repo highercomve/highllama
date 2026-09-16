@@ -29,6 +29,8 @@ PROXY_HOST="127.0.0.1"                     # host we curl/connect to locally
 PROXY_PORT="${LLAMA_PROXY_PORT:-8090}"
 PROXY_URL="http://$PROXY_HOST:$PROXY_PORT"
 LLAMA_BASE="${LLAMA_BASE:-http://127.0.0.1:8089}"
+# embeddings live on highllama's dedicated embedding server, not the chat server
+EMBED_BASE_DEFAULT="http://127.0.0.1:8091"
 STATE_DIR="${LOCALAGENT_STATE:-$HOME/.local/state/localagent}"
 PIDFILE="$STATE_DIR/proxy.pid"
 PROXY_LOG="$STATE_DIR/proxy.log"
@@ -51,13 +53,13 @@ die() {
 proxy_healthy() { curl -s --max-time 3 "$PROXY_URL/health" 2>/dev/null | grep -q '"ok": true'; }
 
 embeddings_healthy() {
-  local embed_url="${LOCALAGENT_EMBED_BASE:-${EMBED_BASE:-$LLAMA_BASE}}"
+  local embed_url="${LOCALAGENT_EMBED_BASE:-${EMBED_BASE:-$EMBED_BASE_DEFAULT}}"
   curl -s --max-time 2 -X POST "$embed_url/v1/embeddings" \
     -H "Content-Type: application/json" -d '{"input":"test"}' 2>/dev/null | grep -q '"data"'
 }
 
 ensure_embeddings() {
-  local embed_url="${LOCALAGENT_EMBED_BASE:-${EMBED_BASE:-$LLAMA_BASE}}"
+  local embed_url="${LOCALAGENT_EMBED_BASE:-${EMBED_BASE:-$EMBED_BASE_DEFAULT}}"
   if embeddings_healthy; then
     echo "embeddings service active at $embed_url"
     return 0
@@ -85,7 +87,7 @@ proxy_start() {
   LLAMA_PROXY_HOST="$LISTEN_HOST" LLAMA_PROXY_PORT="$PROXY_PORT" \
     LLAMA_BASE="$LLAMA_BASE" LLAMA_PROXY_LOG="$PROXY_LOG" \
     LOCALAGENT_COMPRESS="${LOCALAGENT_COMPRESS:-0}" \
-    LOCALAGENT_EMBED_BASE="${LOCALAGENT_EMBED_BASE:-$LLAMA_BASE}" \
+    LOCALAGENT_EMBED_BASE="${LOCALAGENT_EMBED_BASE:-$EMBED_BASE_DEFAULT}" \
     LOCALAGENT_THINKING_DAMPEN="${LOCALAGENT_THINKING_DAMPEN:-0}" \
     setsid nohup python3 "$PROXY_PY" >>"$PROXY_LOG" 2>&1 </dev/null &
   echo $! >"$PIDFILE"
@@ -381,7 +383,7 @@ cmd_info() {
   fi
 
   # Compression & Token Savings
-  echo "Compression  : $(c_grn "ACTIVE") (embeddings @ ${LOCALAGENT_EMBED_BASE:-$LLAMA_BASE})"
+  echo "Compression  : $(c_grn "ACTIVE") (embeddings @ ${LOCALAGENT_EMBED_BASE:-$EMBED_BASE_DEFAULT})"
   local comp_summary
   comp_summary=$(PYTHONPATH="$HERE" python3 -c "
 import compressor

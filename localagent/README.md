@@ -97,7 +97,7 @@ In multi-turn agent sessions (Claude Code, Codex, pi), 70%+ of prompt tokens com
 ### The 5 Compression Mechanics
 
 1. **Semantic Chunk Pruning (`embeddinggemma-300M`):**
-   When a tool output exceeds thresholds (>50 lines / 1,500 chars), the compressor splits the text into line-window chunks and queries the local embeddings endpoint (`http://127.0.0.1:8089/v1/embeddings`). Chunks are scored by cosine similarity against the user's latest query, and only the top 3 most relevant sections are sent to the cloud model.
+   When a tool output exceeds thresholds (>50 lines / 1,500 chars), the compressor splits the text into line-window chunks and queries the local embeddings endpoint (`http://127.0.0.1:8091/v1/embeddings`, highllama's dedicated embedding-model server). Chunks are scored by cosine similarity against the user's latest query, and only the top 3 most relevant sections are sent to the cloud model.
 2. **Deterministic Fallback (Head/Tail):**
    If the embeddings endpoint is unavailable or times out, the compressor gracefully falls back to retaining the first 15 lines and last 15 lines with a clear truncation notice.
 3. **Lossless Spillover (CCR - Context-Compressed Retrieval):**
@@ -110,7 +110,7 @@ In multi-turn agent sessions (Claude Code, Codex, pi), 70%+ of prompt tokens com
 ### Auto-Startup & Embedding Server
 
 Whenever you launch an agent session via `cc` (`claude-local`) or run `localagent proxy start`:
-* It automatically checks if an embeddings service is responding on `:8089`.
+* It automatically checks if an embeddings service is responding on `:8091`.
 * If not, it auto-discovers your local embedding model (`embeddinggemma-300M-Q8_0.gguf`) and starts `highllama embeddings` in the background before launching the proxy.
 
 ### Token Savings Dashboard (`localagent gain`)
@@ -235,7 +235,7 @@ All of the environment variables below can optionally be loaded from a `.env` fi
 | `OPENCODE_PASSTHROUGH_BASE` | `https://opencode.ai/zen/go` | upstream base endpoint URL for OpenCode Go models |
 | `CLOUDCODE_UPSTREAM` | `https://daily-cloudcode-pa.googleapis.com` | Google Cloud Code Assist backend for `/v1internal:*` (agy / gemini-cli); point the CLI here with `CLOUD_CODE_URL=http://127.0.0.1:8090` to get the same context compression |
 | `LOCALAGENT_COMPRESS` | `0` | `1` enables native context compression & semantic chunk pruning before cloud APIs. **In testing — off by default**; needs the embeddings server, which the wrappers only start when this is `1` |
-| `LOCALAGENT_EMBED_BASE` | `http://127.0.0.1:8089` | embeddings endpoint URL used for semantic chunk ranking |
+| `LOCALAGENT_EMBED_BASE` | `http://127.0.0.1:8091` | embeddings endpoint URL used for semantic chunk ranking; the proxy also relays `POST /v1/embeddings` there (never to the Anthropic passthrough) |
 | `LOCALAGENT_THINKING_DAMPEN` | `0` | Optional thinking clamp on routine tool returns (`0` preserves user effort 100%) |
 | `LOCALAGENT_SPILL_DIR` | `~/.local/state/localagent/spill` | storage for full uncompressed originals (lossless CCR) |
 

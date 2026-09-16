@@ -33,7 +33,9 @@ MAX_LINES = int(os.environ.get("LOCALAGENT_COMPRESS_MAX_LINES", "50"))
 MAX_CHARS = int(os.environ.get("LOCALAGENT_COMPRESS_MAX_CHARS", "1500"))
 HEAD_LINES = int(os.environ.get("LOCALAGENT_COMPRESS_HEAD_LINES", "15"))
 TAIL_LINES = int(os.environ.get("LOCALAGENT_COMPRESS_TAIL_LINES", "15"))
-EMBED_BASE = os.environ.get("LOCALAGENT_EMBED_BASE", os.environ.get("LLAMA_BASE", "http://127.0.0.1:8089")).rstrip("/")
+# highllama serves embeddings from a dedicated embedding-model server on :8091 (the chat
+# server on :8089 no longer answers /v1/embeddings).
+EMBED_BASE = os.environ.get("LOCALAGENT_EMBED_BASE", "http://127.0.0.1:8091").rstrip("/")
 # Disabled by default: preserves user's thinking effort / budget setting 100%
 THINKING_DAMPEN = os.environ.get("LOCALAGENT_THINKING_DAMPEN", "0") == "1"
 ROUTINE_THINKING_BUDGET = int(os.environ.get("LOCALAGENT_ROUTINE_THINKING_BUDGET", "1500"))

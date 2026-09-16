@@ -33,6 +33,8 @@ Env:
   LLAMA_PROXY_PORT          listen port              (default 8090)
   LLAMA_PROXY_HOST          listen host              (default 127.0.0.1)
   LLAMA_BASE                llama-server base url     (default http://127.0.0.1:8089)
+  LOCALAGENT_EMBED_BASE     embeddings server url     (default http://127.0.0.1:8091);
+                            POST /v1/embeddings is relayed there, never passed through
   LLAMA_MODEL               force upstream model id   (default: auto-detect from /v1/models)
   LOCAL_MODEL_ALIAS         extra name that routes local (default "local-llama"; any
                             model whose name starts with "local" also routes local)
@@ -541,6 +543,18 @@ def log(*a):
                 f.write(msg + "\n")
         except OSError:
             pass
+
+
+EMBED_BASE = os.environ.get("LOCALAGENT_EMBED_BASE", "http://127.0.0.1:8091").rstrip("/")
+_emb = urlparse(EMBED_BASE)
+
+
+def embed_conn():
+    """Connection to highllama's dedicated embeddings server (default :8091)."""
+    port = _emb.port or (443 if _emb.scheme == "https" else 80)
+    if _emb.scheme == "https":
+        return http.client.HTTPSConnection(_emb.hostname, port, timeout=120)
+    return http.client.HTTPConnection(_emb.hostname, port, timeout=120)
 
 
 def upstream_conn():
@@ -1478,6 +1492,24 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
 
+    def _embeddings(self, raw):
+        """Relay POST /v1/embeddings verbatim to EMBED_BASE."""
+        try:
+            conn = embed_conn()
+            conn.request("POST", "/v1/embeddings", body=raw,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            data = resp.read()
+        except Exception as e:
+            log("embeddings: %s unreachable: %s" % (EMBED_BASE, e))
+            return self._json(502, {"error": {"type": "embeddings_unavailable",
+                                              "message": "embeddings server %s unreachable: %s" % (EMBED_BASE, e)}})
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _json(self, code, obj):
         data = json.dumps(obj).encode()
         self.send_response(code)
@@ -2385,6 +2417,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/v1internal"):
             return self._cloudcode_passthrough(raw)
         path_only = self.path.split("?", 1)[0]
+        # Embeddings are always local: relay to the embeddings server instead of letting
+        # the generic /v1/* passthrough send the text to the Anthropic API.
+        if path_only == "/v1/embeddings":
+            return self._embeddings(raw)
         try:
             body = json.loads(raw) if raw else {}
             if not isinstance(body, dict):
