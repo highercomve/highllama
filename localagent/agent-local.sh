@@ -21,12 +21,12 @@ HOST="${LLAMA_PROXY_HOST:-127.0.0.1}"
 PROXY_URL="http://$HOST:$PORT"
 
 # Context compression is enabled by default for agent sessions
-export LOCALAGENT_COMPRESS="${LOCALAGENT_COMPRESS:-1}"
+export LOCALAGENT_COMPRESS="${LOCALAGENT_COMPRESS:-0}"
 
 # Is the proxy host this machine? Only then does starting the proxy locally make sense.
 is_local_host() {
   case "$HOST" in
-    127.*|localhost|::1) return 0 ;;
+  127.* | localhost | ::1) return 0 ;;
   esac
   hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF "$HOST"
 }
@@ -53,20 +53,20 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-local}"
 
 # Agent-specific extras.
 case "$AGENT" in
-  claude|claude-code)
-    export ANTHROPIC_BASE_URL="$PROXY_URL"
-    export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
-    # NB: auth is whatever you already use. Subscription OAuth is forwarded to Anthropic
-    # by the proxy for Opus traffic. If Opus passthrough ever 401s, export ANTHROPIC_API_KEY.
-    ;;
-  codex)
-    # Codex uses OPENAI_BASE_URL / OPENAI_API_KEY by default.
-    ;;
-  pi)
-    # pi loads providers from extensions. If you want pi to use the proxy, point its
-    # llamacpp extension config at ${PROXY_URL}/v1 instead of llama-server directly.
-    echo "hint: configure ~/.pi/agent/llamacpp.json with {\"url\":\"${PROXY_URL}/v1\"}" >&2
-    ;;
+claude | claude-code)
+  export ANTHROPIC_BASE_URL="$PROXY_URL"
+  export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+  # NB: auth is whatever you already use. Subscription OAuth is forwarded to Anthropic
+  # by the proxy for Opus traffic. If Opus passthrough ever 401s, export ANTHROPIC_API_KEY.
+  ;;
+codex)
+  # Codex uses OPENAI_BASE_URL / OPENAI_API_KEY by default.
+  ;;
+pi)
+  # pi loads providers from extensions. If you want pi to use the proxy, point its
+  # llamacpp extension config at ${PROXY_URL}/v1 instead of llama-server directly.
+  echo "hint: configure ~/.pi/agent/llamacpp.json with {\"url\":\"${PROXY_URL}/v1\"}" >&2
+  ;;
 esac
 
 exec "$AGENT" "$@"

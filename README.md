@@ -172,6 +172,23 @@ highllama update                             # git pull llama.cpp + rebuild for 
   `mmproj-*.gguf`, `highllama pull <repo>:<quant>` downloads it next to the
   weights so `start` auto-attaches it (`--mmproj`) — e.g.
   `highllama pull ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M`.
+- **Reasoning models need a big `max_tokens`:** models that think before
+  answering (Bonsai, Qwen-AgentWorld, …) spend tokens inside `<think>` and leave
+  `message.content` **empty** until the trace closes, so a client that caps
+  `max_tokens` too low gets a valid response with no answer in it — the most
+  common way a healthy thinking model looks broken. The startup probe detects
+  these and prints a tip; send **`max_tokens` >= 4000** (6000 for code).
+  The trace is *not* replayed into later turns (the template blanks prior
+  `<think>` blocks), so multi-turn history stays small — a 4-turn chat was 119
+  prompt tokens, and a 3-step tool-calling loop grew 348 → 452. It only balloons
+  if your client echoes `reasoning_content` back in the assistant message; don't.
+  `llama-server --reasoning-budget N` looks like the fix but is not: `max_tokens`
+  caps thinking and answer together while the budget is a fixed absolute, so a
+  budget low enough to guarantee an answer at small `max_tokens` (~150) truncates
+  real derivations and emits the leftover trace *as* the answer, while a generous
+  one (2500) keeps quality but still returns empty at `max_tokens=200`. It is not
+  overridable per request. Pass it yourself after `--` only if you know you want
+  that trade.
 - Everything is a flag or env var: `MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K
   KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
   PROBE PROBE_REGRESS_PCT HL_STATE HL_PRESETS`;

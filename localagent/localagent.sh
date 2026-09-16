@@ -21,11 +21,11 @@
 #   <repo>/.git/localagent/<branch>/
 set -euo pipefail
 
-SELF="$(readlink -f "${BASH_SOURCE[0]}")"   # follow the ~/.local/bin symlink
+SELF="$(readlink -f "${BASH_SOURCE[0]}")" # follow the ~/.local/bin symlink
 HERE="$(cd "$(dirname "$SELF")" && pwd)"
 PROXY_PY="$HERE/proxy.py"
-LISTEN_HOST="${LLAMA_PROXY_HOST:-0.0.0.0}"   # bind addr: 0.0.0.0 = reachable from LAN
-PROXY_HOST="127.0.0.1"                        # host we curl/connect to locally
+LISTEN_HOST="${LLAMA_PROXY_HOST:-0.0.0.0}" # bind addr: 0.0.0.0 = reachable from LAN
+PROXY_HOST="127.0.0.1"                     # host we curl/connect to locally
 PROXY_PORT="${LLAMA_PROXY_PORT:-8090}"
 PROXY_URL="http://$PROXY_HOST:$PROXY_PORT"
 LLAMA_BASE="${LLAMA_BASE:-http://127.0.0.1:8089}"
@@ -39,10 +39,13 @@ TOOLS_READONLY="Read,Grep,Glob,Bash"
 
 mkdir -p "$STATE_DIR"
 
-c_red()  { printf '\033[31m%s\033[0m' "$*"; }
-c_grn()  { printf '\033[32m%s\033[0m' "$*"; }
-c_dim()  { printf '\033[2m%s\033[0m' "$*"; }
-die()    { echo "$(c_red error:) $*" >&2; exit 1; }
+c_red() { printf '\033[31m%s\033[0m' "$*"; }
+c_grn() { printf '\033[32m%s\033[0m' "$*"; }
+c_dim() { printf '\033[2m%s\033[0m' "$*"; }
+die() {
+  echo "$(c_red error:) $*" >&2
+  exit 1
+}
 
 # ---------------------------------------------------------------- proxy mgmt
 proxy_healthy() { curl -s --max-time 3 "$PROXY_URL/health" 2>/dev/null | grep -q '"ok": true'; }
@@ -68,22 +71,31 @@ ensure_embeddings() {
 }
 
 proxy_start() {
-  if [[ "${LOCALAGENT_COMPRESS:-1}" != "0" ]]; then
+  if [[ "${LOCALAGENT_COMPRESS:-0}" != "0" ]]; then
     ensure_embeddings
   fi
-  if proxy_healthy; then echo "proxy already up at $PROXY_URL"; return 0; fi
+  if proxy_healthy; then
+    echo "proxy already up at $PROXY_URL"
+    return 0
+  fi
   command -v python3 >/dev/null || die "python3 not found"
-  curl -s --max-time 3 "$LLAMA_BASE/v1/models" >/dev/null 2>&1 \
-    || echo "$(c_red warn:) llama-server not reachable at $LLAMA_BASE (start it with highllama)" >&2
+  curl -s --max-time 3 "$LLAMA_BASE/v1/models" >/dev/null 2>&1 ||
+    echo "$(c_red warn:) llama-server not reachable at $LLAMA_BASE (start it with highllama)" >&2
   echo "starting proxy: $PROXY_URL (bind $LISTEN_HOST:$PROXY_PORT) -> $LLAMA_BASE"
   LLAMA_PROXY_HOST="$LISTEN_HOST" LLAMA_PROXY_PORT="$PROXY_PORT" \
-  LLAMA_BASE="$LLAMA_BASE" LLAMA_PROXY_LOG="$PROXY_LOG" \
-  LOCALAGENT_COMPRESS="${LOCALAGENT_COMPRESS:-1}" \
-  LOCALAGENT_EMBED_BASE="${LOCALAGENT_EMBED_BASE:-$LLAMA_BASE}" \
-  LOCALAGENT_THINKING_DAMPEN="${LOCALAGENT_THINKING_DAMPEN:-0}" \
-    setsid nohup python3 "$PROXY_PY" >>"$PROXY_LOG" 2>&1 < /dev/null &
-  echo $! > "$PIDFILE"
-  for _ in $(seq 1 30); do proxy_healthy && { echo "proxy ready (pid $(cat "$PIDFILE"))"; return 0; }; sleep 0.3; done
+    LLAMA_BASE="$LLAMA_BASE" LLAMA_PROXY_LOG="$PROXY_LOG" \
+    LOCALAGENT_COMPRESS="${LOCALAGENT_COMPRESS:-1}" \
+    LOCALAGENT_EMBED_BASE="${LOCALAGENT_EMBED_BASE:-$LLAMA_BASE}" \
+    LOCALAGENT_THINKING_DAMPEN="${LOCALAGENT_THINKING_DAMPEN:-0}" \
+    setsid nohup python3 "$PROXY_PY" >>"$PROXY_LOG" 2>&1 </dev/null &
+  echo $! >"$PIDFILE"
+  for _ in $(seq 1 30); do
+    proxy_healthy && {
+      echo "proxy ready (pid $(cat "$PIDFILE"))"
+      return 0
+    }
+    sleep 0.3
+  done
   die "proxy failed to become healthy; see $PROXY_LOG"
 }
 
@@ -96,7 +108,8 @@ proxy_stop() {
 
 proxy_status() {
   if proxy_healthy; then
-    local model; model=$(curl -s "$PROXY_URL/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["model"])')
+    local model
+    model=$(curl -s "$PROXY_URL/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["model"])')
     echo "$(c_grn up)   $PROXY_URL  model=$model  upstream=$LLAMA_BASE"
   else
     echo "$(c_red down) $PROXY_URL"
@@ -104,9 +117,9 @@ proxy_status() {
 }
 
 resolve_model() {
-  curl -s --max-time 3 "$PROXY_URL/health" 2>/dev/null \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin)["model"])' 2>/dev/null \
-    || echo "local-model"
+  curl -s --max-time 3 "$PROXY_URL/health" 2>/dev/null |
+    python3 -c 'import sys,json;print(json.load(sys.stdin)["model"])' 2>/dev/null ||
+    echo "local-model"
 }
 
 # ---------------------------------------------------------------- run
@@ -115,24 +128,51 @@ cmd_run() {
   repo="$(pwd)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --task)      task="$2"; shift 2;;
-      --task-file) task="$(cat "$2")"; shift 2;;
-      --repo)      repo="$(cd "$2" && pwd)"; shift 2;;
-      --tools)     tools="$2"; shift 2;;
-      --timeout)   timeout="$2"; shift 2;;
-      --name)      name="$2"; shift 2;;
-      --in-place)  in_place=1; shift;;
-      --readonly)  readonly=1; tools="$TOOLS_READONLY"; shift;;
-      *) die "unknown flag: $1";;
+    --task)
+      task="$2"
+      shift 2
+      ;;
+    --task-file)
+      task="$(cat "$2")"
+      shift 2
+      ;;
+    --repo)
+      repo="$(cd "$2" && pwd)"
+      shift 2
+      ;;
+    --tools)
+      tools="$2"
+      shift 2
+      ;;
+    --timeout)
+      timeout="$2"
+      shift 2
+      ;;
+    --name)
+      name="$2"
+      shift 2
+      ;;
+    --in-place)
+      in_place=1
+      shift
+      ;;
+    --readonly)
+      readonly=1
+      tools="$TOOLS_READONLY"
+      shift
+      ;;
+    *) die "unknown flag: $1" ;;
     esac
   done
-  [[ -n "$task" ]] || { task="$(cat)"; }   # fall back to stdin
+  [[ -n "$task" ]] || { task="$(cat)"; } # fall back to stdin
   [[ -n "$task" ]] || die "no --task given"
 
   proxy_start >&2
-  local model; model="$(resolve_model)"
+  local model
+  model="$(resolve_model)"
 
-  local is_git=0; git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 && is_git=1
+  local is_git=0
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 && is_git=1
   local workdir="$repo" branch="" outdir base=""
 
   if [[ $readonly -eq 1 || $in_place -eq 1 || $is_git -eq 0 ]]; then
@@ -161,22 +201,23 @@ cmd_run() {
   echo "$(c_dim "running local sub-agent... (timeout ${timeout}s)")" >&2
 
   local perm="bypassPermissions"
-  [[ $readonly -eq 1 ]] && perm="bypassPermissions"   # still bypass to avoid prompts; tools are read-only set
+  [[ $readonly -eq 1 ]] && perm="bypassPermissions" # still bypass to avoid prompts; tools are read-only set
   local transcript="$outdir/transcript.json"
   local rc=0
-  ( cd "$workdir"
+  (
+    cd "$workdir"
     ANTHROPIC_BASE_URL="$PROXY_URL" \
-    ANTHROPIC_API_KEY="local" \
-    ANTHROPIC_MODEL="$model" \
-    DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_PROMPT_CACHING=1 \
-    timeout "$timeout" claude --bare -p "$task" \
+      ANTHROPIC_API_KEY="local" \
+      ANTHROPIC_MODEL="$model" \
+      DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_PROMPT_CACHING=1 \
+      timeout "$timeout" claude --bare -p "$task" \
       --model "$model" \
       --tools "$tools" \
       --permission-mode "$perm" \
       --no-session-persistence \
       --output-format json
-  ) > "$transcript" 2>"$outdir/stderr.log" || rc=$?
+  ) >"$transcript" 2>"$outdir/stderr.log" || rc=$?
 
   # summarize
   local result_txt
@@ -202,11 +243,14 @@ except Exception as e:
     if [[ -n "$branch" ]]; then
       # isolated worktree: safe to `add -A` to capture untracked files in the diff
       git -C "$workdir" add -A >/dev/null 2>&1 || true
-      git -C "$workdir" diff --cached ${base:+"$base"} > "$diff_file" 2>/dev/null || git -C "$workdir" diff --cached > "$diff_file" 2>/dev/null || true
+      git -C "$workdir" diff --cached ${base:+"$base"} >"$diff_file" 2>/dev/null || git -C "$workdir" diff --cached >"$diff_file" 2>/dev/null || true
       nfiles=$(git -C "$workdir" diff --cached --name-only ${base:+"$base"} 2>/dev/null | wc -l | tr -d ' ')
     else
       # in-place: never touch the real index; report unstaged + untracked read-only
-      { git -C "$workdir" diff; git -C "$workdir" ls-files --others --exclude-standard; } > "$diff_file" 2>/dev/null || true
+      {
+        git -C "$workdir" diff
+        git -C "$workdir" ls-files --others --exclude-standard
+      } >"$diff_file" 2>/dev/null || true
       nfiles=$(git -C "$workdir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     fi
     {
@@ -233,13 +277,17 @@ find_repo_for_branch() { git -C "${2:-$(pwd)}" rev-parse --git-dir >/dev/null 2>
 cmd_list() {
   local repo="${1:-$(pwd)}"
   local d="$repo/.git/localagent"
-  [[ -d "$d" ]] || { echo "no pending runs in $repo"; return 0; }
+  [[ -d "$d" ]] || {
+    echo "no pending runs in $repo"
+    return 0
+  }
   echo "pending localagent worktrees in $repo:"
   git -C "$repo" worktree list 2>/dev/null | grep localagent || echo "  (none active)"
 }
 
 cmd_diff() {
-  local branch="$1"; local repo="${2:-$(pwd)}"
+  local branch="$1"
+  local repo="${2:-$(pwd)}"
   local slug="${branch//\//_}"
   local f="$repo/.git/localagent/meta/$slug/changes.diff"
   [[ -f "$f" ]] || die "no diff at $f"
@@ -247,9 +295,18 @@ cmd_diff() {
 }
 
 cmd_apply() {
-  local branch="$1"; shift || true
+  local branch="$1"
+  shift || true
   local repo="$(pwd)" into=""
-  while [[ $# -gt 0 ]]; do case "$1" in --repo) repo="$2"; shift 2;; --into) into="$2"; shift 2;; *) shift;; esac; done
+  while [[ $# -gt 0 ]]; do case "$1" in --repo)
+    repo="$2"
+    shift 2
+    ;;
+  --into)
+    into="$2"
+    shift 2
+    ;;
+  *) shift ;; esac done
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repo: $repo"
   local slug="${branch//\//_}"
   local wt="$repo/.git/localagent/wt/$slug"
@@ -264,7 +321,8 @@ cmd_apply() {
 }
 
 cmd_discard() {
-  local branch="$1"; local repo="${2:-$(pwd)}"
+  local branch="$1"
+  local repo="${2:-$(pwd)}"
   local slug="${branch//\//_}"
   local wt="$repo/.git/localagent/wt/$slug"
   git -C "$repo" worktree remove --force "$wt" 2>/dev/null || true
@@ -289,31 +347,33 @@ cmd_info() {
     # dataset_path had no .jsonl extension to strip — append .db
     db_file="${dataset_path}.db"
   fi
-  
+
   echo "$(c_grn "LocalAgent Session Information:")"
   echo "----------------------------------------"
-  
+
   # Proxy Status
   if proxy_healthy; then
-    local model; model=$(curl -s "$PROXY_URL/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["model"])' 2>/dev/null || echo "unknown")
+    local model
+    model=$(curl -s "$PROXY_URL/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["model"])' 2>/dev/null || echo "unknown")
     echo "Proxy Status : $(c_grn "UP") ($PROXY_URL)"
     echo "Active Model : $model"
     echo "Upstream API : $LLAMA_BASE"
   else
     echo "Proxy Status : $(c_red "DOWN") ($PROXY_URL)"
   fi
-  
+
   echo "Proxy Log    : $PROXY_LOG"
   if [[ -f "$PROXY_LOG" ]]; then
     echo "  Log Size   : $(du -sh "$PROXY_LOG" | awk '{print $1}')"
   fi
-  
+
   echo "Database     : $db_file"
   if [[ -f "$db_file" ]]; then
     echo "  DB Size    : $(du -sh "$db_file" | awk '{print $1}')"
     # Row count using sqlite3
     if command -v sqlite3 >/dev/null; then
-      local count; count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM dataset_calls" 2>/dev/null || echo "0")
+      local count
+      count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM dataset_calls" 2>/dev/null || echo "0")
       echo "  Log Count  : $count entries"
     fi
   else
@@ -351,22 +411,29 @@ cmd_gain() {
 # ---------------------------------------------------------------- dispatch
 usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
 
-cmd="${1:-}"; shift || true
+cmd="${1:-}"
+shift || true
 case "$cmd" in
-  proxy)
-    sub="${1:-status}"; shift || true
-    case "$sub" in
-      start) proxy_start;; stop) proxy_stop;; status) proxy_status;;
-      restart) proxy_stop; proxy_start;; *) die "proxy: start|stop|status|restart";;
-    esac;;
-  run)     cmd_run "$@";;
-  list)    cmd_list "$@";;
-  diff)    cmd_diff "$@";;
-  apply)   cmd_apply "$@";;
-  discard) cmd_discard "$@";;
-  export)  python3 "$HERE/export_dataset.py" "$@";;
-  gain|stats) cmd_gain "$@";;
-  info)    cmd_info;;
-  ""|-h|--help|help) usage;;
-  *) die "unknown command: $cmd (try: proxy|run|list|diff|apply|discard|export|gain|info)";;
+proxy)
+  sub="${1:-status}"
+  shift || true
+  case "$sub" in
+  start) proxy_start ;; stop) proxy_stop ;; status) proxy_status ;;
+  restart)
+    proxy_stop
+    proxy_start
+    ;;
+  *) die "proxy: start|stop|status|restart" ;;
+  esac
+  ;;
+run) cmd_run "$@" ;;
+list) cmd_list "$@" ;;
+diff) cmd_diff "$@" ;;
+apply) cmd_apply "$@" ;;
+discard) cmd_discard "$@" ;;
+export) python3 "$HERE/export_dataset.py" "$@" ;;
+gain | stats) cmd_gain "$@" ;;
+info) cmd_info ;;
+"" | -h | --help | help) usage ;;
+*) die "unknown command: $cmd (try: proxy|run|list|diff|apply|discard|export|gain|info)" ;;
 esac

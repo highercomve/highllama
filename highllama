@@ -543,16 +543,27 @@ try:
         raise SystemExit
     # degenerate-output check: a repetition loop generates FAST, so speed alone
     # would record garbage as a best. Low distinct-4-gram ratio = looping.
+    #
+    # Reasoning models spend the whole probe token budget inside <think> and
+    # return content="", so scoring `content` alone silently disables this guard
+    # on exactly the models that emit the most text. Score the reasoning trace
+    # when that is where the tokens went.
     flag = ""
+    think = ""
     try:
-        words = ((d.get("choices") or [{}])[0].get("message") or {}).get("content", "").split()
+        msg = (d.get("choices") or [{}])[0].get("message") or {}
+        body = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        if reasoning:
+            think = " think"
+        words = (body or reasoning).split()
         if len(words) >= 24:
             grams = [tuple(words[i:i+4]) for i in range(len(words) - 3)]
             if len(set(grams)) / len(grams) < 0.4:
                 flag = " loop"
     except Exception:
         pass
-    print(f"{tps:.1f}{flag}")
+    print(f"{tps:.1f}{flag}{think}")
 except Exception:
     pass
 ' 2>/dev/null
@@ -625,6 +636,27 @@ run_probe_and_guard() { # <port> <alias> — measure decode t/s, track best, war
         probe_say ">> probe skipped (no valid timing from server)"
         return 0
     fi
+    case "$tps" in
+    *" think")
+        tps="${tps% think}"
+        # The probe asks for 64 tokens and got back pure reasoning: this model
+        # thinks before it answers, and `content` stays empty until the trace
+        # closes. A client that caps max_tokens too low therefore gets a
+        # perfectly valid response with an empty message — the single most
+        # common way a healthy thinking model looks broken.
+        #
+        # Deliberately a warning and not a fix: --reasoning-budget N is the only
+        # server-side lever and it cannot solve this. max_tokens caps thinking
+        # and answer together while the budget is a fixed absolute, so a budget
+        # low enough to guarantee an answer at small max_tokens (~150) truncates
+        # real reasoning mid-derivation and emits the leftover trace AS the
+        # answer — confidently wrong instead of visibly blank. A generous budget
+        # (2500) keeps quality but still returns empty at max_tokens=200. It is
+        # also not overridable per-request. Measured on Bonsai-27B; see README.
+        probe_say ">> reasoning model: thinks before answering (probe returned reasoning only)"
+        probe_say ">> tip: clients must send max_tokens >= 4000 — a low cap returns an EMPTY message"
+        ;;
+    esac
     case "$tps" in
     *" loop")
         tps="${tps%% *}"
@@ -1488,6 +1520,11 @@ restart)
     HL_LAST_EXTRA=()
     # shellcheck disable=SC1090
     . "$HL_LAST"
+    # drop empty elements — llama-server rejects an empty argument, and older
+    # highllama versions recorded HL_LAST_EXTRA=( '' ) for "no extra args"
+    _le=(); for _e in ${HL_LAST_EXTRA[@]+"${HL_LAST_EXTRA[@]}"}; do
+        [ -n "$_e" ] && _le+=("$_e")
+    done; HL_LAST_EXTRA=(${_le[@]+"${_le[@]}"})
     echo ">> restarting last launch: $(basename "$MODEL") ctx=$CONTEXT${HL_LAST_EXTRA[0]+ extra:${HL_LAST_EXTRA[*]}}"
     if ! "$SCRIPT_PATH" stop; then
         echo "!! failed to stop the existing server" >&2
@@ -1712,7 +1749,8 @@ if [ -z "${HL_CMDDUMP:-}" ]; then
             printf '%s=%q\n' "$_v" "${!_v}"
         done
         printf 'HL_LAST_EXTRA=('
-        printf ' %q' ${EXTRA[@]+"${EXTRA[@]}"}
+        # note: a bare `printf ' %q'` with no args still emits one ''; guard it
+        [ "${#EXTRA[@]}" -gt 0 ] && printf ' %q' "${EXTRA[@]}"
         printf ' )\n'
     } >"$_last_tmp"
     mv "$_last_tmp" "$HL_LAST"
@@ -2189,10 +2227,30 @@ metal | cpu)
     ;;
 esac
 
-# mmap is the right default on unified memory (Metal); --no-mmap elsewhere so
+# mmap is the right default on unified memory (Metal); disabled elsewhere so
 # CPU-side expert weights land in real RAM instead of thrashing page cache.
-MMAP_ARGS=(--no-mmap)
-[ "$BACKEND" = "metal" ] && MMAP_ARGS=()
+# Upstream replaced --no-mmap/--mlock with `--load-mode MODE` (b10088+), so probe
+# the binary and emit whichever spelling it understands.
+# NB: runs before LLAMA_BIN is set, so resolve the binary here; only cache a
+# result once we actually found something to ask.
+llama_has_load_mode() {
+    if [ -z "${_HAS_LOAD_MODE:-}" ]; then
+        local _b="${LLAMA_BIN:-$LLAMA_DIR/build/bin/llama-server}"
+        [ -x "$_b" ] || _b="$LLAMA_DIR/build/bin/llama-server"
+        [ -x "$_b" ] || return 1
+        if "$_b" --help 2>&1 | command grep -q -- '--load-mode'; then
+            _HAS_LOAD_MODE=1
+        else _HAS_LOAD_MODE=0; fi
+    fi
+    [ "$_HAS_LOAD_MODE" = 1 ]
+}
+if [ "$BACKEND" = "metal" ]; then
+    MMAP_ARGS=()
+elif llama_has_load_mode; then
+    MMAP_ARGS=(--load-mode none)
+else
+    MMAP_ARGS=(--no-mmap)
+fi
 
 # ---- chat template override --------------------------------------------------
 # Some GGUFs ship a Jinja chat template that llama.cpp's engine can't render.
@@ -2315,7 +2373,10 @@ if [ -n "$USE_ROUTER" ]; then
             printf 'dry-base = 1.75\n'
             printf 'dry-allowed-length = 2\n'
         fi
-        [ "$BACKEND" != "metal" ] && printf 'no-mmap = true\n'
+        if [ "$BACKEND" != "metal" ]; then
+            if llama_has_load_mode; then printf 'load-mode = none\n'
+            else printf 'no-mmap = true\n'; fi
+        fi
         printf 'jinja = true\n'
         [ -n "$TPL_FILE" ] && printf 'chat-template-file = %s\n' "$TPL_FILE"
         [ -n "$MMPROJ_HIT" ] && printf 'mmproj = %s\n' "$MMPROJ_HIT"
@@ -2347,9 +2408,21 @@ if [ -n "$USE_ROUTER" ]; then
     RLOG="$(mktemp "${TMPDIR:-/tmp}/highllama-router.XXXXXX")"
     RSRV=""
     RTAIL=""
+    ROUTER_READY=""   # set below; declared here for the EXIT trap under `set -u`
     cleanup_router() {
+        local _rc=$?
         [ -n "$RTAIL" ] && kill "$RTAIL" 2>/dev/null
         [ -n "$RSRV" ] && kill "$RSRV" 2>/dev/null
+        # on a failed start the live `tail -f` often loses the race and the log
+        # is deleted unread — keep it, and say where, so the error is findable
+        if [ "$_rc" -ne 0 ] && [ -z "$ROUTER_READY" ] && [ -s "$RLOG" ]; then
+            local _keep="${HL_STATE:-$HOME/.config/highllama}/router-fail.log"
+            mkdir -p "$(dirname "$_keep")" 2>/dev/null
+            { echo "# router preset:"; sed 's/^/#   /' "$INI"; echo; cat "$RLOG"; } >"$_keep" 2>/dev/null \
+                && echo "!! router log saved to $_keep" >&2
+            echo "---- last 15 lines of the router log ----" >&2
+            tail -n 15 "$RLOG" >&2
+        fi
         rm -f "$RLOG" "$INI"
     }
     trap cleanup_router EXIT
@@ -2368,7 +2441,12 @@ if [ -n "$USE_ROUTER" ]; then
     # ready when both children report in, or bail on OOM / a bad preset key
     ROUTER_READY=""
     while kill -0 "$RSRV" 2>/dev/null; do
-        if [ "$(command grep -c 'cmd_child_to_router:ready' "$RLOG" 2>/dev/null || echo 0)" -ge 2 ]; then
+        # grep -c exits 1 on zero matches but still prints "0": `|| true` keeps
+        # `set -e` from killing us without the "0\n0" a `|| echo 0` would yield
+        # b10088+ replaced the bare `:ready` line with `:state:{"state":"ready",...}`
+        _ready_re='cmd_child_to_router:(ready|state:.*"state"[[:space:]]*:[[:space:]]*"ready")'
+        _ready_n="$(command grep -cE "$_ready_re" "$RLOG" 2>/dev/null || true)"
+        if [ "${_ready_n:-0}" -ge 2 ]; then
             echo ">> router ready: chat + embeddings models loaded"
             ROUTER_READY=1
             break
@@ -2434,9 +2512,17 @@ while :; do
     TAILER=$!
 
     # watch for readiness vs. out-of-memory while the server is starting
+    #
+    # Match both spellings of the ready line: upstream shortened "server is
+    # listening on http://..." to "listening on http://..." (b10088-era). On the
+    # stale pattern alone this loop never breaks — the server serves fine, but
+    # the script spins here forever and never reaches run_probe_and_guard, so the
+    # speed baseline, the regression guard and the reasoning-model tip all go
+    # missing on the foreground path. The daemon path greps /health instead and
+    # was unaffected, which is why this hid for so long.
     outcome=""
     while kill -0 "$SRV" 2>/dev/null; do
-        if command grep -q "server is listening" "$LOG"; then
+        if command grep -qE "(server is )?listening on http" "$LOG"; then
             outcome="ok"
             break
         fi
