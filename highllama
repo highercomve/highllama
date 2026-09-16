@@ -94,6 +94,7 @@ MODELS_DIR="${MODELS_DIR:-$HOME/.lmstudio/models}" # router-mode model root (one
 MODELS_MAX="${MODELS_MAX:-2}"                      # router-mode: max models loaded c
 EMBED_MODEL="${EMBED_MODEL:-}"                     # embedding model (path/substring) for MTP+embeddings router; auto-discovered if empty
 HL_STATE="${HL_STATE:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/speed.tsv}" # measured-speed state (probe baselines + tuned configs)
+HL_USAGE="${HL_USAGE:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/usage.tsv}"  # per-day token totals (see `highllama usage`)
 PROBE="${PROBE:-1}"       # startup decode-speed probe: 1 = on (--no-probe / PROBE=0 to skip)
 PROBE_REGRESS_PCT="${PROBE_REGRESS_PCT:-70}" # warn when measured decode falls below this % of best-known
 HL_PRESETS="${HL_PRESETS:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/presets}" # user model presets (see MODEL_PRESETS)
@@ -504,6 +505,117 @@ state_del() { # <kind> <alias> <gpu> <bucket>
     awk -F'\t' -v k="$1" -v a="$2" -v g="$3" -v b="$4" \
         '!($1==k && $2==a && $3==g && $4==b)' "$HL_STATE" >"$tmp"
     mv "$tmp" "$HL_STATE"
+}
+
+# ---- token accounting: daily input/output totals ---------------------------
+# llama-server's /metrics counters are cumulative but live only in RAM: they
+# zero on every restart, and highllama restarts the server often. So we fold
+# them into a per-day file ($HL_USAGE) and keep a cursor of what we have
+# already banked.
+#
+# The cursor is keyed on the server's Process-Start-Time-Unix header. When that
+# changes the process is new and its counters restarted, so the whole current
+# value is the delta; otherwise the delta is value-minus-cursor. Anything
+# generated between the last fold and a restart we never observed is lost, so
+# `stop` folds one last time before killing the server (it owns the lifecycle).
+#
+# NB: prompt_tokens_total counts only tokens actually decoded -- a cache hit is
+# billed to prompt_tokens_cached_total instead. Input is the sum of both, which
+# is what a client's usage.prompt_tokens reports.
+usage_fold() { # [port] -> bank the running server's counters into $HL_USAGE
+    local port="${1:-$PORT}" hdr body dir tmp
+    command -v curl >/dev/null 2>&1 || return 0
+    hdr="$(mktemp "${TMPDIR:-/tmp}/highllama-usage.XXXXXX")"
+    body="$(curl -sf --max-time 3 -D "$hdr" "http://127.0.0.1:${port}/metrics" 2>/dev/null)" || {
+        rm -f "$hdr"
+        return 0 # no server, or built without --metrics: nothing to fold
+    }
+    local started cur_in cur_cached cur_out
+    started="$(awk 'tolower($1)=="process-start-time-unix:"{gsub(/\r/,"",$2); print $2; exit}' "$hdr")"
+    rm -f "$hdr"
+    cur_in="$(printf '%s\n' "$body" | awk '$1=="llamacpp:prompt_tokens_total"{print $2; exit}')"
+    cur_cached="$(printf '%s\n' "$body" | awk '$1=="llamacpp:prompt_tokens_cached_total"{print $2; exit}')"
+    cur_out="$(printf '%s\n' "$body" | awk '$1=="llamacpp:tokens_predicted_total"{print $2; exit}')"
+    [ -n "$cur_in" ] && [ -n "$cur_out" ] || return 0
+    cur_in="$(awk -v a="$cur_in" -v b="${cur_cached:-0}" 'BEGIN{printf "%d", a+b}')"
+    cur_out="$(awk -v a="$cur_out" 'BEGIN{printf "%d", a}')"
+    : "${started:=0}"
+
+    dir="$(dirname "$HL_USAGE")"
+    mkdir -p "$dir"
+    [ -f "$HL_USAGE" ] || printf '# highllama token usage v1\n# day\tin\tout\n' >"$HL_USAGE"
+    tmp="$(mktemp "$dir/.usage.XXXXXX")"
+    awk -F'\t' -v today="$(date +%Y-%m-%d)" -v st="$started" \
+        -v ci="$cur_in" -v co="$cur_out" '
+        /^#/ { print; next }
+        $1=="cursor" { p_st=$2; p_in=$3; p_out=$4; next }
+        $1==today    { t_in=$2; t_out=$3; next }
+        NF { print }
+        END {
+            # same process -> bank the increment; new process -> bank it all
+            if (p_st == st) { d_in = ci - p_in; d_out = co - p_out }
+            else            { d_in = ci;        d_out = co }
+            if (d_in  < 0) d_in  = 0   # counter went backwards: treat as a reset
+            if (d_out < 0) d_out = 0
+            printf "%s\t%d\t%d\n", today, t_in + d_in, t_out + d_out
+            printf "cursor\t%s\t%d\t%d\n", st, ci, co
+        }' "$HL_USAGE" >"$tmp" && mv "$tmp" "$HL_USAGE" || rm -f "$tmp"
+    return 0
+}
+
+usage_read_day() { # <YYYY-MM-DD> -> "in<TAB>out" (zeros when absent)
+    [ -f "$HL_USAGE" ] || {
+        printf '0\t0\n'
+        return 0
+    }
+    awk -F'\t' -v d="$1" '$1==d {print $2 "\t" $3; f=1; exit} END{if(!f) print "0\t0"}' "$HL_USAGE"
+}
+
+cmd_usage() { # [--json]
+    local json=0
+    [ "${1:-}" = "--json" ] && json=1
+    usage_fold "$PORT"
+    local today in out total
+    today="$(date +%Y-%m-%d)"
+    IFS=$'\t' read -r in out <<<"$(usage_read_day "$today")"
+    total=$((in + out))
+    if [ "$json" = 0 ]; then
+        printf 'token usage for %s (%s)\n' "$today" "$HL_USAGE"
+        printf '  input   %s\n' "$(fmt_tokens "$in")"
+        printf '  output  %s\n' "$(fmt_tokens "$out")"
+        printf '  total   %s\n' "$(fmt_tokens "$total")"
+        return 0
+    fi
+    # ai-usage collector contract: {id,name,plan,ok,stale,error,
+    # limits:[{label,percent,resetsAt}]}. percent stays null -- a local server
+    # has no quota, and a number here would be folded into the bar widget's
+    # worstPercent and compete with real subscription limits for its colour.
+    # resetsAt is the next local midnight, which is when these counts roll over.
+    # Next LOCAL midnight, expressed in UTC: the day buckets are keyed on
+    # `date +%Y-%m-%d`, which is local. Compute the epoch first and format it
+    # separately -- `date -u -d 'tomorrow 00:00'` parses in UTC too, so it
+    # would return midnight UTC and the widget's countdown would be off by the
+    # zone offset.
+    local mid_epoch midnight
+    mid_epoch="$(date -d 'tomorrow 00:00' +%s 2>/dev/null ||
+        date -v+1d -v0H -v0M -v0S +%s 2>/dev/null || true)"
+    if [ -n "$mid_epoch" ]; then
+        midnight="$(date -u -d "@$mid_epoch" +%FT%TZ 2>/dev/null ||
+            date -u -r "$mid_epoch" +%FT%TZ 2>/dev/null || true)"
+    fi
+    printf '{"id":"highllama","name":"Highllama","plan":"local","ok":true,"stale":false,"error":null,"limits":['
+    printf '{"label":"Input %s","percent":null,"resetsAt":"%s"},' "$(fmt_tokens "$in")" "$midnight"
+    printf '{"label":"Output %s","percent":null,"resetsAt":"%s"},' "$(fmt_tokens "$out")" "$midnight"
+    printf '{"label":"Total %s","percent":null,"resetsAt":"%s"}' "$(fmt_tokens "$total")" "$midnight"
+    printf ']}\n'
+}
+
+fmt_tokens() { # 1234567 -> 1.2M
+    awk -v n="${1:-0}" 'BEGIN{
+        if (n >= 1000000) printf "%.1fM", n/1000000
+        else if (n >= 1000) printf "%.0fk", n/1000
+        else printf "%d", n
+    }'
 }
 
 wait_api_ready() { # <port> [timeout_s] — /health 200s only once the model is loaded
@@ -1330,6 +1442,8 @@ COMMANDS:
                      e.g. `highllama restart --daemon`
   tune [options]     measure the fastest config (MTP / offload) for a model on
                      this hardware and persist it; 'start' applies it after
+  usage [--json]     today's input/output token totals (persisted per day;
+                     --json emits an ai-usage provider card for the bar widget)
   logs [args]        stream daemon logs (journalctl -t highllama)
   deps [backend]     install build requirements (pacman/apt/dnf/zypper/brew)
   build [backend]    clone (if needed) + cmake-build llama.cpp
@@ -1432,6 +1546,8 @@ stop)
         fi
     fi
     if [ -n "$(server_running)" ]; then
+        # bank the token counters before they die with the process
+        usage_fold "$PORT"
         echo ">> stopping server..."
         pkill -x llama-server 2>/dev/null || true
         pkill -f 'mlx_lm.server|mlx_lm server' 2>/dev/null || true
@@ -1466,6 +1582,11 @@ status)
     else
         echo ">> no server running."
     fi
+    exit 0
+    ;;
+usage)
+    shift
+    cmd_usage "$@"
     exit 0
     ;;
 logs)
@@ -2429,7 +2550,7 @@ if [ -n "$USE_ROUTER" ]; then
     trap 'exit 130' INT TERM
     RCMD=(
         "$LLAMA_BIN" --models-preset "$INI" --models-max "$MODELS_MAX"
-        --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"}
+        --host "$HOST" --port "$PORT" --metrics ${EXTRA[@]+"${EXTRA[@]}"}
     )
     printf '>> llama-server (router):'; printf ' %q' "${RCMD[@]}"; printf '\n'
     echo ">> preset INI ($INI):"; sed 's/^/   /' "$INI"
@@ -2494,6 +2615,7 @@ while :; do
         -ctk "$KVTYPE_K" -ctv "$KVTYPE_V"
         -c "$CONTEXT"
         --parallel "$PARALLEL"
+        --metrics # /metrics counters -> `highllama usage`
         ${SAMPLER_ARGS[@]+"${SAMPLER_ARGS[@]}"}
         ${MMAP_ARGS[@]+"${MMAP_ARGS[@]}"}
         --jinja
