@@ -39,6 +39,7 @@
 #   highllama start -m <model> --chat-template ./my.jinja            # override broken GGUF template
 #   highllama start -m <model> --daemon          # background; logs -> journal
 #   highllama logs                              # stream daemon journal logs
+#   highllama watch                             # live: is it prefilling / generating?
 #   highllama reload -c 128k --mtp              # stop running server and restart with new flags
 #   highllama restart                           # stop + start with the same settings as last start
 #   highllama start --no-embeddings              # remove the embeddings from the server
@@ -694,6 +695,124 @@ cmd_usage() { # [--json]
     printf '{"label":"%s","percent":%s,"resetsAt":"%s"},' "$l_out" "${p_out:-null}" "$midnight"
     printf '{"label":"%s","percent":%s,"resetsAt":"%s"}' "$l_total" "${p_total:-null}" "$midnight"
     printf ']}\n'
+}
+
+# ---- watch: live per-slot state from /slots ---------------------------------
+# llama-server's own log is silent for most of a generation: the n_gen progress
+# line waits for 100 tokens and then prints at most every 3s, so short replies
+# never show up while they run. /slots is live (prompt and decode counters move
+# per batch), so poll it and render idle / prefill / generating per slot.
+cmd_watch() { # [interval seconds]
+    local interval="${1:-1}"
+    command -v python3 >/dev/null 2>&1 || {
+        echo "!! watch needs python3" >&2
+        exit 1
+    }
+    HL_WATCH_PORT="$PORT" HL_WATCH_INTERVAL="$interval" exec python3 - <<'PY'
+import json, os, sys, time, urllib.request
+
+port = os.environ["HL_WATCH_PORT"]
+interval = float(os.environ["HL_WATCH_INTERVAL"])
+url = f"http://127.0.0.1:{port}/slots"
+tty = sys.stdout.isatty()
+
+def fetch():
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            return json.load(r), None
+    except urllib.error.HTTPError as e:
+        return None, f"/slots returned HTTP {e.code} (server started with --no-slots?)"
+    except Exception:
+        return None, f"no server on :{port}"
+
+def stamp():
+    return time.strftime("%H:%M:%S")
+
+def emit(line):  # persistent line, above the live status on a tty
+    sys.stdout.write(("\r\033[K" if tty else "") + line + "\n")
+    sys.stdout.flush()
+
+track = {}  # slot id -> {task, t0, gen_t0, dec0, last_dec, tps, phase, n_prompt, cached}
+last_err = None
+try:
+    while True:
+        slots, err = fetch()
+        now = time.monotonic()
+        if err:
+            if err != last_err:
+                emit(f"{stamp()} !! {err}")
+                last_err = err
+            track.clear()
+            time.sleep(interval)
+            continue
+        if last_err:
+            emit(f"{stamp()} >> connected to :{port}")
+            last_err = None
+
+        parts = []
+        for s in slots:
+            sid, task = s.get("id"), s.get("id_task")
+            dec = (s.get("next_token") or [{}])[0].get("n_decoded", 0)
+            n_prompt = s.get("n_prompt_tokens", 0)
+            done_p = s.get("n_prompt_tokens_processed", 0)
+            cached = s.get("n_prompt_tokens_cache", 0)
+            t = track.get(sid)
+
+            if t and (not s.get("is_processing") or t["task"] != task):
+                # finished (or replaced before we saw it go idle)
+                el = now - t["t0"]
+                gen = t["last_dec"]
+                tps = f" @ {t['tps']:.1f} t/s" if t["tps"] else ""
+                emit(f"{stamp()} slot {sid} task {t['task']}: done in {el:.1f}s — "
+                     f"prompt {t['n_prompt']} (cached {t['cached']}), generated {gen}{tps}")
+                track.pop(sid)
+                t = None
+
+            if not s.get("is_processing"):
+                parts.append(f"slot {sid}: idle")
+                continue
+
+            if t is None:
+                t = track[sid] = dict(task=task, t0=now, gen_t0=None, dec0=0,
+                                      last_dec=0, tps=0.0, phase="", n_prompt=n_prompt,
+                                      cached=cached)
+                if dec:
+                    emit(f"{stamp()} slot {sid} task {task}: already generating ({dec} tok) when watch attached")
+                else:
+                    emit(f"{stamp()} slot {sid} task {task}: started — prompt {n_prompt} tokens")
+            if dec == 0:  # n_prompt_tokens keeps growing with the output once decoding
+                t["n_prompt"], t["cached"] = n_prompt, cached
+
+            if dec == 0:
+                todo = max(n_prompt - cached, 1)
+                pct = min(100, 100 * done_p // todo)
+                phase = "prefill"
+                parts.append(f"slot {sid}: prefill {done_p}/{todo} ({pct}%) {now - t['t0']:.0f}s")
+            else:
+                phase = "generating"
+                if t["gen_t0"] is None:  # first sighting: rate is measured from here
+                    t["gen_t0"], t["dec0"] = now, dec
+                elif now > t["gen_t0"]:
+                    t["tps"] = (dec - t["dec0"]) / (now - t["gen_t0"])
+                t["last_dec"] = dec
+                tps = f" @ {t['tps']:.1f} t/s" if t["tps"] else ""
+                parts.append(f"slot {sid}: generating {dec} tok{tps}")
+            if phase != t["phase"]:
+                if phase == "generating" and not t["phase"]:
+                    pass  # watch attached mid-generation: "started" already said so
+                elif phase == "generating":
+                    emit(f"{stamp()} slot {sid} task {task}: generating "
+                         f"(prefill took {now - t['t0']:.1f}s)")
+                t["phase"] = phase
+
+        if tty:  # non-tty (piped/journal): only the event lines, no status spam
+            sys.stdout.write("\r\033[K" + f"{stamp()} " + " | ".join(parts))
+            sys.stdout.flush()
+        time.sleep(interval)
+except KeyboardInterrupt:
+    if tty:
+        sys.stdout.write("\n")
+PY
 }
 
 fmt_tokens() { # 1234567 -> 1.2M
@@ -1531,6 +1650,8 @@ COMMANDS:
   usage [--json]     today's input/output token totals (persisted per day;
                      --json emits an ai-usage provider card for the bar widget)
   logs [args]        stream daemon logs (journalctl -t highllama)
+  watch [secs]       live per-slot state: idle / prefill n/N / generating @ t/s
+                     (polls /slots every secs, default 1; PORT=... for another port)
   deps [backend]     install build requirements (pacman/apt/dnf/zypper/brew)
   build [backend]    clone (if needed) + cmake-build llama.cpp
   update [backend]   git pull llama.cpp + rebuild
@@ -1674,6 +1795,10 @@ usage)
     shift
     cmd_usage "$@"
     exit 0
+    ;;
+watch)
+    shift
+    cmd_watch "$@"
     ;;
 logs)
     if ! command -v journalctl >/dev/null 2>&1; then
