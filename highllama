@@ -563,6 +563,60 @@ usage_fold() { # [port] -> bank the running server's counters into $HL_USAGE
     return 0
 }
 
+# Daily token budget for the usage bars. A local server has no quota, so the
+# budget is a deliberate choice: what the same tokens would have cost on a
+# metered service. OpenCode Go allows $60/month of usage, and at a reference
+# model's per-token price that converts to a token count. Splitting the
+# allowance so input and output run out together at ratio R = in:out tokens:
+#
+#   in = R*X, out = X    (R*X*price_in + X*price_out) / 1e6 = 60
+#
+# The default takes GLM 5.3 Flash ($0.15/M in, $0.50/M out) at R=10, since a
+# local 27B is comparable to a small fast model rather than a frontier one:
+# 10M input and 1M output per day. That also lands near this hardware's
+# ceiling -- 1M output is about 4h of continuous generation at ~68 t/s.
+#
+# Override in $HL_USAGE_CONF or via HL_BUDGET_IN / HL_BUDGET_OUT. A budget of
+# 0 means "no budget": that row reports percent null and renders no bar.
+HL_USAGE_CONF="${HL_USAGE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/usage.conf}"
+BUDGET_IN_DEFAULT=10000000
+BUDGET_OUT_DEFAULT=1000000
+
+usage_budget() { # -> "in<TAB>out" tokens/day
+    local bin bout
+    if [ ! -f "$HL_USAGE_CONF" ]; then
+        mkdir -p "$(dirname "$HL_USAGE_CONF")" 2>/dev/null || true
+        cat >"$HL_USAGE_CONF" <<EOF 2>/dev/null || true
+# Daily token budget for \`highllama usage\` (tokens/day; 0 = no bar).
+#
+# A local server has no quota, so this is what the same tokens would have cost
+# on a metered service. OpenCode Go allows \$60/month of usage; at a reference
+# model's price that converts to a token count. Defaults use GLM 5.3 Flash
+# (\$0.15/M in, \$0.50/M out) at a 10:1 input:output ratio -- a local 27B is
+# comparable to a small fast model, not a frontier one.
+#
+# Same \$60/month at other reference models (10:1), for reference:
+#   DeepSeek V4 Flash  in 11.9M  out 1.19M
+#   GLM 5.3 Flash      in 10.0M  out 1.00M   <- default
+#   Qwen3.5 Plus       in  6.25M out  625k
+#   Kimi K2.7 Code     in  1.48M out  148k
+#   GLM 5.3            in  1.09M out  109k
+BUDGET_IN=$BUDGET_IN_DEFAULT
+BUDGET_OUT=$BUDGET_OUT_DEFAULT
+EOF
+    fi
+    # Parse rather than source: this file is data, not code.
+    bin="$(awk -F= '$1=="BUDGET_IN"{gsub(/[^0-9]/,"",$2); print $2; exit}' "$HL_USAGE_CONF" 2>/dev/null)"
+    bout="$(awk -F= '$1=="BUDGET_OUT"{gsub(/[^0-9]/,"",$2); print $2; exit}' "$HL_USAGE_CONF" 2>/dev/null)"
+    printf '%s\t%s\n' "${HL_BUDGET_IN:-${bin:-$BUDGET_IN_DEFAULT}}" \
+        "${HL_BUDGET_OUT:-${bout:-$BUDGET_OUT_DEFAULT}}"
+}
+
+usage_pct() { # <used> <budget> -> 0-100, or empty when the budget is 0/unset
+    [ "${2:-0}" -gt 0 ] 2>/dev/null || return 0
+    awk -v u="$1" -v b="$2" 'BEGIN{p=u*100/b; if(p>100)p=100; printf "%.0f", p}'
+}
+
 usage_read_day() { # <YYYY-MM-DD> -> "in<TAB>out" (zeros when absent)
     [ -f "$HL_USAGE" ] || {
         printf '0\t0\n'
@@ -575,21 +629,28 @@ cmd_usage() { # [--json]
     local json=0
     [ "${1:-}" = "--json" ] && json=1
     usage_fold "$PORT"
-    local today in out total
+    local today in out total b_in b_out b_total p_in p_out p_total
     today="$(date +%Y-%m-%d)"
     IFS=$'\t' read -r in out <<<"$(usage_read_day "$today")"
     total=$((in + out))
+    IFS=$'\t' read -r b_in b_out <<<"$(usage_budget)"
+    b_total=$((b_in + b_out))
+    p_in="$(usage_pct "$in" "$b_in")"
+    p_out="$(usage_pct "$out" "$b_out")"
+    p_total="$(usage_pct "$total" "$b_total")"
     if [ "$json" = 0 ]; then
         printf 'token usage for %s (%s)\n' "$today" "$HL_USAGE"
-        printf '  input   %s\n' "$(fmt_tokens "$in")"
-        printf '  output  %s\n' "$(fmt_tokens "$out")"
-        printf '  total   %s\n' "$(fmt_tokens "$total")"
+        printf '  input   %8s / %-8s %s\n' "$(fmt_tokens "$in")" "$(fmt_tokens "$b_in")" "${p_in:+($p_in%)}"
+        printf '  output  %8s / %-8s %s\n' "$(fmt_tokens "$out")" "$(fmt_tokens "$b_out")" "${p_out:+($p_out%)}"
+        printf '  total   %8s / %-8s %s\n' "$(fmt_tokens "$total")" "$(fmt_tokens "$b_total")" "${p_total:+($p_total%)}"
+        printf 'budget: %s (edit BUDGET_IN / BUDGET_OUT)\n' "$HL_USAGE_CONF"
         return 0
     fi
     # ai-usage collector contract: {id,name,plan,ok,stale,error,
-    # limits:[{label,percent,resetsAt}]}. percent stays null -- a local server
-    # has no quota, and a number here would be folded into the bar widget's
-    # worstPercent and compete with real subscription limits for its colour.
+    # limits:[{label,percent,resetsAt}]}. percent is the share of the daily
+    # budget above, or null when that budget is 0. NB: the bar widget folds
+    # every percent into worstPercent, so a full local budget colours the bar
+    # exactly like an exhausted paid quota -- set the budgets to 0 to opt out.
     # resetsAt is the next local midnight, which is when these counts roll over.
     # Next LOCAL midnight, expressed in UTC: the day buckets are keyed on
     # `date +%Y-%m-%d`, which is local. Compute the epoch first and format it
@@ -603,10 +664,15 @@ cmd_usage() { # [--json]
         midnight="$(date -u -d "@$mid_epoch" +%FT%TZ 2>/dev/null ||
             date -u -r "$mid_epoch" +%FT%TZ 2>/dev/null || true)"
     fi
+    # "used / budget" while a budget is set, bare count when it is not
+    local l_in l_out l_total
+    l_in="Input $(fmt_tokens "$in")${p_in:+ / $(fmt_tokens "$b_in")}"
+    l_out="Output $(fmt_tokens "$out")${p_out:+ / $(fmt_tokens "$b_out")}"
+    l_total="Total $(fmt_tokens "$total")${p_total:+ / $(fmt_tokens "$b_total")}"
     printf '{"id":"highllama","name":"Highllama","plan":"local","ok":true,"stale":false,"error":null,"limits":['
-    printf '{"label":"Input %s","percent":null,"resetsAt":"%s"},' "$(fmt_tokens "$in")" "$midnight"
-    printf '{"label":"Output %s","percent":null,"resetsAt":"%s"},' "$(fmt_tokens "$out")" "$midnight"
-    printf '{"label":"Total %s","percent":null,"resetsAt":"%s"}' "$(fmt_tokens "$total")" "$midnight"
+    printf '{"label":"%s","percent":%s,"resetsAt":"%s"},' "$l_in" "${p_in:-null}" "$midnight"
+    printf '{"label":"%s","percent":%s,"resetsAt":"%s"},' "$l_out" "${p_out:-null}" "$midnight"
+    printf '{"label":"%s","percent":%s,"resetsAt":"%s"}' "$l_total" "${p_total:-null}" "$midnight"
     printf ']}\n'
 }
 
