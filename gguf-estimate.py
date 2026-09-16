@@ -36,6 +36,16 @@ def main():
         "attention.key_length_swa",
         "attention.value_length_swa",
         "expert_count",
+        # hybrid attention/recurrent models (Qwen3-Next/Qwen3.5, MiniMax-01):
+        # most layers are linear-attention with a CONSTANT-size state, so their
+        # KV does not grow with ctx. Treating them as full attention inflates
+        # the KV estimate ~4x and dumps the whole model to CPU.
+        "attention.recurrent_layers",
+        "full_attention_interval",
+        "ssm.conv_kernel",
+        "ssm.state_size",
+        "ssm.group_count",
+        "ssm.inner_size",
     }
     md = {}
     with open(path, "rb") as f:
@@ -123,14 +133,43 @@ def main():
             return bool(pattern[i])
         return False
 
+    # Hybrid models (Qwen3-Next/Qwen3.5, MiniMax-01): only some layers are real
+    # attention; the rest are linear-attention/SSM layers whose state is a fixed
+    # size per sequence regardless of ctx. llama.cpp picks them from an explicit
+    # recurrent_layers array when present, else from full_attention_interval:
+    # layer i is recurrent unless (i+1) % interval == 0 (src/models/qwen35.cpp).
+    recr_arr = md.get("attention.recurrent_layers")
+    full_int = int(md.get("full_attention_interval", 0) or 0)
+
+    def layer_recr(i):
+        if isinstance(recr_arr, list) and i < len(recr_arr):
+            return bool(recr_arr[i])
+        if full_int > 0:
+            return (i + 1) % full_int != 0
+        return False
+
     kv_elems = 0
+    n_recr = 0
     for i in range(L):
         h = heads[i]
-        if layer_swa(i):
+        if layer_recr(i):
+            n_recr += 1  # constant-size state, accounted below
+        elif layer_swa(i):
             kv_elems += h * (dks + dvs) * min(ctx, win)
         else:
             kv_elems += h * (dk + dv) * ctx
     kv_mib = kv_elems * (kv_bits / 8.0) / (1024 * 1024)
+
+    # Recurrent state is allocated per sequence at f32, and does not scale with
+    # ctx: conv state (n_embd_r) + ssm state (n_embd_s) per llama-hparams.cpp.
+    if n_recr:
+        d_conv = int(md.get("ssm.conv_kernel", 0) or 0)
+        d_inner = int(md.get("ssm.inner_size", 0) or 0)
+        d_state = int(md.get("ssm.state_size", 0) or 0)
+        n_group = int(md.get("ssm.group_count", 0) or 0)
+        n_conv = max(d_conv - 1, 0) * (d_inner + 2 * n_group * d_state)
+        n_ssm = d_state * d_inner
+        kv_mib += n_recr * (n_conv + n_ssm) * 4.0 * parallel / (1024 * 1024)
 
     weights_mib = os.path.getsize(path) / (1024 * 1024)
     overhead = 650 + 130 * parallel + (ctx / 1024.0) * 8.0  # cuda + compute buffers

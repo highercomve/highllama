@@ -1696,6 +1696,19 @@ if [ -z "${HL_CMDDUMP:-}" ]; then
     {
         echo "# resolved launch, written by 'highllama start' — replayed by 'highllama restart'"
         for _v in MODEL CONTEXT NCMOE THREADS KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND PARALLEL; do
+            # Record "auto" knobs as empty so a restart re-decides them against
+            # the free VRAM it actually has, exactly like NCMOE already does.
+            # Baking the resolved KV quant in here froze the q8_0 -> q4_0
+            # stepdown after the first start: restart exported KVTYPE_K=q8_0,
+            # which reads as an explicit --kv and switches auto off for good.
+            case "$_v" in
+            KVTYPE_K | KVTYPE_V)
+                if [ -n "$KV_AUTO" ]; then
+                    printf '%s=%q\n' "$_v" ""
+                    continue
+                fi
+                ;;
+            esac
             printf '%s=%q\n' "$_v" "${!_v}"
         done
         printf 'HL_LAST_EXTRA=('
