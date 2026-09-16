@@ -42,16 +42,16 @@
 #   highllama watch                             # live: is it prefilling / generating?
 #   highllama reload -c 128k --mtp              # stop running server and restart with new flags
 #   highllama restart                           # stop + start with the same settings as last start
-#   highllama start --no-embeddings              # remove the embeddings from the server
-#                                                # model (CLS pooling, /v1/embeddings)
+#   highllama start --no-embeddings              # don't also start the embeddings server (:8091)
 #
 # Everything is overridable by flag OR env var (flag wins):
-#   MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND
+#   MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL EMBED_PORT EMBED_NGL NO_EMBEDDINGS HOST PORT BACKEND
 #
-# MTP + embeddings together: when --mtp/--draft is set AND embeddings are on,
-# highllama serves both via llama.cpp router mode (chat model + a small embedding
-# model as separate child processes behind one endpoint). The embedding model is
-# auto-discovered or set with EMBED_MODEL=; --no-embeddings opts out.
+# Embeddings: `start`/`restart` also launch a SEPARATE llama-server for a small
+# embedding model (auto-discovered, or EMBED_MODEL=) on EMBED_PORT (default 8091),
+# CPU-only by default (EMBED_NGL=0), GGUF-native pooling. The chat server on PORT
+# does not serve /v1/embeddings (a CLS-pooled chat model returns useless vectors).
+# `stop` stops both; --no-embeddings / NO_EMBEDDINGS=1 opts out.
 #
 set -euo pipefail
 
@@ -89,11 +89,10 @@ PORT="${PORT:-8089}"      # 8080 is a very common conflict; auto-advances if bus
 BACKEND="${BACKEND:-}"    # empty = autodetect (see detect_backend)
 DAEMON=""                 # --daemon: detach to background, logs -> journal
 EXTRA=()                  # any extra args after `--` are passed straight to llama-server
-ALLMODELS=1
-ALLMODELS_EXTRA=()
-MODELS_DIR="${MODELS_DIR:-$HOME/.lmstudio/models}" # router-mode model root (one-level subdirs)
-MODELS_MAX="${MODELS_MAX:-2}"                      # router-mode: max models loaded c
-EMBED_MODEL="${EMBED_MODEL:-}"                     # embedding model (path/substring) for MTP+embeddings router; auto-discovered if empty
+NO_EMBEDDINGS="${NO_EMBEDDINGS:-}"                 # 1 = don't start the embeddings server (--no-embeddings)
+EMBED_MODEL="${EMBED_MODEL:-}"                     # embedding model (path/substring); auto-discovered if empty
+EMBED_PORT="${EMBED_PORT:-8091}"                   # embeddings server port (fails if busy with something else)
+EMBED_NGL="${EMBED_NGL:-0}"                        # embeddings GPU layers: 0 = CPU only, no VRAM
 HL_STATE="${HL_STATE:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/speed.tsv}" # measured-speed state (probe baselines + tuned configs)
 HL_USAGE="${HL_USAGE:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/usage.tsv}"  # per-day token totals (see `highllama usage`)
 PROBE="${PROBE:-1}"       # startup decode-speed probe: 1 = on (--no-probe / PROBE=0 to skip)
@@ -289,7 +288,7 @@ resolve_mmproj_for() {
     return 0
 }
 
-# resolve an embedding model for router mode: $EMBED_MODEL (exact path or local
+# resolve the embedding model for the embeddings server: $EMBED_MODEL (exact path or local
 # substring match) if set, else auto-discover the smallest local embedding GGUF
 # (embeddinggemma / bge / nomic / gte / e5 / minilm / arctic-embed). Empty if none.
 resolve_embed_model() {
@@ -367,13 +366,17 @@ to_tokens() {
     esac
 }
 
+embed_state_dir() { printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/highllama"; }
+
 # is a server already running? prints its cmdline if so.
 # Detect by exact process NAME so it matches whatever `stop` (pkill -x) kills,
 # regardless of how/where the server was launched (avoids stacking a 2nd server
 # on top of one already holding VRAM). Also catches an MLX server.
 server_running() {
-    local pid
-    pid="$(pgrep -x llama-server 2>/dev/null | head -1 || true)"
+    local pid embed_pid
+    # the separate embeddings server (cmd_embeddings) is not "the server"
+    embed_pid="$(cat "$(embed_state_dir)/embeddings.pid" 2>/dev/null || true)"
+    pid="$(pgrep -x llama-server 2>/dev/null | command grep -vxF "${embed_pid:-none}" | head -1 || true)"
     [ -n "$pid" ] || pid="$(pgrep -f 'mlx_lm.server|mlx_lm server' 2>/dev/null | head -1 || true)"
     [ -n "$pid" ] || return 0
     ps -o args= -p "$pid" 2>/dev/null || true
@@ -617,8 +620,7 @@ usage_model() { # -> alias of the loaded chat model, or empty when none is up
     local ids
     command -v curl >/dev/null 2>&1 || return 0
     ids="$(curl -sf --max-time 3 "http://127.0.0.1:${PORT}/v1/models" 2>/dev/null)" || return 0
-    # In router mode this lists the embeddings model too; the chat model is
-    # first. Keep it dependency-free -- jq is not required elsewhere here.
+    # Keep it dependency-free -- jq is not required elsewhere here.
     # grep -o, not sed: the payload is one line and a greedy .* would return
     # the LAST id rather than the first.
     printf '%s' "$ids" | command grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]*"' |
@@ -1126,7 +1128,7 @@ cmd_tune() {
         "$SCRIPT_PATH" stop >/dev/null 2>&1 || true
         log="$(mktemp "${TMPDIR:-/tmp}/highllama-tune.XXXXXX")"
         (
-            export PROBE=0
+            export PROBE=0 HL_NO_RECORD=1
             [ -n "${envs[$li]}" ] && export NCMOE="${envs[$li]}"
             # shellcheck disable=SC2086
             exec "$SCRIPT_PATH" start ${fwd[@]+"${fwd[@]}"} --no-embeddings ${extras[$li]:+${extras[$li]}}
@@ -1528,26 +1530,60 @@ cmd_pull() {
 }
 
 # ---- embeddings ---------------------------------------------------------------
+# A separate llama-server for a small embedding model (default :8091, CPU). The chat
+# server never serves /v1/embeddings: CLS-pooling a causal chat model returns
+# near-identical vectors for unrelated texts.
+
+# probe <host> <port>: prints "<model> dim=<n>" and returns 0 = a real embedding
+# model answered, 2 = a chat/non-embedding model answered (WRONG), 1 = down/no embeddings
+embed_probe() {
+    local host="$1" port="$2"
+    [ "$host" = "0.0.0.0" ] && host=127.0.0.1
+    HL_BASE="http://${host}:${port}" python3 - <<'PY'
+import json, os, re, sys, urllib.request
+base = os.environ["HL_BASE"]
+EMB = re.compile(r"embed|bge|nomic|gte-|e5-|minilm|arctic-embed", re.I)
+try:
+    req = urllib.request.Request(base + "/v1/embeddings",
+                                 json.dumps({"input": "highllama embeddings probe"}).encode(),
+                                 {"Content-Type": "application/json"})
+    r = json.load(urllib.request.urlopen(req, timeout=10))
+    dim = len(r["data"][0]["embedding"])
+except Exception as e:
+    print(f"no embeddings ({e.__class__.__name__})"); sys.exit(1)
+name = os.path.basename(str(r.get("model") or "?"))
+try:  # the alias the server reports is what clients must send / expect
+    ids = [m.get("id", "") for m in json.load(urllib.request.urlopen(base + "/v1/models", timeout=3)).get("data", [])]
+    name = os.path.basename(ids[0]) if ids else name
+except Exception:
+    pass
+print(f"model={name.removesuffix('.gguf')} dim={dim}")
+sys.exit(0 if EMB.search(name) else 2)
+PY
+}
+
 cmd_embeddings() {
     local action="${1:-start}"
     shift || true
-    local port="${EMBED_PORT:-${PORT:-8089}}"
+    local port="$EMBED_PORT"
     local host="${HOST:-127.0.0.1}"
-    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/highllama"
+    local state_dir
+    state_dir="$(embed_state_dir)"
     mkdir -p "$state_dir"
     local pidfile="$state_dir/embeddings.pid"
     local logfile="$state_dir/embeddings.log"
+    local report rc
 
     case "$action" in
     status)
-        if curl -s --max-time 2 -X POST "http://${host}:${port}/v1/embeddings" \
-            -H "Content-Type: application/json" -d '{"input":"test"}' 2>/dev/null | command grep -q '"data"'; then
-            echo ">> embeddings UP on http://${host}:${port}/v1"
-            return 0
-        else
-            echo ">> embeddings DOWN on http://${host}:${port}/v1"
-            return 1
-        fi
+        rc=0
+        report="$(embed_probe "$host" "$port")" || rc=$?
+        case "$rc" in
+        0) echo ">> embeddings UP on http://${host}:${port}/v1 — $report" ;;
+        2) echo "!! embeddings WRONG on http://${host}:${port}/v1 — $report is not an embedding model" >&2 ;;
+        *) echo ">> embeddings DOWN on http://${host}:${port}/v1 — $report" ;;
+        esac
+        return "$rc"
         ;;
     stop)
         if [ -f "$pidfile" ]; then
@@ -1555,19 +1591,31 @@ cmd_embeddings() {
             pid="$(cat "$pidfile" 2>/dev/null || true)"
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
                 kill "$pid" 2>/dev/null || true
+                for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+                kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
                 echo ">> embeddings server stopped (pid $pid)."
             fi
             rm -f "$pidfile"
         else
-            echo ">> no separate embeddings pid found."
+            echo ">> no embeddings server running."
         fi
         return 0
         ;;
     start)
-        if curl -s --max-time 2 -X POST "http://${host}:${port}/v1/embeddings" \
-            -H "Content-Type: application/json" -d '{"input":"test"}' 2>/dev/null | command grep -q '"data"'; then
-            echo ">> embeddings server already running on http://${host}:${port}/v1"
-            return 0
+        if port_busy "$port"; then
+            rc=0
+            report="$(embed_probe "$host" "$port")" || rc=$?
+            if [ "$rc" = 0 ]; then
+                echo ">> embeddings server already running on http://${host}:${port}/v1 — $report"
+                return 0
+            fi
+            local owner=""
+            command -v ss >/dev/null 2>&1 &&
+                owner="$(ss -ltnpH "sport = :$port" 2>/dev/null | command grep -oE 'users:\(\("[^"]+",pid=[0-9]+' | head -1 | sed -E 's/users:\(\("([^"]+)",pid=([0-9]+)/\1 pid \2/')"
+            [ -n "$owner" ] && [ -r "/proc/${owner##* }/cmdline" ] &&
+                owner="$owner: $(tr '\0' ' ' <"/proc/${owner##* }/cmdline" | cut -c1-120)"
+            echo "!! embeddings: port $port is busy with something else (${owner:-$report}) — free it or set EMBED_PORT=" >&2
+            return 1
         fi
 
         local model
@@ -1578,20 +1626,11 @@ cmd_embeddings() {
         fi
 
         local llama_bin="${LLAMA_BIN:-$LLAMA_DIR/build/bin/llama-server}"
+        case "$llama_bin" in /*) ;; *) llama_bin="$LLAMA_DIR/${llama_bin#./}" ;; esac
         if [ ! -x "$llama_bin" ]; then
             echo "!! $llama_bin not found. Build llama.cpp first: $0 build" >&2
             return 1
         fi
-
-        local orig_port="$port"
-        while port_busy "$port"; do
-            port=$((port + 1))
-            if [ "$port" -gt $((orig_port + 10)) ]; then
-                echo "!! no free port found for embeddings near $orig_port" >&2
-                return 1
-            fi
-        done
-        [ "$port" != "$orig_port" ] && echo ">> port $orig_port busy -> using $port for embeddings"
 
         local llama_libdir
         llama_libdir="$(cd "$(dirname "$llama_bin")" && pwd)"
@@ -1599,19 +1638,34 @@ cmd_embeddings() {
             export LD_LIBRARY_PATH="${llama_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         fi
 
-        echo ">> starting highllama embeddings: $(basename "$model") on http://${host}:${port}/v1"
-        setsid nohup "$llama_bin" -m "$model" --embeddings --host "$host" --port "$port" \
-            >"$logfile" 2>&1 </dev/null &
-        echo $! > "$pidfile"
-        echo "http://${host}:${port}" > "$state_dir/embeddings.url"
+        local ctx="${EMBED_CTX:-2048}"
+        # alias = GGUF file stem (e.g. embeddinggemma-300M-Q8_0): the name /v1/models and
+        # responses report, instead of the full path
+        local alias
+        alias="$(basename "$model")"
+        alias="${alias%.gguf}"
+        local args=(-m "$model" --alias "$alias" --embeddings -c "$ctx" -b "$ctx" -ub "$ctx" --host "$host" --port "$port")
+        # CPU by default: a ~300M embedder is fast on CPU and must not take VRAM from the
+        # chat model. -dev none also skips the GPU context (~170 MiB) a CUDA build makes.
+        if [ "$EMBED_NGL" = 0 ]; then args+=(-ngl 0 -dev none); else args+=(-ngl "$EMBED_NGL"); fi
+        # GGUF-native pooling unless overridden: forcing cls on a mean-trained model
+        # (e.g. embeddinggemma) yields near-degenerate vectors.
+        [ -n "${EMBED_POOLING:-}" ] && args+=(--pooling "$EMBED_POOLING")
 
-        for _ in $(seq 1 30); do
-            if curl -s --max-time 2 -X POST "http://${host}:${port}/v1/embeddings" \
-                -H "Content-Type: application/json" -d '{"input":"test"}' 2>/dev/null | command grep -q '"data"'; then
-                echo ">> embeddings server ready on http://${host}:${port}/v1 (pid $(cat "$pidfile"))"
+        echo ">> starting highllama embeddings: $(basename "$model") on http://${host}:${port}/v1 ($([ "$EMBED_NGL" = 0 ] && echo CPU || echo "ngl=$EMBED_NGL"))"
+        setsid nohup "$llama_bin" "${args[@]}" >"$logfile" 2>&1 </dev/null &
+        echo $! >"$pidfile"
+        echo "http://${host}:${port}" >"$state_dir/embeddings.url"
+
+        for _ in $(seq 1 120); do
+            rc=0
+            report="$(embed_probe "$host" "$port" 2>/dev/null)" || rc=$?
+            if [ "$rc" = 0 ]; then
+                echo ">> embeddings server ready on http://${host}:${port}/v1 — $report (pid $(cat "$pidfile"))"
                 return 0
             fi
-            sleep 0.3
+            kill -0 "$(cat "$pidfile")" 2>/dev/null || break
+            sleep 0.5
         done
 
         echo "!! embeddings server failed to become ready; see $logfile" >&2
@@ -1638,7 +1692,7 @@ COMMANDS:
   pull [term|repo]   browse/search Hugging Face and download a GGUF
   ls                 list local models (numbered picker view)
   list               list local models with sizes + full paths
-  embeddings [cmd]   start/stop/status dedicated embeddings server (for context compression)
+  embeddings [cmd]   start/stop/status the embeddings server (EMBED_PORT, default :8091)
   status             show whether a server is running
   stop               stop the running server (and systemd user unit)
   reload [options]   stop the server and restart with new options
@@ -1680,12 +1734,12 @@ START OPTIONS:
       --port <n>           port (default 8089; auto-advances if busy)
       --backend <b>        cuda|rocm|vulkan|metal|mlx|cpu (default: autodetect)
   -d, --daemon             run in background, logs -> journal
-      --no-embeddings      don't also serve the embeddings model
+      --no-embeddings      don't also start the embeddings server (:8091)
       --no-probe           skip the startup decode-speed probe / regression check
       -- <args>            pass remaining args straight to llama-server
 
 Every option is also settable via env var (flag wins):
-  MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND PROBE PROBE_REGRESS_PCT HL_STATE HL_PRESETS
+  MODEL CONTEXT NCMOE THREADS KVTYPE KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL EMBED_PORT EMBED_NGL NO_EMBEDDINGS HOST PORT BACKEND PROBE PROBE_REGRESS_PCT HL_STATE HL_PRESETS
 
 PRESETS:
   Per-model-family defaults (NCMOE, KVTYPE, MTP, EXTRA) fill whatever flags, env
@@ -1780,6 +1834,7 @@ stop)
     else
         echo ">> no server running."
     fi
+    cmd_embeddings stop | command grep -v "no embeddings server running" || true
     exit 0
     ;;
 status)
@@ -1789,6 +1844,7 @@ status)
     else
         echo ">> no server running."
     fi
+    cmd_embeddings status || true
     exit 0
     ;;
 usage)
@@ -1943,7 +1999,7 @@ while [ $# -gt 0 ]; do
         shift
         ;;
     --no-embeddings)
-        ALLMODELS=""
+        NO_EMBEDDINGS=1
         shift
         ;;
     --no-probe)
@@ -2058,13 +2114,15 @@ fi
 # ---- record the resolved launch for `highllama restart` --------------------
 # Written after the picker so MODEL is final. The daemon child re-enters start
 # with HL_CMDDUMP set and identical env — skip there, the parent already saved.
-if [ -z "${HL_CMDDUMP:-}" ]; then
+# `tune` sets HL_NO_RECORD=1: its throwaway candidate launches (--no-embeddings,
+# trial offloads) must not replace the user's real launch.
+if [ -z "${HL_CMDDUMP:-}" ] && [ -z "${HL_NO_RECORD:-}" ]; then
     HL_LAST="${HL_LAST:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/last-start.env}"
     mkdir -p "$(dirname "$HL_LAST")"
     _last_tmp="$(mktemp "$(dirname "$HL_LAST")/.last-start.XXXXXX")"
     {
         echo "# resolved launch, written by 'highllama start' — replayed by 'highllama restart'"
-        for _v in MODEL CONTEXT NCMOE THREADS KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL HOST PORT BACKEND PARALLEL; do
+        for _v in MODEL CONTEXT NCMOE THREADS KVTYPE_K KVTYPE_V FA DRY DRAFT MTP MTP_NMAX TEMPLATE EMBED_MODEL EMBED_PORT NO_EMBEDDINGS HOST PORT BACKEND PARALLEL; do
             # Record "auto" knobs as empty so a restart re-decides them against
             # the free VRAM it actually has, exactly like NCMOE already does.
             # Baking the resolved KV quant in here froze the q8_0 -> q4_0
@@ -2110,6 +2168,7 @@ if [ -n "$DAEMON" ]; then
         DRAFT="$DRAFT" MTP="$MTP" MTP_NMAX="$MTP_NMAX" \
         TEMPLATE="$TEMPLATE" IGNORE_TEMPLATE="${IGNORE_TEMPLATE:-}" \
         EMBED_MODEL="$EMBED_MODEL" EMBED_POOLING="${EMBED_POOLING:-}" EMBED_CTX="${EMBED_CTX:-}" \
+        EMBED_PORT="$EMBED_PORT" EMBED_NGL="$EMBED_NGL" NO_EMBEDDINGS="$NO_EMBEDDINGS" \
         HOST="$HOST" PORT="$PORT" \
         BACKEND="$BACKEND" PARALLEL="$PARALLEL" HL_CMDDUMP="$CMDDUMP" \
         PROBE="$PROBE" PROBE_REGRESS_PCT="$PROBE_REGRESS_PCT" HL_STATE="$HL_STATE" \
@@ -2128,6 +2187,8 @@ if [ -n "$DAEMON" ]; then
             if [ -s "$CMDDUMP" ]; then echo ">> llama-server:"; sed 's/^/   /' "$CMDDUMP"; fi
             rm -f "$CMDDUMP"
             echo ">> ready: http://${HOST}:${PORT}/v1"
+            # the child started (or failed to start) the embeddings server first — say which
+            [ "$NO_EMBEDDINGS" != 1 ] && { cmd_embeddings status 2>&1 || true; }
             # relay the child's decode probe (it needs a few seconds to generate).
             # wait for the probe verdict itself — degradation banners land in the
             # dump earlier, while the model is still loading.
@@ -2342,7 +2403,7 @@ fi
 
 SPEC_ARGS=()
 MTP="" # resolved flag: "" = off, 1 = on (set only when a usable head is found)
-MTP_DRAFT="" # resolved local mtp- head path (also reused by router mode)
+MTP_DRAFT="" # resolved local mtp- head path
 if [ "$MTP_MODE" != off ]; then
     # Find an MTP head: a separate 'mtp-*.gguf' sibling (gemma-4 style) or one
     # embedded in the main GGUF (unsloth Qwen3.6, `nextn` metadata). We can only
@@ -2626,31 +2687,21 @@ echo ">> context=$CONTEXT  threads=$THREADS  kv=$KV_DESC  fa=$([ "$FA_ON" = 1 ] 
 echo ">> serving http://${HOST}:${PORT}/v1  (Ctrl-C to stop)"
 cd "$LLAMA_DIR"
 
-# Speculative decoding (MTP/draft) and embeddings need SEPARATE model contexts —
-# one causal+draft, one pooled — and cannot share a single in-process model
-# (GGML_ASSERT "missing result_norm/result_embd tensor"). When both are wanted,
-# switch to llama.cpp router mode: each model runs as its own child process with
-# its own params (MTP only on the chat model, embeddings only on the embedding
-# model), all behind one endpoint. Requires a local-file chat model and an
-# embedding model; otherwise fall back to MTP-only with embeddings off.
-USE_ROUTER=""
-EMBED_HIT=""
-if [ -n "$ALLMODELS" ] && { [ -n "$MTP" ] || [ -n "$DRAFT" ]; }; then
-    if [ "${MODEL_ARGS[0]}" = "-m" ] && { [ -z "$DRAFT" ] || [ -f "$DRAFT" ]; }; then
-        EMBED_HIT="$(resolve_embed_model)"
-    fi
-    if [ -n "$EMBED_HIT" ]; then
-        USE_ROUTER=1
-        ALLMODELS="" # the router serves embeddings itself; skip single-process embeddings flags
-        echo ">> embeddings + speculative: router mode (chat=$ALIAS, embeddings=$(basename "$EMBED_HIT"))"
+# Embeddings run as a separate server on EMBED_PORT (see cmd_embeddings), started
+# before the chat model so its (CPU) load never races the chat model for memory.
+# Not fatal: the chat server comes up either way.
+EMBED_STARTED="" # pid of the embeddings server THIS launch started (stopped with it)
+if [ "$NO_EMBEDDINGS" != 1 ]; then
+    _embed_pidfile="$(embed_state_dir)/embeddings.pid"
+    _embed_before="$(cat "$_embed_pidfile" 2>/dev/null || true)"
+    if [ "$EMBED_PORT" = "$PORT" ]; then
+        echo "!! embeddings: EMBED_PORT ($EMBED_PORT) equals the chat port — skipping embeddings" >&2
+    elif cmd_embeddings start; then
+        _embed_after="$(cat "$_embed_pidfile" 2>/dev/null || true)"
+        [ "$_embed_after" != "$_embed_before" ] && EMBED_STARTED="$_embed_after"
     else
-        echo ">> note: no embedding model found (set EMBED_MODEL=) — disabling embeddings while speculative decoding is active"
-        ALLMODELS=""
+        echo ">> continuing without embeddings (chat server only)"
     fi
-fi
-
-if [ -n "$ALLMODELS" ]; then
-    ALLMODELS_EXTRA=(--models-dir "$MODELS_DIR" --models-max "$MODELS_MAX" --pooling cls --embeddings)
 fi
 
 LLAMA_BIN="${LLAMA_BIN:-./build/bin/llama-server}"
@@ -2670,130 +2721,6 @@ fi
 # device OOM signatures across backends (CUDA / HIP / Vulkan / Metal)
 OOM_RE='out of memory|failed to allocate|failed to create context|cudaMalloc failed|hipMalloc failed|hipErrorOutOfMemory|VK_ERROR_OUT_OF_DEVICE_MEMORY|ErrorOutOfDeviceMemory|Insufficient Memory|kIOGPUCommandBufferCallbackErrorOutOfMemory'
 
-# ---- router mode: one endpoint, a child process per model -------------------
-# Generate a preset INI (chat model with MTP/draft + a small embedding model),
-# launch llama.cpp's router so each model loads as its own child with its own
-# params, then serve until stopped. No expert-offload auto-retry here: each child
-# manages its own VRAM, and n-cpu-moe was already sized for the chat model.
-if [ -n "$USE_ROUTER" ]; then
-    EMBED_ALIAS="$(basename "$EMBED_HIT")"
-    EMBED_ALIAS="${EMBED_ALIAS%.gguf}"
-    TPL_FILE=""
-    [ "${#TEMPLATE_ARGS[@]}" -ge 2 ] && TPL_FILE="${TEMPLATE_ARGS[1]}"
-    INI="$(mktemp "${TMPDIR:-/tmp}/highllama-presets.XXXXXX.ini")"
-    {
-        printf '[%s]\n' "$ALIAS"
-        printf 'model = %s\n' "${MODEL_ARGS[1]}"
-        # Honor the estimator's offload decision (mirrors the non-router path):
-        # dense models offload via -ngl (n-cpu-moe is a no-op there), MoE models
-        # keep all layers on GPU and push experts to CPU via n-cpu-moe. Hardcoding
-        # n-gpu-layers=99 for a dense model ignores the estimate and OOMs.
-        if [ "$MODE" = "dense" ]; then
-            printf 'n-gpu-layers = %s\n' "$NCMOE"
-        else
-            printf 'n-gpu-layers = 99\n'
-            printf 'n-cpu-moe = %s\n' "$NCMOE"
-        fi
-        printf 'threads = %s\n' "$THREADS"
-        printf 'flash-attn = %s\n' "$([ "$FA_ON" = 1 ] && echo on || echo off)"
-        printf 'cache-type-k = %s\n' "$KVTYPE_K"
-        printf 'cache-type-v = %s\n' "$KVTYPE_V"
-        printf 'ctx-size = %s\n' "$CONTEXT"
-        printf 'parallel = %s\n' "$PARALLEL"
-        if [ "${#SAMPLER_ARGS[@]}" -gt 0 ]; then
-            printf 'dry-multiplier = %s\n' "$DRY"
-            printf 'dry-base = 1.75\n'
-            printf 'dry-allowed-length = 2\n'
-        fi
-        if [ "$BACKEND" != "metal" ]; then
-            if llama_has_load_mode; then printf 'load-mode = none\n'
-            else printf 'no-mmap = true\n'; fi
-        fi
-        printf 'jinja = true\n'
-        [ -n "$TPL_FILE" ] && printf 'chat-template-file = %s\n' "$TPL_FILE"
-        [ -n "$MMPROJ_HIT" ] && printf 'mmproj = %s\n' "$MMPROJ_HIT"
-        if [ -n "$MTP" ]; then
-            printf 'spec-type = draft-mtp\n'
-            # empty when the MTP head is embedded in the main GGUF (no separate -md)
-            [ -n "$MTP_DRAFT" ] && printf 'model-draft = %s\n' "$MTP_DRAFT"
-            printf 'spec-draft-n-max = %s\n' "$MTP_NMAX"
-            printf 'n-gpu-layers-draft = 99\n'
-        elif [ -n "$DRAFT" ]; then
-            printf 'model-draft = %s\n' "$DRAFT"
-            printf 'spec-draft-n-max = 16\n'
-            printf 'n-gpu-layers-draft = 99\n'
-        fi
-        printf 'load-on-startup = true\n'
-        printf '\n[%s]\n' "$EMBED_ALIAS"
-        printf 'model = %s\n' "$EMBED_HIT"
-        printf 'embeddings = true\n'
-        # Use the model's GGUF-native pooling by default — forcing cls on a
-        # mean-trained model (e.g. embeddinggemma) yields near-degenerate vectors
-        # that don't discriminate. Override only via EMBED_POOLING=.
-        [ -n "${EMBED_POOLING:-}" ] && printf 'pooling = %s\n' "$EMBED_POOLING"
-        printf 'ctx-size = %s\n' "${EMBED_CTX:-2048}"
-        printf 'load-on-startup = true\n'
-    } >"$INI"
-    echo ">> router preset ($INI):"
-    sed 's/^/     /' "$INI"
-    echo ">> launching router (models-max=$MODELS_MAX) on http://${HOST}:${PORT}/v1 ..."
-    RLOG="$(mktemp "${TMPDIR:-/tmp}/highllama-router.XXXXXX")"
-    RSRV=""
-    RTAIL=""
-    ROUTER_READY=""   # set below; declared here for the EXIT trap under `set -u`
-    cleanup_router() {
-        local _rc=$?
-        [ -n "$RTAIL" ] && kill "$RTAIL" 2>/dev/null
-        [ -n "$RSRV" ] && kill "$RSRV" 2>/dev/null
-        # on a failed start the live `tail -f` often loses the race and the log
-        # is deleted unread — keep it, and say where, so the error is findable
-        if [ "$_rc" -ne 0 ] && [ -z "$ROUTER_READY" ] && [ -s "$RLOG" ]; then
-            local _keep="${HL_STATE:-$HOME/.config/highllama}/router-fail.log"
-            mkdir -p "$(dirname "$_keep")" 2>/dev/null
-            { echo "# router preset:"; sed 's/^/#   /' "$INI"; echo; cat "$RLOG"; } >"$_keep" 2>/dev/null \
-                && echo "!! router log saved to $_keep" >&2
-            echo "---- last 15 lines of the router log ----" >&2
-            tail -n 15 "$RLOG" >&2
-        fi
-        rm -f "$RLOG" "$INI"
-    }
-    trap cleanup_router EXIT
-    trap 'exit 130' INT TERM
-    RCMD=(
-        "$LLAMA_BIN" --models-preset "$INI" --models-max "$MODELS_MAX"
-        --host "$HOST" --port "$PORT" --metrics ${EXTRA[@]+"${EXTRA[@]}"}
-    )
-    printf '>> llama-server (router):'; printf ' %q' "${RCMD[@]}"; printf '\n'
-    echo ">> preset INI ($INI):"; sed 's/^/   /' "$INI"
-    [ -n "${HL_CMDDUMP:-}" ] && { printf '%q ' "${RCMD[@]}"; printf '\n\n'; sed 's/^/# /' "$INI"; } >"$HL_CMDDUMP"
-    "${RCMD[@]}" >"$RLOG" 2>&1 &
-    RSRV=$!
-    tail -f -n +1 "$RLOG" & # stream router + child logs live
-    RTAIL=$!
-    # ready when both children report in, or bail on OOM / a bad preset key
-    ROUTER_READY=""
-    while kill -0 "$RSRV" 2>/dev/null; do
-        # grep -c exits 1 on zero matches but still prints "0": `|| true` keeps
-        # `set -e` from killing us without the "0\n0" a `|| echo 0` would yield
-        # b10088+ replaced the bare `:ready` line with `:state:{"state":"ready",...}`
-        _ready_re='cmd_child_to_router:(ready|state:.*"state"[[:space:]]*:[[:space:]]*"ready")'
-        _ready_n="$(command grep -cE "$_ready_re" "$RLOG" 2>/dev/null || true)"
-        if [ "${_ready_n:-0}" -ge 2 ]; then
-            echo ">> router ready: chat + embeddings models loaded"
-            ROUTER_READY=1
-            break
-        fi
-        if command grep -qiE "$OOM_RE|not recognized in preset|GGML_ASSERT" "$RLOG"; then
-            echo "!! router failed to start (see log above)" >&2
-            exit 1
-        fi
-        sleep 0.5
-    done
-    [ -n "$ROUTER_READY" ] && run_probe_and_guard "$PORT" "$ALIAS"
-    wait "$RSRV"
-    exit $?
-fi
-
 # ---- launch with OOM auto-retry: bump expert-offload until it fits ----------
 LOG="$(mktemp "${TMPDIR:-/tmp}/highllama.XXXXXX")"
 SRV=""
@@ -2802,6 +2729,14 @@ cleanup() {
     [ -n "$TAILER" ] && kill "$TAILER" 2>/dev/null
     [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
     rm -f "$LOG"
+    # embeddings live and die with the chat server this process started — but only
+    # if the pidfile still names OUR embeddings server: on `restart` the new launch
+    # may already have started a fresh one by the time this old process exits.
+    if [ -n "$EMBED_STARTED" ] &&
+        [ "$(cat "$(embed_state_dir)/embeddings.pid" 2>/dev/null)" = "$EMBED_STARTED" ]; then
+        cmd_embeddings stop >/dev/null 2>&1
+    fi
+    return 0
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -2834,7 +2769,6 @@ while :; do
         ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
         ${MMPROJ_ARGS[@]+"${MMPROJ_ARGS[@]}"}
         --host "$HOST" --port "$PORT"
-        ${ALLMODELS_EXTRA[@]+"${ALLMODELS_EXTRA[@]}"}
         ${EXTRA[@]+"${EXTRA[@]}"}
     )
     printf '>> llama-server:'; printf ' %q' "${CMD[@]}"; printf '\n'

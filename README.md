@@ -59,7 +59,7 @@ highllama -m unsloth/gemma-4-12B-it-GGUF:Q4_K_XL -c 160k    # head_dim=512: symm
 highllama -m <model> --kv q4_0 --dry 0                      # leaner symmetric KV; disable the DRY sampler
 highllama -m <model> --chat-template ./fixed.jinja          # override a broken GGUF template
 highllama --backend mlx -m mlx-community/Qwen3-8B-4bit      # MLX on macOS
-highllama embeddings start | status | stop   # run background embeddings server (auto-picks local embedding model)
+highllama embeddings start | status | stop   # embeddings server on :8091 (auto-started by start); status shows model + dim
 highllama ls                                 # list local models (picker view)
 highllama list | stop | status | logs        # full paths | kill | status | view logs
 highllama update                             # git pull llama.cpp + rebuild for the backend
@@ -130,14 +130,22 @@ highllama update                             # git pull llama.cpp + rebuild for 
   (MTP on/off when the model fully fits; nearby offload values when it
   doesn't) and persists the winner — future `start`s apply it automatically,
   with explicit flags still winning.
-- **MTP + embeddings at once:** speculative decoding (causal) and embeddings
-  (pooled) can't share one model context, so when `--mtp`/`--draft` is active and
-  embeddings are on, highllama switches to llama.cpp **router mode** — the chat
-  model (with MTP) and a small embedding model run as separate child processes
-  behind one endpoint (`/v1/chat/completions` → chat, `/v1/embeddings` → embed).
-  The embedding model is auto-discovered (embeddinggemma / bge / nomic / e5 / …)
-  or set explicitly with `EMBED_MODEL=`; `--no-embeddings` opts out. Needs a
-  local-file chat model.
+- **Embeddings on their own server (:8091):** `start`/`restart` (incl. `--daemon`)
+  also launch a separate `llama-server` for a small embedding model on
+  `EMBED_PORT` (default **8091**, same host as chat), and `stop` stops it too.
+  The model is auto-discovered (embeddinggemma / bge / nomic / e5 / …) or set with
+  `EMBED_MODEL=`; its alias is the GGUF file stem (e.g. `embeddinggemma-300M-Q8_0`),
+  it uses the GGUF-native pooling (`EMBED_POOLING=` to override), `EMBED_CTX=`
+  (default 2048), and runs **CPU-only** by default (`EMBED_NGL=0`, no VRAM taken
+  from the chat model; `EMBED_NGL=99` for GPU). The chat server on :8089 does
+  **not** serve `/v1/embeddings` anymore — CLS-pooling a chat model returned
+  near-identical vectors for unrelated texts. The chat server stays a plain
+  single-process `llama-server`, so clients may send any or no `model` name.
+  If the embeddings port is taken by another program, start says which one and
+  continues with chat only. `--no-embeddings` (or `NO_EMBEDDINGS=1`, remembered
+  by `restart`) opts out. `highllama embeddings status` reports the model and
+  dimension (e.g. `model=embeddinggemma-300M-Q8_0 dim=768`) and exits 2 with a
+  warning if a non-embedding model answers.
 - **Chat template fixes:** some GGUFs ship a Jinja template llama.cpp can't
   render — Gemma 4's tool-use template upper-cases a union parameter type with
   `map('upper')`, so a request carrying such a tool 500s with `NotImplemented:
