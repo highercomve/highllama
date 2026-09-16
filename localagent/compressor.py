@@ -24,8 +24,10 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-# Configuration via environment
-COMPRESS_ENABLED = os.environ.get("LOCALAGENT_COMPRESS", "1") != "0"
+# Configuration via environment.
+# Compression is opt-in while it is still in testing: it needs the embeddings
+# server running, and the shell wrappers only start that when it is switched on.
+COMPRESS_ENABLED = os.environ.get("LOCALAGENT_COMPRESS", "0") != "0"
 PRESERVE_RECENT_TURNS = int(os.environ.get("LOCALAGENT_COMPRESS_PRESERVE_TURNS", "2"))
 MAX_LINES = int(os.environ.get("LOCALAGENT_COMPRESS_MAX_LINES", "50"))
 MAX_CHARS = int(os.environ.get("LOCALAGENT_COMPRESS_MAX_CHARS", "1500"))
@@ -47,7 +49,7 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 def is_compression_enabled() -> bool:
-    return os.environ.get("LOCALAGENT_COMPRESS", "1") != "0"
+    return os.environ.get("LOCALAGENT_COMPRESS", "0") != "0"
 
 
 def _get_db(db_path: str = COMPRESSION_DB) -> sqlite3.Connection:

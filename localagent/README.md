@@ -234,7 +234,7 @@ All of the environment variables below can optionally be loaded from a `.env` fi
 | `OPENCODE_API_KEY` | empty | API key / subscription token for OpenCode Go frontier models |
 | `OPENCODE_PASSTHROUGH_BASE` | `https://opencode.ai/zen/go` | upstream base endpoint URL for OpenCode Go models |
 | `CLOUDCODE_UPSTREAM` | `https://daily-cloudcode-pa.googleapis.com` | Google Cloud Code Assist backend for `/v1internal:*` (agy / gemini-cli); point the CLI here with `CLOUD_CODE_URL=http://127.0.0.1:8090` to get the same context compression |
-| `LOCALAGENT_COMPRESS` | `1` | `1` enables native context compression & semantic chunk pruning before cloud APIs |
+| `LOCALAGENT_COMPRESS` | `0` | `1` enables native context compression & semantic chunk pruning before cloud APIs. **In testing — off by default**; needs the embeddings server, which the wrappers only start when this is `1` |
 | `LOCALAGENT_EMBED_BASE` | `http://127.0.0.1:8089` | embeddings endpoint URL used for semantic chunk ranking |
 | `LOCALAGENT_THINKING_DAMPEN` | `0` | Optional thinking clamp on routine tool returns (`0` preserves user effort 100%) |
 | `LOCALAGENT_SPILL_DIR` | `~/.local/state/localagent/spill` | storage for full uncompressed originals (lossless CCR) |
