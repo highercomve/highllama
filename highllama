@@ -65,6 +65,11 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # ---- defaults -------------------------------------------------------------
 LLAMA_DIR="${LLAMA_DIR:-$SCRIPT_DIR/llama.cpp}"
+# PrismML's llama.cpp fork, kept beside the stock build rather than replacing it: their ternary
+# GGUF types (PQ2_0 = ggml type 142, PTQ1_0 = 143) are not upstream yet, so Ternary-Bonsai-2 and
+# friends only load there. Installed with `highllama prism install`; used automatically for a
+# model whose file says it needs it, and for nothing else.
+PRISM_DIR="${PRISM_DIR:-$SCRIPT_DIR/llama.cpp-prism}"
 MODEL="${MODEL:-}"        # empty => interactive picker (no-arg dynamic mode)
 CONTEXT="${CONTEXT:-64k}" # accepts 32k / 64k / 128k or a raw token count
 NCMOE="${NCMOE:-}"        # MoE layers pinned to CPU: a count, or "N%" of the layers;
@@ -1206,6 +1211,105 @@ cmd_tune() {
     exit 0
 }
 
+# ---- PrismML fork -----------------------------------------------------------
+# Ternary Bonsai 2 ships as PQ2_0 / PTQ1_0, GGML types 142 and 143, which stock llama.cpp refuses
+# ("failed to read tensor info"). PrismML publishes a fork with prebuilt binaries; we keep them in
+# their own directory so the stock build stays exactly as it is, and reach for them only when a
+# model needs them.
+
+# Does this model need the fork? Read the tensor types out of the GGUF header: PQ2_0 is ggml type
+# 142 and PTQ1_0 is 143, and stock llama.cpp rejects anything above 43 with "invalid ggml type".
+# That is the fact; the filename is only a hint, and is used when the header cannot be read (a
+# download in progress, an -hf tag that has not landed yet, a file that is not local at all).
+prism_model() {
+    local f="${1:-}" types
+    [ -n "$f" ] || return 1
+    if [ -f "$f" ] && [ -x "$SCRIPT_DIR/gguf-types.py" ]; then
+        if types="$("$SCRIPT_DIR/gguf-types.py" "$f" 2>/dev/null)"; then
+            for t in $types; do
+                [ "$t" -ge 142 ] 2>/dev/null && return 0
+            done
+            return 1
+        fi
+    fi
+    case "$(basename "$f")" in
+    *PQ2_0* | *PTQ1_0* | *prism-fork-required* | *Ternary-Bonsai-2*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+prism_bin() { echo "$PRISM_DIR/llama-server"; }
+
+# Which of their assets suits this machine: they publish per CUDA minor, plus CPU/Vulkan/HIP.
+prism_asset_pattern() {
+    local backend="${1:-$(detect_backend)}"
+    case "$backend" in
+    cuda)
+        # Their builds link a specific CUDA runtime, so pick by the runtime this machine has
+        # rather than by the driver or toolkit: a 12.x build on a 13-only box dies at startup
+        # with "libcudart.so.12: cannot open shared object file".
+        local major v
+        major="$(ldconfig -p 2>/dev/null | command grep -oE 'libcudart\.so\.[0-9]+' | sed 's/.*\.//' | sort -rn | head -1)"
+        if [ -z "$major" ]; then
+            v="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\)\..*/\1/p' | head -1)"
+            major="${v:-12}"
+        fi
+        case "$major" in
+        13) echo "bin-linux-cuda-13" ;;
+        *)
+            # 12.x: their 12.4 and 12.8 builds are both minor-specific; 12.8 is the common one.
+            v="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | head -1)"
+            case "$v" in
+            12.4*) echo "bin-linux-cuda-12.4" ;;
+            *) echo "bin-linux-cuda-12.8" ;;
+            esac
+            ;;
+        esac
+        ;;
+    vulkan) echo "bin-linux-vulkan" ;;
+    rocm) echo "bin-linux-hip" ;;
+    metal) echo "bin-macos" ;;
+    *) echo "bin-linux-cpu" ;;
+    esac
+}
+
+prism_install() {
+    local pattern url tag tmp
+    pattern="$(prism_asset_pattern "${1:-}")"
+    echo ">> looking for a PrismML build matching '$pattern'"
+    local api="https://api.github.com/repos/PrismML-Eng/llama.cpp/releases/latest"
+    tag="$(curl -fsSL "$api" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+    url="$(curl -fsSL "$api" | sed -n 's/.*"browser_download_url": *"\([^"]*\)".*/\1/p' | command grep -- "$pattern" | head -1)"
+    if [ -z "$url" ]; then
+        echo "!! no PrismML asset matching '$pattern' in $tag" >&2
+        echo "   see https://github.com/PrismML-Eng/llama.cpp/releases" >&2
+        return 1
+    fi
+    echo ">> $tag: $(basename "$url")"
+    tmp="$(mktemp -d)"
+    curl -fL --progress-bar -o "$tmp/prism.tar.gz" "$url" || { rm -rf "$tmp"; return 1; }
+    mkdir -p "$PRISM_DIR"
+    tar xzf "$tmp/prism.tar.gz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
+    # The archive has a versioned top directory; flatten it so the path stays stable across updates.
+    local src
+    src="$(dirname "$(find "$tmp" -name llama-server -type f | head -1)")"
+    [ -n "$src" ] || { echo "!! no llama-server in the archive" >&2; rm -rf "$tmp"; return 1; }
+    cp -a "$src/." "$PRISM_DIR/"
+    rm -rf "$tmp"
+    chmod +x "$PRISM_DIR"/llama-* 2>/dev/null || true
+    echo "$tag" > "$PRISM_DIR/.version"
+    echo ">> installed: $(prism_bin) ($tag)"
+}
+
+prism_status() {
+    if [ -x "$(prism_bin)" ]; then
+        echo "prism fork: $(prism_bin) ($(cat "$PRISM_DIR/.version" 2>/dev/null || echo "unknown version"))"
+    else
+        echo "prism fork: not installed (highllama prism install)"
+    fi
+}
+
+
 # ---- build requirements per platform (deps subcommand) ---------------------
 install_deps() {
     local backend="$1"
@@ -1709,6 +1813,7 @@ COMMANDS:
   deps [backend]     install build requirements (pacman/apt/dnf/zypper/brew)
   build [backend]    clone (if needed) + cmake-build llama.cpp
   update [backend]   git pull llama.cpp + rebuild
+  prism [cmd]        PrismML fork for PQ2_0/PTQ1_0 models (install|update|status|path)
   help, -h, --help   show this help
 
 START OPTIONS:
@@ -1883,6 +1988,19 @@ build)
     ;;
 update)
     update_llama "${2:-$(detect_backend)}"
+    exit 0
+    ;;
+prism)
+    # The PrismML fork, for Ternary Bonsai 2 and anything else quantised PQ2_0 / PTQ1_0.
+    case "${2:-status}" in
+    install | update) prism_install "${3:-}" ;;
+    status) prism_status ;;
+    path) prism_bin ;;
+    *)
+        echo "usage: highllama prism [install|update|status|path]" >&2
+        exit 2
+        ;;
+    esac
     exit 0
     ;;
 reload)
@@ -2701,6 +2819,22 @@ if [ "$NO_EMBEDDINGS" != 1 ]; then
         [ "$_embed_after" != "$_embed_before" ] && EMBED_STARTED="$_embed_after"
     else
         echo ">> continuing without embeddings (chat server only)"
+    fi
+fi
+
+# A Prism-quantised model (PQ2_0 / PTQ1_0) can only be loaded by their fork; everything else
+# keeps using the build in llama.cpp/ exactly as before.
+# Test the file we actually resolved to, not what the user typed: `-m Ternary-Bonsai-2` is a
+# substring, and the quantisation only shows in the filename it matched.
+PRISM_CANDIDATE="${MODEL_ARGS[1]:-$MODEL}"
+if [ -z "${LLAMA_BIN:-}" ] && prism_model "$PRISM_CANDIDATE"; then
+    if [ -x "$(prism_bin)" ]; then
+        LLAMA_BIN="$(prism_bin)"
+        echo ">> $(basename "$PRISM_CANDIDATE") needs the PrismML fork — using $LLAMA_BIN"
+    else
+        echo "!! $(basename "$PRISM_CANDIDATE") is Prism-quantised (PQ2_0/PTQ1_0) and stock llama.cpp cannot read it." >&2
+        echo "   Install the fork once with: highllama prism install" >&2
+        exit 1
     fi
 fi
 
