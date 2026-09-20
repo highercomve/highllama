@@ -830,6 +830,193 @@ fmt_tokens() { # 1234567 -> 1.2M
     }'
 }
 
+# ---- router mode ------------------------------------------------------------------------------
+#
+# llama.cpp gained a router: start llama-server with no model, register models in an INI, and it
+# loads, unloads and routes by the `model` field of each request, every model in its own process.
+# That is the thing `restart` could never be — changing the model or its flags stops being a
+# stop/start of the whole server.
+#
+# It is also the only way two callers can want different flags from the same weights. GhostReel
+# describes keyframes with `parallel = 4` over a small context and runs its script chat with
+# `parallel = 1` over 64k; one server cannot be both, and switching used to mean editing
+# last-start.env by hand. Loading a model still costs its VRAM, so on one card this is a swap
+# (`models-max = 1`), not coexistence.
+HL_ROUTER_INI="${HL_ROUTER_INI:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/router.ini}"
+HL_ROUTER_MAX="${HL_ROUTER_MAX:-1}" # models resident at once; 1 is what a single GPU affords
+
+router_api() { # <method> <path> [json-body] -> response body, or non-zero
+    local method="$1" path="$2" body="${3:-}"
+    if [ -n "$body" ]; then
+        curl -fsS --max-time 600 -X "$method" "http://127.0.0.1:$PORT$path" \
+            -H 'Content-Type: application/json' -d "$body" 2>/dev/null
+    else
+        curl -fsS --max-time 600 -X "$method" "http://127.0.0.1:$PORT$path" 2>/dev/null
+    fi
+}
+
+router_running() { # the server on $PORT answers /models as a router (not a single-model server)
+    local body
+    body="$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/models" 2>/dev/null)" || return 1
+    printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d.get("data"),list) else 1)' 2>/dev/null
+}
+
+router_init() { # seed router.ini from the last recorded start, so the first run needs no typing
+    local last="${HL_LAST:-${XDG_CONFIG_HOME:-$HOME/.config}/highllama/last-start.env}"
+    if [ -f "$HL_ROUTER_INI" ]; then
+        echo ">> $HL_ROUTER_INI already exists (edit it, or delete it to re-seed)"
+        return 0
+    fi
+    mkdir -p "$(dirname "$HL_ROUTER_INI")"
+    local model='' mmproj='' ctx=32768
+    if [ -f "$last" ]; then
+        # shellcheck disable=SC1090
+        ( . "$last"; printf '%s\n%s\n' "${MODEL:-}" "${CONTEXT:-32768}" ) >/tmp/.hl_seed.$$ 2>/dev/null || true
+        model="$(sed -n 1p /tmp/.hl_seed.$$ 2>/dev/null)"
+        ctx="$(sed -n 2p /tmp/.hl_seed.$$ 2>/dev/null)"
+        rm -f /tmp/.hl_seed.$$
+        # MODEL is a picker name; resolve it to a path the same way `start` does.
+        [ -n "$model" ] && model="$(resolve_local_gguf "$model" 2>/dev/null || true)"
+        [ -n "$model" ] && mmproj="$(resolve_mmproj_for "$model" 2>/dev/null || true)"
+    fi
+    {
+        echo "# highllama router presets — one section per model, '[*]' applies to all."
+        echo "# Keys are llama-server long options without the dashes (ctx-size, parallel,"
+        echo "# n-gpu-layers, mmproj, cache-type-k...). An unknown key is a hard error, so a"
+        echo "# typo fails loudly at start rather than silently at inference."
+        echo
+        echo "[*]"
+        echo "n-gpu-layers = 99"
+        echo "flash-attn = on"
+        echo "cache-type-k = ${KVTYPE_K:-q4_0}"
+        echo "cache-type-v = ${KVTYPE_V:-q4_0}"
+        if [ -n "$model" ]; then
+            echo
+            echo "# Seeded from your last 'highllama start'. Two sections, same weights, because"
+            echo "# describing frames and holding a conversation want different servers."
+            echo "[chat]"
+            echo "model = $model"
+            [ -n "$mmproj" ] && echo "mmproj = $mmproj"
+            echo "ctx-size = ${ctx:-32768}"
+            echo "parallel = 1"
+            echo
+            echo "[describe]"
+            echo "model = $model"
+            [ -n "$mmproj" ] && echo "mmproj = $mmproj"
+            echo "ctx-size = 16384"
+            echo "parallel = 4"
+        else
+            echo
+            echo "# No recorded start to seed from — add a section per model:"
+            echo "# [my-model]"
+            echo "# model = /path/to/model.gguf"
+            echo "# ctx-size = 32768"
+            echo "# parallel = 1"
+        fi
+    } >"$HL_ROUTER_INI"
+    echo ">> wrote $HL_ROUTER_INI"
+}
+
+router_models() { # list what the router knows, and what is resident
+    router_running || { echo "!! no router on port $PORT — 'highllama router start'" >&2; return 1; }
+    router_api GET /models | python3 -c '
+import json, sys
+rows = (json.load(sys.stdin).get("data") or [])
+if not rows:
+    print("   (no models registered - add sections to router.ini)")
+    raise SystemExit
+print("   %-28s%-12s%s" % ("MODEL", "STATUS", "MODALITIES"))
+for m in rows:
+    st = m.get("status") or {}
+    status = st.get("value", "?") if isinstance(st, dict) else str(st)
+    mods = ",".join((m.get("architecture") or {}).get("input_modalities") or ["text"])
+    mark = "*" if status == "running" else " "
+    print(" %s %-28s%-12s%s" % (mark, m.get("id", "?"), status, mods))
+'
+}
+
+router_use() { # <name> — make this the resident model
+    local name="$1"
+    [ -n "$name" ] || { echo "!! usage: highllama router use <model>" >&2; return 2; }
+    router_running || { echo "!! no router on port $PORT — 'highllama router start'" >&2; return 1; }
+
+    # One card, one model: everything else goes first. The router would refuse a load past
+    # models-max anyway, and failing after unloading nothing is the confusing order.
+    local resident
+    resident="$(router_api GET /models | python3 -c '
+import json, sys
+for m in (json.load(sys.stdin).get("data") or []):
+    st = m.get("status") or {}
+    if (st.get("value") if isinstance(st, dict) else st) == "running":
+        print(m.get("id",""))
+' 2>/dev/null)"
+    local m
+    for m in $resident; do
+        [ "$m" = "$name" ] && { echo ">> $name is already resident"; return 0; }
+        echo ">> unloading $m"
+        router_api POST /models/unload "{\"model\":\"$m\"}" >/dev/null || true
+    done
+
+    echo ">> loading $name ..."
+    local out
+    if ! out="$(router_api POST /models/load "{\"model\":\"$name\"}")"; then
+        echo "!! load failed — is '$name' a section in $HL_ROUTER_INI?" >&2
+        echo "!! known models:" >&2
+        router_models >&2
+        return 1
+    fi
+    printf '%s' "$out" | command grep -q '"success"' || { echo "!! $out" >&2; return 1; }
+    echo ">> $name is resident on http://$HOST:$PORT/v1"
+}
+
+router_unload() { # [<name>|--all]
+    router_running || { echo "!! no router on port $PORT" >&2; return 1; }
+    local target="${1:---all}"
+    if [ "$target" != "--all" ]; then
+        router_api POST /models/unload "{\"model\":\"$target\"}" >/dev/null && echo ">> unloaded $target"
+        return 0
+    fi
+    router_api GET /models | python3 -c '
+import json, sys
+for m in (json.load(sys.stdin).get("data") or []):
+    st = m.get("status") or {}
+    if (st.get("value") if isinstance(st, dict) else st) == "running":
+        print(m.get("id",""))
+' 2>/dev/null | while read -r m; do
+        [ -n "$m" ] || continue
+        router_api POST /models/unload "{\"model\":\"$m\"}" >/dev/null && echo ">> unloaded $m"
+    done
+}
+
+router_start() { # [--daemon]
+    [ -f "$HL_ROUTER_INI" ] || router_init
+    local bin="${LLAMA_BIN:-$LLAMA_DIR/build/bin/llama-server}"
+    [ -x "$bin" ] || { echo "!! no llama-server at $bin — 'highllama build'" >&2; return 1; }
+    "$bin" --help 2>&1 | command grep -q -- '--models-preset' || {
+        echo "!! this llama.cpp is older than router mode — 'highllama update'" >&2
+        return 1
+    }
+    if router_running; then
+        echo ">> router already on http://$HOST:$PORT/v1"
+        return 0
+    fi
+    # A router with nothing loaded holds no VRAM, so it is safe to leave running.
+    local cmd=("$bin" --host "$HOST" --port "$PORT"
+        --models-preset "$HL_ROUTER_INI"
+        --models-max "$HL_ROUTER_MAX"
+        --no-models-autoload
+        --metrics --jinja)
+    printf '>> router:'; printf ' %q' "${cmd[@]}"; printf '\n'
+    if [ "${1:-}" = "--daemon" ]; then
+        setsid nohup "${cmd[@]}" >/dev/null 2>&1 < /dev/null &
+        wait_api_ready "$PORT" 60 || { echo "!! router did not come up" >&2; return 1; }
+        echo ">> router ready: http://$HOST:$PORT/v1  (nothing loaded yet)"
+        router_models
+    else
+        exec "${cmd[@]}"
+    fi
+}
+
 wait_api_ready() { # <port> [timeout_s] — /health 200s only once the model is loaded
     local port="$1" t="${2:-300}" _
     for _ in $(seq 1 $((t * 2))); do
@@ -1803,6 +1990,13 @@ COMMANDS:
   restart [options]  stop + start with the same settings as the last start
                      (picker choice included; no tty needed). extras win,
                      e.g. `highllama restart --daemon`
+  router <cmd>       run llama.cpp's router: one endpoint, many models, swapped
+                     over HTTP instead of by stop/start. init | start [--daemon]
+                     | models | use <model> | unload [<model>|--all].
+                     Sections live in router.ini, so two callers can have the
+                     same weights on different flags (chat on parallel=1 and
+                     64k, describe on parallel=4 and 16k). An idle router holds
+                     no VRAM; models-max defaults to 1, so 'use' is a swap.
   tune [options]     measure the fastest config (MTP / offload) for a model on
                      this hardware and persist it; 'start' applies it after
   usage [--json]     today's input/output token totals (persisted per day;
@@ -1988,6 +2182,22 @@ build)
     ;;
 update)
     update_llama "${2:-$(detect_backend)}"
+    exit 0
+    ;;
+router)
+    # Change the running model, or the flags it runs with, without a stop/start.
+    shift
+    case "${1:-models}" in
+    start) router_start "${2:---daemon}" ;;
+    init) router_init ;;
+    models | ls) router_models ;;
+    use) router_use "${2:-}" ;;
+    unload) router_unload "${2:---all}" ;;
+    *)
+        echo "usage: highllama router [start [--daemon]|init|models|use <model>|unload [<model>|--all]]" >&2
+        exit 2
+        ;;
+    esac
     exit 0
     ;;
 prism)
