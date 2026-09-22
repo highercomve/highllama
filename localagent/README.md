@@ -145,6 +145,41 @@ By Tool / Source
 ────────────────────────────────────────────────────────────────────────
 ```
 
+## Jev compaction (`jevcompact.py`)
+
+When Claude Code (`/compact`), opencode (its compaction agent) or pi (context
+checkpoint) asks its model to summarize the conversation through the proxy, the
+proxy can answer that request itself:
+
+1. If the whole conversation fits the local model's budget, it all goes in — on
+   real compactions, dropping messages then only cost detail (and time).
+2. Otherwise [Jev](https://docs.typesafe.ai) (TypeSafe System One) scores every
+   message with one Noul, "still needed to continue the task?" (batched, ~1-4s),
+   and code keeps every user turn, the last 6 messages and the messages scored
+   >= 0.4, within the budget.
+3. The loaded highllama model writes the summary from that subset, following the
+   client's own compaction instructions, so the output format is unchanged.
+
+It falls back automatically. If the local model is not loaded, llama-server is
+down, Jev errors or the summary comes back empty, the ORIGINAL request is relayed
+unchanged, exactly as if the feature were off. The model-loaded check runs first,
+so a fallback costs no Jev calls. Each outcome is logged as `jev-compact:` in
+`proxy.log`.
+
+Enabled by `LOCALAGENT_JEV_COMPACT=1` (set by `localagent.sh`) plus
+`TYPESAFE_API_KEY` in `localagent/.env` (gitignored). Tuning:
+`LOCALAGENT_JEV_THRESHOLD` (default 0.4), `LOCALAGENT_JEV_BUDGET_TOKENS` (default
+48000), `TYPESAFE_MODEL` (default `jev-latest`).
+
+Measuring quality: `LOCALAGENT_JEV_COMPACT_EVAL=1` scores every compaction's
+coverage (Jev checks whether the summary keeps each user request, each file the
+agent acted on, late errors and the final state), logs it, and saves a record
+under `~/.local/state/localagent/compactions/`. `LOCALAGENT_JEV_COMPACT_MODE=full`
+skips Jev selection as a baseline. Offline: `python3 jevcompact.py replay
+<record.json> --mode both` reruns a saved compaction both ways, and
+`python3 jevcompact.py eval <record.json> <summary.txt>` scores any summary. Handled on `/v1/messages`,
+`/v1/chat/completions` and `/v1/responses` (pi's route for gpt-5.6-luna).
+
 ## Install
 
 ```bash

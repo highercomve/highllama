@@ -90,6 +90,14 @@ except ImportError:
     except ImportError:
         compressor = None
 
+try:
+    import jevcompact
+except ImportError:
+    try:
+        from localagent import jevcompact
+    except ImportError:
+        jevcompact = None
+
 PORT = int(os.environ.get("LLAMA_PROXY_PORT", "8090"))
 HOST = os.environ.get("LLAMA_PROXY_HOST", "127.0.0.1")
 LLAMA_BASE = os.environ.get("LLAMA_BASE", "http://127.0.0.1:8089").rstrip("/")
@@ -2442,6 +2450,15 @@ class Handler(BaseHTTPRequestHandler):
         req_model = body.get("model", MODEL)
         opencode_core_model, opencode_proto = get_opencode_model_and_protocol(req_model)
 
+        # Compaction requests (Claude Code /compact, opencode, pi) can be answered by
+        # Jev-selected context + the local model. try_compact returns None on any
+        # problem, and the untouched request then continues down the normal route.
+        if (jevcompact and jevcompact.is_enabled()
+                and path_only in ("/v1/messages", "/v1/chat/completions", "/v1/responses")):
+            done = jevcompact.try_compact(body, LLAMA_BASE, log=log)
+            if done:
+                return self._reply_compaction(path_only, body, req_model, done["text"])
+
         # OpenAI-compatible chat completions endpoint (used by opencode, Codex, pi, etc.)
         if self.path.startswith("/v1/chat/completions"):
             if opencode_core_model:
@@ -2736,6 +2753,123 @@ class Handler(BaseHTTPRequestHandler):
                     "body": body,
                     "response_bytes": response_bytes,
                 })
+
+    def _reply_compaction(self, path_only, body, req_model, text):
+        """Send a locally-written compaction summary in the shape the client asked for."""
+        stream = bool(body.get("stream"))
+        if path_only == "/v1/messages":
+            usage = {"input_tokens": 0, "output_tokens": len(text) // 4}
+            if not stream:
+                return self._json(200, {
+                    "id": new_msg_id(), "type": "message", "role": "assistant",
+                    "model": req_model, "content": [{"type": "text", "text": text}],
+                    "stop_reason": "end_turn", "stop_sequence": None, "usage": usage,
+                })
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                self._w(sse("message_start", {"type": "message_start", "message": {
+                    "id": new_msg_id(), "type": "message", "role": "assistant",
+                    "model": req_model, "content": [], "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}}}))
+                self._emit_text_block(0, text)
+                self._w(sse("message_delta", {"type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": usage["output_tokens"]}}))
+                self._w(sse("message_stop", {"type": "message_stop"}))
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                log("client disconnected during compaction reply")
+            return
+
+        if path_only == "/v1/responses":
+            return self._reply_compaction_responses(body, req_model, text)
+
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        usage = {"prompt_tokens": 0, "completion_tokens": len(text) // 4,
+                 "total_tokens": len(text) // 4}
+        if not stream:
+            return self._json(200, {
+                "id": cid, "object": "chat.completion", "created": created,
+                "model": req_model,
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": text}}],
+                "usage": usage,
+            })
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        def chunk(delta, finish=None, **extra):
+            obj = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": req_model,
+                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            obj.update(extra)
+            return ("data: %s\n\n" % json.dumps(obj)).encode()
+
+        try:
+            self._w(chunk({"role": "assistant", "content": text}))
+            self._w(chunk({}, "stop", usage=usage))
+            self._w(b"data: [DONE]\n\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            log("client disconnected during compaction reply")
+
+    def _reply_compaction_responses(self, body, req_model, text):
+        """OpenAI Responses shape (pi's route for Responses-only models)."""
+        rid = "resp_" + uuid.uuid4().hex[:24]
+        mid = "msg_" + uuid.uuid4().hex[:24]
+        out_tokens = len(text) // 4
+        part = {"type": "output_text", "text": text, "annotations": []}
+        item = {"id": mid, "type": "message", "role": "assistant",
+                "status": "completed", "content": [part]}
+        usage = {"input_tokens": 0, "output_tokens": out_tokens,
+                 "total_tokens": out_tokens}
+
+        def response(status, output, usage=None):
+            return {"id": rid, "object": "response", "created_at": int(time.time()),
+                    "model": req_model, "status": status, "output": output,
+                    "usage": usage}
+
+        if not body.get("stream"):
+            return self._json(200, response("completed", [item], usage))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        events = [
+            {"type": "response.created", "response": response("in_progress", [])},
+            {"type": "response.output_item.added", "output_index": 0,
+             "item": dict(item, status="in_progress", content=[])},
+            {"type": "response.content_part.added", "item_id": mid, "output_index": 0,
+             "content_index": 0, "part": dict(part, text="")},
+            {"type": "response.output_text.delta", "item_id": mid, "output_index": 0,
+             "content_index": 0, "delta": text},
+            {"type": "response.output_text.done", "item_id": mid, "output_index": 0,
+             "content_index": 0, "text": text},
+            {"type": "response.content_part.done", "item_id": mid, "output_index": 0,
+             "content_index": 0, "part": part},
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+            {"type": "response.completed", "response": response("completed", [item], usage)},
+        ]
+        try:
+            for seq, ev in enumerate(events):
+                ev["sequence_number"] = seq
+                self._w(sse(ev["type"], ev))
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            log("client disconnected during compaction reply")
 
     def _w(self, chunk):
         # HTTP/1.1 chunked framing: <hex-len>\r\n<data>\r\n
