@@ -1,4 +1,5 @@
 llama.cpp/
+llama.cpp-prism/
 __pycache__/
 *.log
 .claude/settings.local.json
